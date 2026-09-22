@@ -13,6 +13,11 @@
 #include <va/va_enc_h264.h>
 #include <va/va_enc_hevc.h>
 #include <va/va_vpp.h>
+/* ⚠️ The post-processing entry points live in a vtable of their own,
+ * ctx->vtable_vpp, and this is the header that declares it. Without it
+ * the three bc250_QueryVideoProc* below compile fine and are never
+ * called. */
+#include <va/va_backend_vpp.h>
 #include <va/va_drmcommon.h>
 #include <drm_fourcc.h>
 #include <pthread.h>
@@ -98,6 +103,24 @@ struct bc250_context {
     int num_render_targets;
     VASurfaceID current_render_target;
     VABufferID coded_buf_id;
+
+    /* VAEntrypointVideoProc. No encoder, no decoder: one surface in,
+     * one surface out, scaled.
+     *
+     * ⚠️ The rectangles are COPIES. VAProcPipelineParameterBuffer holds
+     * pointers to the caller's own VARectangles, and vaCreateBuffer copies
+     * the pointers, not what they point at. They are read while
+     * vaRenderPicture is still on the caller's stack and kept here; by
+     * vaEndPicture nothing says the originals still exist. */
+    int vpp;
+    struct {
+        VASurfaceID source;
+        VARectangle src_rect;
+        VARectangle dst_rect;
+        int has_source;
+        int has_src_rect;
+        int has_dst_rect;
+    } vpp_state;
 
     /* Encoders & Decoders */
     h264_encoder_t *h264_enc;

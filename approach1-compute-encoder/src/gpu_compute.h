@@ -102,6 +102,11 @@ typedef struct bc250_gpu_context {
     VkPipelineLayout deblock_layout;
     VkPipelineLayout entropy_layout;
     VkPipelineLayout color_convert_layout;
+    /* VAEntrypointVideoProc: scale and crop, one pipeline per bit depth.
+     * See gpu_compute_video_proc(). */
+    VkDescriptorSetLayout vpp_desc_layout;
+    VkDescriptorSet vpp_desc_set;
+    VkPipelineLayout vpp_layout;
     VkPipelineLayout reconstruct_layout;
     VkPipelineLayout intra_wavefront_layout;
 
@@ -113,6 +118,8 @@ typedef struct bc250_gpu_context {
     VkPipeline deblock_pipeline;
     VkPipeline entropy_pipeline;
     VkPipeline color_convert_pipeline;
+    VkPipeline vpp_pipeline;      /* video_proc.comp, eight bit */
+    VkPipeline vpp_pipeline10;    /* video_proc10.comp, ten bit */
     VkPipeline reconstruct_pipeline;
     VkPipeline intra_wavefront_pipeline;
 
@@ -356,6 +363,23 @@ int gpu_compute_upload_p010(gpu_context_t *ctx, gpu_image_t *image,
                             const uint16_t *y_plane, int y_pitch,
                             const uint16_t *uv_plane, int uv_pitch,
                             int width, int height);
+
+/* Scale and crop `src` into `dst`, both two-plane YUV 4:2:0 of the same
+ * bit depth, bilinear. The rectangles are in LUMA samples; their origins
+ * and sizes are rounded to even numbers on the way in, because an odd one
+ * cannot be expressed in a 4:2:0 plane.
+ *
+ * This is the whole of VAEntrypointVideoProc in this driver: no filters,
+ * no colour conversion. There is nothing to convert between, since every
+ * surface it hands out is NV12 or P010.
+ *
+ * Submits, waits, and returns 0 or -1. The work is a few hundred
+ * microseconds and the descriptor set is shared, so it does not overlap
+ * with itself.
+ */
+int gpu_compute_video_proc(gpu_context_t *ctx,
+                           gpu_image_t *src, const int src_rect[4],
+                           gpu_image_t *dst, const int dst_rect[4]);
 
 void gpu_compute_copy_from_wc(void *dst, const void *src, size_t n);
 int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,

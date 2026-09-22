@@ -1171,6 +1171,17 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     VkDescriptorSetLayoutCreateInfo intra_wavefront_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 9, .pBindings = intra_wavefront_bindings };
     vkCreateDescriptorSetLayout(ctx->device, &intra_wavefront_layout_info, NULL, &ctx->intra_wavefront_desc_layout);
 
+    /* VideoProc: source luma, source chroma, destination luma,
+     * destination chroma. */
+    VkDescriptorSetLayoutBinding vpp_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+    };
+    VkDescriptorSetLayoutCreateInfo vpp_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 4, .pBindings = vpp_bindings };
+    vkCreateDescriptorSetLayout(ctx->device, &vpp_layout_info, NULL, &ctx->vpp_desc_layout);
+
     /* Descriptor Pool */
     /* Headroom, not a tight fit. The nine layouts above bind 24 storage
      * buffers and 14 storage images today; adding the nonzero mask and the
@@ -1241,6 +1252,9 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     layout_info.pSetLayouts = &ctx->intra_wavefront_desc_layout;
     vkCreatePipelineLayout(ctx->device, &layout_info, NULL, &ctx->intra_wavefront_layout);
 
+    layout_info.pSetLayouts = &ctx->vpp_desc_layout;
+    vkCreatePipelineLayout(ctx->device, &layout_info, NULL, &ctx->vpp_layout);
+
     /* Allocate Descriptor Sets */
     VkDescriptorSetAllocateInfo alloc_set_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1268,6 +1282,9 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
 
     alloc_set_info.pSetLayouts = &ctx->cc_desc_layout;
     vkAllocateDescriptorSets(ctx->device, &alloc_set_info, &ctx->cc_desc_set);
+
+    alloc_set_info.pSetLayouts = &ctx->vpp_desc_layout;
+    vkAllocateDescriptorSets(ctx->device, &alloc_set_info, &ctx->vpp_desc_set);
 
     alloc_set_info.pSetLayouts = &ctx->reconstruct_desc_layout;
     vkAllocateDescriptorSets(ctx->device, &alloc_set_info, &ctx->reconstruct_desc_set);
@@ -1306,6 +1323,23 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         ctx->entropy_pipeline = create_compute_pipeline(ctx->device, entropy_shader, ctx->entropy_layout);
         vkDestroyShaderModule(ctx->device, entropy_shader, NULL);
     }
+    /* ⚠️ Missing shaders are not fatal here, deliberately: the driver
+     * still decodes and encodes without them, and gpu_compute_video_proc()
+     * checks for the pipeline before using it. A VideoProc context is
+     * refused at vaCreateConfig instead, which is a clear error rather
+     * than a crash halfway through a frame. */
+    VkShaderModule vpp_shader = load_spirv_shader(ctx->device, "video_proc.comp.spv");
+    if (vpp_shader != VK_NULL_HANDLE) {
+        ctx->vpp_pipeline = create_compute_pipeline(ctx->device, vpp_shader, ctx->vpp_layout);
+        vkDestroyShaderModule(ctx->device, vpp_shader, NULL);
+    }
+
+    VkShaderModule vpp10_shader = load_spirv_shader(ctx->device, "video_proc10.comp.spv");
+    if (vpp10_shader != VK_NULL_HANDLE) {
+        ctx->vpp_pipeline10 = create_compute_pipeline(ctx->device, vpp10_shader, ctx->vpp_layout);
+        vkDestroyShaderModule(ctx->device, vpp10_shader, NULL);
+    }
+
     VkShaderModule cc_shader = load_spirv_shader(ctx->device, "color_convert.comp.spv");
     if (cc_shader) {
         ctx->color_convert_pipeline = create_compute_pipeline(ctx->device, cc_shader, ctx->color_convert_layout);
@@ -1379,6 +1413,8 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->deblock_pipeline) vkDestroyPipeline(ctx->device, ctx->deblock_pipeline, NULL);
     if (ctx->entropy_pipeline) vkDestroyPipeline(ctx->device, ctx->entropy_pipeline, NULL);
     if (ctx->color_convert_pipeline) vkDestroyPipeline(ctx->device, ctx->color_convert_pipeline, NULL);
+    if (ctx->vpp_pipeline) vkDestroyPipeline(ctx->device, ctx->vpp_pipeline, NULL);
+    if (ctx->vpp_pipeline10) vkDestroyPipeline(ctx->device, ctx->vpp_pipeline10, NULL);
     if (ctx->reconstruct_pipeline) vkDestroyPipeline(ctx->device, ctx->reconstruct_pipeline, NULL);
     if (ctx->intra_wavefront_pipeline) vkDestroyPipeline(ctx->device, ctx->intra_wavefront_pipeline, NULL);
 
@@ -1389,6 +1425,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->deblock_layout) vkDestroyPipelineLayout(ctx->device, ctx->deblock_layout, NULL);
     if (ctx->entropy_layout) vkDestroyPipelineLayout(ctx->device, ctx->entropy_layout, NULL);
     if (ctx->color_convert_layout) vkDestroyPipelineLayout(ctx->device, ctx->color_convert_layout, NULL);
+    if (ctx->vpp_layout) vkDestroyPipelineLayout(ctx->device, ctx->vpp_layout, NULL);
     if (ctx->reconstruct_layout) vkDestroyPipelineLayout(ctx->device, ctx->reconstruct_layout, NULL);
     if (ctx->intra_wavefront_layout) vkDestroyPipelineLayout(ctx->device, ctx->intra_wavefront_layout, NULL);
 
@@ -1399,6 +1436,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->deblock_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->deblock_desc_layout, NULL);
     if (ctx->entropy_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->entropy_desc_layout, NULL);
     if (ctx->cc_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->cc_desc_layout, NULL);
+    if (ctx->vpp_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->vpp_desc_layout, NULL);
     if (ctx->reconstruct_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->reconstruct_desc_layout, NULL);
     if (ctx->intra_wavefront_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->intra_wavefront_desc_layout, NULL);
 
@@ -2572,6 +2610,64 @@ int gpu_compute_dispatch_encode_ext(gpu_context_t *ctx, gpu_image_t render_targe
 
 int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices) {
     return gpu_compute_dispatch_encode_ext(ctx, render_target, width, height, qp, is_intra, num_slices, 0, NULL);
+}
+
+
+/* See gpu_compute.h. One dispatch over the destination rectangle, then a
+ * wait: this runs from vaEndPicture and the caller expects the surface to
+ * be finished when it returns. */
+int gpu_compute_video_proc(gpu_context_t *ctx,
+                           gpu_image_t *src, const int src_rect[4],
+                           gpu_image_t *dst, const int dst_rect[4])
+{
+    if (!ctx || !src || !dst || !src_rect || !dst_rect) return -1;
+    if (src->format != dst->format) return -1;
+
+    VkPipeline pipeline = (dst->format == GPU_IMAGE_P010)
+                          ? ctx->vpp_pipeline10 : ctx->vpp_pipeline;
+    if (pipeline == VK_NULL_HANDLE) return -1;
+    if (!src->y_view || !src->uv_view || !dst->y_view || !dst->uv_view) return -1;
+
+    /* ⚠️ Even origins and even sizes. A 4:2:0 plane has one chroma sample
+     * per two-by-two luma block, so an odd rectangle has no chroma to
+     * write for half of its edge - and the shader's own chroma step
+     * assumes the origin is even. Rounded here, once, rather than argued
+     * about in the shader. */
+    const int sx = src_rect[0] & ~1, sy = src_rect[1] & ~1;
+    const int sw = src_rect[2] & ~1, sh = src_rect[3] & ~1;
+    const int dx = dst_rect[0] & ~1, dy = dst_rect[1] & ~1;
+    const int dw = dst_rect[2] & ~1, dh = dst_rect[3] & ~1;
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return -1;
+
+    VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
+    if (gpu_compute_begin_picture(ctx, *dst) != 0) return -1;
+
+    transition_image_layout(cmd_buf, src->y_plane, src->current_layout, VK_IMAGE_LAYOUT_GENERAL);
+    transition_image_layout(cmd_buf, src->uv_plane, src->current_layout, VK_IMAGE_LAYOUT_GENERAL);
+    src->current_layout = VK_IMAGE_LAYOUT_GENERAL;
+    transition_image_layout(cmd_buf, dst->y_plane, dst->current_layout, VK_IMAGE_LAYOUT_GENERAL);
+    transition_image_layout(cmd_buf, dst->uv_plane, dst->current_layout, VK_IMAGE_LAYOUT_GENERAL);
+    dst->current_layout = VK_IMAGE_LAYOUT_GENERAL;
+
+    update_storage_image_descriptor(ctx->device, ctx->vpp_desc_set, 0, src->y_view);
+    update_storage_image_descriptor(ctx->device, ctx->vpp_desc_set, 1, src->uv_view);
+    update_storage_image_descriptor(ctx->device, ctx->vpp_desc_set, 2, dst->y_view);
+    update_storage_image_descriptor(ctx->device, ctx->vpp_desc_set, 3, dst->uv_view);
+
+    const int32_t pc[10] = {
+        sx, sy, sw, sh,
+        dx, dy, dw, dh,
+        (int32_t)dst->width, (int32_t)dst->height
+    };
+
+    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->vpp_layout, 0, 1, &ctx->vpp_desc_set, 0, NULL);
+    vkCmdPushConstants(cmd_buf, ctx->vpp_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdDispatch(cmd_buf, ((uint32_t)dw + 15) / 16, ((uint32_t)dh + 15) / 16, 1);
+    insert_compute_barrier(cmd_buf);
+
+    if (gpu_compute_end_picture(ctx) != 0) return -1;
+    return gpu_compute_sync(ctx);
 }
 
 int gpu_compute_dispatch_me_only(gpu_context_t *ctx, gpu_image_t render_target, int width, int height) {

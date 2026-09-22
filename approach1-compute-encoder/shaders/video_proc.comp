@@ -1,0 +1,136 @@
+/* bc250-encoding-decoding-fix - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/*
+ * video_proc.comp - scale and crop one NV12 surface into another.
+ *
+ * VAEntrypointVideoProc, eight bit. This is what scale_vaapi asks for.
+ * There is no colour conversion here because there is nothing to convert
+ * between: every surface this driver hands out is two-plane YUV 4:2:0,
+ * so the source and the destination are always the same colour space.
+ *
+ * ⚠️ video_proc10.comp is this same shader at ten bits. The two are kept
+ * as separate files rather than one with an #include, because the build
+ * compiles every .comp in this directory with no include path. They must
+ * be changed together - a fix here that is not made there is a bug that
+ * only appears on Main 10 content.
+ *
+ * Bilinear, not bicubic and not a windowed sinc. It is what the hardware
+ * scalers in this class do, it costs four fetches, and anything sharper
+ * would be a choice to defend with pictures rather than an obvious win.
+ *
+ * ⚠️ Except when shrinking, where plain bilinear is not a choice but
+ * a bug. Four taps two samples apart cannot represent what happens to
+ * the sixteen samples between them, so a 4:1 reduction throws away most
+ * of the picture and aliases the rest. Measured against ffmpeg on a hard
+ * synthetic pattern: 33 dB at 4:1 with point sampling, and that gap is
+ * visible. So the footprint of the destination pixel is integrated,
+ * which is what any scaler does when it minifies - and at a ratio of one
+ * the loop runs once with a zero offset, so a 1:1 pass is still exactly
+ * a copy.
+ */
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, r8)  uniform readonly  image2D srcY;
+layout(set = 0, binding = 1, rg8) uniform readonly  image2D srcUV;
+layout(set = 0, binding = 2, r8)  uniform writeonly image2D dstY;
+layout(set = 0, binding = 3, rg8) uniform writeonly image2D dstUV;
+
+/* ⚠️ Ten words, the same forty bytes every other pipeline layout in this
+ * driver pushes. ivec4 aligns to sixteen, so src lands at 0, dst at 16
+ * and limit at 32 - which is exactly words 0..3, 4..7 and 8..9 of the
+ * uint32_t[10] the C side sends. */
+layout(push_constant) uniform PushConstants {
+    ivec4 src;    /* x, y, width, height - in luma samples */
+    ivec4 dst;    /* the same, in the destination */
+    ivec2 limit;  /* the destination's whole luma size, to stay inside */
+} pc;
+
+float fetch_y(vec2 p)
+{
+    vec2 lo = vec2(pc.src.xy);
+    vec2 hi = vec2(pc.src.xy + pc.src.zw) - vec2(1.0);
+    p = clamp(p, lo, hi);
+
+    ivec2 a = ivec2(floor(p));
+    ivec2 b = min(a + ivec2(1), ivec2(hi));
+    vec2 f = p - vec2(a);
+
+    float p00 = imageLoad(srcY, ivec2(a.x, a.y)).r;
+    float p10 = imageLoad(srcY, ivec2(b.x, a.y)).r;
+    float p01 = imageLoad(srcY, ivec2(a.x, b.y)).r;
+    float p11 = imageLoad(srcY, ivec2(b.x, b.y)).r;
+    return mix(mix(p00, p10, f.x), mix(p01, p11, f.x), f.y);
+}
+
+vec2 fetch_uv(vec2 p)
+{
+    vec2 lo = vec2(pc.src.xy >> 1);
+    vec2 hi = vec2((pc.src.xy + pc.src.zw) >> 1) - vec2(1.0);
+    p = clamp(p, lo, hi);
+
+    ivec2 a = ivec2(floor(p));
+    ivec2 b = min(a + ivec2(1), ivec2(hi));
+    vec2 f = p - vec2(a);
+
+    vec2 p00 = imageLoad(srcUV, ivec2(a.x, a.y)).rg;
+    vec2 p10 = imageLoad(srcUV, ivec2(b.x, a.y)).rg;
+    vec2 p01 = imageLoad(srcUV, ivec2(a.x, b.y)).rg;
+    vec2 p11 = imageLoad(srcUV, ivec2(b.x, b.y)).rg;
+    return mix(mix(p00, p10, f.x), mix(p01, p11, f.x), f.y);
+}
+
+void main()
+{
+    ivec2 rel = ivec2(gl_GlobalInvocationID.xy);
+    if (rel.x >= pc.dst.z || rel.y >= pc.dst.w) return;
+
+    ivec2 out_pos = pc.dst.xy + rel;
+    if (out_pos.x >= pc.limit.x || out_pos.y >= pc.limit.y) return;
+
+    vec2 ratio = vec2(pc.src.zw) / vec2(pc.dst.zw);
+
+    /* How many taps to spread across the destination pixel's footprint.
+     * One when enlarging or copying; the reduction factor when shrinking,
+     * capped at eight per axis. Past 8:1 the result aliases a little
+     * again, which is a price worth paying over a 4K frame spending
+     * thousands of fetches on one output sample. */
+    ivec2 taps = clamp(ivec2(ratio), ivec2(1), ivec2(8));
+    vec2 tap_step = ratio / vec2(taps);
+
+    /* Sample at the centre of the destination pixel mapped back into the
+     * source, which is the half-sample offset that keeps a 1:1 copy
+     * exactly a copy instead of shifting it half a pixel. */
+    vec2 sp = (vec2(rel) + vec2(0.5)) * ratio + vec2(pc.src.xy) - vec2(0.5);
+
+    float y = 0.0;
+    for (int j = 0; j < taps.y; j++) {
+        for (int i = 0; i < taps.x; i++) {
+            vec2 off = (vec2(i, j) - vec2(taps - ivec2(1)) * 0.5) * tap_step;
+            y += fetch_y(sp + off);
+        }
+    }
+    y /= float(taps.x * taps.y);
+    imageStore(dstY, out_pos, vec4(y, 0.0, 0.0, 1.0));
+
+    /* One chroma sample per two-by-two luma block. ⚠️ Driven by the
+     * position inside the destination rectangle, not by the parity of the
+     * absolute coordinate: the C side has already rounded the rectangle's
+     * origin to an even number, because an odd one cannot be expressed in
+     * a 4:2:0 plane at all. */
+    if (((rel.x | rel.y) & 1) == 0) {
+        ivec2 cout = (pc.dst.xy + rel) >> 1;
+        if (cout.x < (pc.limit.x >> 1) && cout.y < (pc.limit.y >> 1)) {
+            vec2 cp = (vec2(rel >> 1) + vec2(0.5)) * ratio
+                      + vec2(pc.src.xy >> 1) - vec2(0.5);
+            vec2 uv = vec2(0.0);
+            for (int j = 0; j < taps.y; j++) {
+                for (int i = 0; i < taps.x; i++) {
+                    vec2 off = (vec2(i, j) - vec2(taps - ivec2(1)) * 0.5) * tap_step;
+                    uv += fetch_uv(cp + off * 0.5);
+                }
+            }
+            uv /= float(taps.x * taps.y);
+            imageStore(dstUV, cout, vec4(uv, 0.0, 1.0));
+        }
+    }
+}

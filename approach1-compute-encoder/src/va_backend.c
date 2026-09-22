@@ -49,6 +49,8 @@ VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list
     profile_list[i++] = VAProfileHEVCMain;
     /* Decode only: the encoder here is eight bit. */
     profile_list[i++] = VAProfileHEVCMain10;
+    /* Post-processing hangs off no codec at all. */
+    profile_list[i++] = VAProfileNone;
 
     *num_profiles = i;
     return VA_STATUS_SUCCESS;
@@ -66,7 +68,8 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
                                 profile == VAProfileH264Main ||
                                 profile == VAProfileH264High ||
                                 profile == VAProfileHEVCMain ||
-                                profile == VAProfileHEVCMain10);
+                                profile == VAProfileHEVCMain10 ||
+                                profile == VAProfileNone);
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -77,6 +80,17 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
     /* H.264 and H.265 can be both encoded and decoded. Main 10 can only
      * be decoded: the encoder writes eight-bit streams and says so in its
      * own sequence parameter set. */
+    /* VAProfileNone is post-processing and nothing else. */
+    if (profile == VAProfileNone) {
+        if (!entrypoint_list) {
+            *num_entrypoints = 1;
+            return VA_STATUS_SUCCESS;
+        }
+        entrypoint_list[0] = VAEntrypointVideoProc;
+        *num_entrypoints = 1;
+        return VA_STATUS_SUCCESS;
+    }
+
     const int can_decode = (profile == VAProfileH264ConstrainedBaseline ||
                             profile == VAProfileH264Baseline ||
                             profile == VAProfileH264Main ||
@@ -109,9 +123,15 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
                  * offering eight as well would let an application create
                  * NV12 surfaces for a stream the decoder will write ten
                  * bits into. */
-                attrib_list[i].value = (profile == VAProfileHEVCMain10)
-                                     ? VA_RT_FORMAT_YUV420_10
-                                     : VA_RT_FORMAT_YUV420;
+                if (profile == VAProfileHEVCMain10)
+                    attrib_list[i].value = VA_RT_FORMAT_YUV420_10;
+                else if (profile == VAProfileNone)
+                    /* Post-processing takes either, and keeps the depth:
+                     * it scales, it does not convert. */
+                    attrib_list[i].value = VA_RT_FORMAT_YUV420
+                                         | VA_RT_FORMAT_YUV420_10;
+                else
+                    attrib_list[i].value = VA_RT_FORMAT_YUV420;
                 break;
             case VAConfigAttribRateControl:
                 /* Meaningless for decoding, and saying so is better than
@@ -263,14 +283,17 @@ VAStatus bc250_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config, V
      * ignore it the way it used to. An unknown config answers NV12,
      * which is what every caller got before. */
     bc250_driver_data *data = get_driver_data(ctx);
-    int ten_bit = 0;
+    int ten_bit = 0, both = 0;
     if (data && VALID_ID(config, MAX_CONFIGS)
         && data->configs[config].allocated) {
-        ten_bit = data->configs[config].profile == VAProfileHEVCMain10;
+        const VAProfile prof = data->configs[config].profile;
+        ten_bit = prof == VAProfileHEVCMain10;
+        /* Post-processing works at either depth, so it says so. */
+        both = prof == VAProfileNone;
     }
 
     if (!attrib_list) {
-        *num_attribs = 3;
+        *num_attribs = both ? 4 : 3;
         return VA_STATUS_SUCCESS;
     }
 
@@ -280,6 +303,14 @@ VAStatus bc250_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config, V
     attrib_list[i].value.type = VAGenericValueTypeInteger;
     attrib_list[i].value.value.i = ten_bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
     i++;
+
+    if (both) {
+        attrib_list[i].type = VASurfaceAttribPixelFormat;
+        attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+        attrib_list[i].value.type = VAGenericValueTypeInteger;
+        attrib_list[i].value.value.i = VA_FOURCC_P010;
+        i++;
+    }
 
     attrib_list[i].type = VASurfaceAttribMaxWidth;
     attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
@@ -503,6 +534,18 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                         }
                     }
                 }
+            } else if (entry == VAEntrypointVideoProc) {
+                /* ⚠️ Refused here rather than at vaEndPicture. Without the
+                 * shaders there is nothing to scale with, and finding that
+                 * out halfway through a frame gives the application an
+                 * error it cannot do anything about. */
+                if (data->gpu.vpp_pipeline == VK_NULL_HANDLE) {
+                    memset(c, 0, sizeof(*c));
+                    DRIVER_UNLOCK(data);
+                    return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+                }
+                c->vpp = 1;
+                c->vpp_state.source = VA_INVALID_SURFACE;
             } else if (entry == VAEntrypointVLD) {
                 if (prof == VAProfileHEVCMain || prof == VAProfileHEVCMain10)
                     c->h265_dec = hevc_decoder_create(&data->gpu, picture_width,
@@ -859,6 +902,50 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
         return VA_STATUS_SUCCESS;
     }
 
+    if (c->vpp) {
+        for (int i = 0; i < num_buffers; i++) {
+            VABufferID buf_id = buffers[i];
+            if (!VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated)
+                continue;
+            bc250_buffer *b = &data->buffers[buf_id];
+            if (b->type != VAProcPipelineParameterBufferType) continue;
+            if (b->size < sizeof(VAProcPipelineParameterBuffer)) continue;
+
+            const VAProcPipelineParameterBuffer *pp = b->data;
+
+            /* Filters are advertised as none, so a caller asking for one
+             * is asking for something this driver said it cannot do. */
+            if (pp->num_filters > 0) {
+                DRIVER_UNLOCK(data);
+                return VA_STATUS_ERROR_UNSUPPORTED_FILTER;
+            }
+            if (pp->rotation_state != VA_ROTATION_NONE
+                || pp->mirror_state != VA_MIRROR_NONE) {
+                DRIVER_UNLOCK(data);
+                return VA_STATUS_ERROR_UNSUPPORTED_FILTER;
+            }
+
+            c->vpp_state.source = pp->surface;
+            c->vpp_state.has_source = 1;
+
+            /* ⚠️ Dereferenced HERE. These point into the caller's memory
+             * and are only guaranteed to be alive for this call; the
+             * buffer holds the pointers, not the rectangles. */
+            c->vpp_state.has_src_rect = 0;
+            if (pp->surface_region) {
+                c->vpp_state.src_rect = *pp->surface_region;
+                c->vpp_state.has_src_rect = 1;
+            }
+            c->vpp_state.has_dst_rect = 0;
+            if (pp->output_region) {
+                c->vpp_state.dst_rect = *pp->output_region;
+                c->vpp_state.has_dst_rect = 1;
+            }
+        }
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_SUCCESS;
+    }
+
     for (int i = 0; i < num_buffers; i++) {
         VABufferID buf_id = buffers[i];
         if (!VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated) continue;
@@ -1133,6 +1220,43 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     bc250_surface *surf = &data->surfaces[c->current_render_target];
+
+    if (c->vpp) {
+        if (!c->vpp_state.has_source
+            || !VALID_ID(c->vpp_state.source, MAX_SURFACES)
+            || !data->surfaces[c->vpp_state.source].allocated
+            || data->surfaces[c->vpp_state.source].pending_destroy) {
+            DRIVER_UNLOCK(data);
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        bc250_surface *from = &data->surfaces[c->vpp_state.source];
+
+        /* Whole surface unless the caller named a rectangle. */
+        int sr[4] = { 0, 0, from->width, from->height };
+        int dr[4] = { 0, 0, surf->width, surf->height };
+        if (c->vpp_state.has_src_rect) {
+            sr[0] = c->vpp_state.src_rect.x; sr[1] = c->vpp_state.src_rect.y;
+            sr[2] = c->vpp_state.src_rect.width;
+            sr[3] = c->vpp_state.src_rect.height;
+        }
+        if (c->vpp_state.has_dst_rect) {
+            dr[0] = c->vpp_state.dst_rect.x; dr[1] = c->vpp_state.dst_rect.y;
+            dr[2] = c->vpp_state.dst_rect.width;
+            dr[3] = c->vpp_state.dst_rect.height;
+        }
+        if (sr[0] < 0 || sr[1] < 0 || dr[0] < 0 || dr[1] < 0
+            || sr[0] + sr[2] > from->width || sr[1] + sr[3] > from->height
+            || dr[0] + dr[2] > surf->width || dr[1] + dr[3] > surf->height) {
+            DRIVER_UNLOCK(data);
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        }
+
+        const int rc = gpu_compute_video_proc(&data->gpu, &from->image, sr,
+                                              &surf->image, dr);
+        c->vpp_state.has_source = 0;
+        DRIVER_UNLOCK(data);
+        return rc == 0 ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_OPERATION_FAILED;
+    }
 
     if (c->h265_dec) {
         VASurfaceID target = c->current_render_target;
@@ -1785,13 +1909,13 @@ VAStatus bc250_SetDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *at
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
+/* None, and that is the honest answer. This driver's post-processing
+ * scales and crops; deinterlacing, denoise, sharpening and colour
+ * balance are not implemented, and saying otherwise would get them asked
+ * for and then refused a frame later. */
 VAStatus bc250_QueryVideoProcFilters(VADriverContextP ctx, VAContextID context, VAProcFilterType *filters, unsigned int *num_filters) {
-    (void)ctx; (void)context;
+    (void)ctx; (void)context; (void)filters;
     if (!num_filters) return VA_STATUS_ERROR_INVALID_PARAMETER;
-    if (!filters) {
-        *num_filters = 0;
-        return VA_STATUS_SUCCESS;
-    }
     *num_filters = 0;
     return VA_STATUS_SUCCESS;
 }
@@ -1804,9 +1928,45 @@ VAStatus bc250_QueryVideoProcFilterCaps(VADriverContextP ctx, VAContextID contex
 }
 
 VAStatus bc250_QueryVideoProcPipelineCaps(VADriverContextP ctx, VAContextID context, VABufferID *filters, unsigned int num_filters, VAProcPipelineCaps *pipeline_caps) {
-    (void)ctx; (void)context; (void)filters; (void)num_filters;
+    (void)ctx; (void)context; (void)filters;
     if (!pipeline_caps) return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    /* The caller reads these through the pointers below, so they outlive
+     * the call: static, like every other driver does it. */
+    static uint32_t formats[] = { VA_FOURCC_NV12, VA_FOURCC_P010 };
+    static VAProcColorStandardType standards[] = { VAProcColorStandardNone };
+
     memset(pipeline_caps, 0, sizeof(*pipeline_caps));
+
+    /* A filter asked for is a filter this driver said it does not have. */
+    if (num_filters > 0) return VA_STATUS_ERROR_UNSUPPORTED_FILTER;
+
+    pipeline_caps->pipeline_flags = 0;
+    pipeline_caps->filter_flags = 0;
+    pipeline_caps->num_forward_references = 0;
+    pipeline_caps->num_backward_references = 0;
+    pipeline_caps->input_color_standards = standards;
+    pipeline_caps->num_input_color_standards = 1;
+    pipeline_caps->output_color_standards = standards;
+    pipeline_caps->num_output_color_standards = 1;
+    /* Scaling and cropping only. No rotation, no mirroring, no blending:
+     * every one of those would be a shader that does not exist. */
+    pipeline_caps->rotation_flags = 1u << VA_ROTATION_NONE;
+    pipeline_caps->blend_flags = 0;
+    pipeline_caps->mirror_flags = VA_MIRROR_NONE;
+    pipeline_caps->num_additional_outputs = 0;
+    pipeline_caps->num_input_pixel_formats = 2;
+    pipeline_caps->input_pixel_format = formats;
+    pipeline_caps->num_output_pixel_formats = 2;
+    pipeline_caps->output_pixel_format = formats;
+    pipeline_caps->max_input_width = BC250_MAX_WIDTH;
+    pipeline_caps->max_input_height = BC250_MAX_HEIGHT;
+    pipeline_caps->min_input_width = 2;
+    pipeline_caps->min_input_height = 2;
+    pipeline_caps->max_output_width = BC250_MAX_WIDTH;
+    pipeline_caps->max_output_height = BC250_MAX_HEIGHT;
+    pipeline_caps->min_output_width = 2;
+    pipeline_caps->min_output_height = 2;
     return VA_STATUS_SUCCESS;
 }
 
@@ -1916,6 +2076,21 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
      * size libva's internal arrays, they aren't a "supported" flag. */
     ctx->max_subpic_formats = 1;
     ctx->max_display_attributes = 1;
+
+    /* ⚠️ The second vtable. Post-processing does not go in the main one,
+     * and a driver that fills in only the main one has libva answering
+     * UNIMPLEMENTED on its behalf - which is what happened here, with all
+     * three functions sitting written and unreachable.
+     *
+     * libva allocates it before calling us; guarded anyway, because a
+     * null here would be a segfault at driver load rather than a missing
+     * feature. */
+    if (ctx->vtable_vpp) {
+        ctx->vtable_vpp->version = VA_DRIVER_VTABLE_VPP_VERSION;
+        ctx->vtable_vpp->vaQueryVideoProcFilters = bc250_QueryVideoProcFilters;
+        ctx->vtable_vpp->vaQueryVideoProcFilterCaps = bc250_QueryVideoProcFilterCaps;
+        ctx->vtable_vpp->vaQueryVideoProcPipelineCaps = bc250_QueryVideoProcPipelineCaps;
+    }
 
     /* Wire complete vtable */
     ctx->vtable->vaTerminate = bc250_Terminate;
