@@ -36,17 +36,17 @@ static bool FUNC(untouchable)(const hevcd_t *d, int x, int y)
     return d->no_filter[(y >> l) * stride + (x >> l)] != 0;
 }
 
-/* One four-line segment of a luma FUNC(edge).
+/* One four-line segment of a luma edge.
  *
  * `base` points at q0 of the first line, `forward` steps from p to q and
- * `giu` steps from one line to the next: for a vertical FUNC(edge) those are one
- * sample and one row, for a horizontal FUNC(edge) the other way round. Writing
+ * `giu` steps from one line to the next: for a vertical edge those are one
+ * sample and one row, for a horizontal edge the other way round. Writing
  * it once in these two steps is what keeps the two directions from
  * drifting apart, which is where a hand-unrolled deblocking filter usually
  * goes wrong.
  */
 static void FUNC(filter_luma)(pixel *base, int forward, int giu,
-                        int beta, int tc, bool keep_p, bool keep_q, int bd)
+                        int beta, int tc, bool keep_p, bool keep_q)
 {
 #define P(k, i) ((int)base[(i) * giu - ((k) + 1) * forward])
 #define Q(k, i) ((int)base[(i) * giu + (k) * forward])
@@ -57,7 +57,7 @@ static void FUNC(filter_luma)(pixel *base, int forward, int giu,
 
     /* 8.7.2.5.3. The decision looks at the first and the last line of the
      * four and at nothing in between: four lines of an eight-sample block
-     * FUNC(edge) are alike enough that two of them decide for all four, and
+     * edge are alike enough that two of them decide for all four, and
      * halving the work of the decision was worth it to the committee. */
     const int dp0 = abs(P(2, 0) - 2 * P(1, 0) + P(0, 0));
     const int dp3 = abs(P(2, 3) - 2 * P(1, 3) + P(0, 3));
@@ -72,7 +72,7 @@ static void FUNC(filter_luma)(pixel *base, int forward, int giu,
 
     /* 8.7.2.5.6: strong only when the step really is a step - flat on both
      * sides, and the jump across small enough to be an artefact rather
-     * than an FUNC(edge) that belongs to the picture. */
+     * than an edge that belongs to the picture. */
     bool forte = true;
     for (int i = 0; i < 4 && forte; i += 3) {
         const int dpq = 2 * (i == 0 ? dpq0 : dpq3);
@@ -139,9 +139,9 @@ static void FUNC(filter_luma)(pixel *base, int forward, int giu,
 }
 
 /* 8.7.2.5.5. Chroma gets one sample each side and no decision at all: it
- * is filtered where the boundary FUNC(strength) is two and nowhere else, which
- * in an intra picture means every FUNC(edge). */
-static void FUNC(filter_chroma)(pixel *base, int forward, int giu, int tc, int bd,
+ * is filtered where the boundary strength is two and nowhere else, which
+ * in an intra picture means every edge. */
+static void FUNC(filter_chroma)(pixel *base, int forward, int giu, int tc,
                          bool keep_p, bool keep_q)
 {
     for (int i = 0; i < 4; i++) {
@@ -164,7 +164,7 @@ static int FUNC(qp_chroma)(int qp_i)
     return hevcd_qp_c[qp_i - 30];
 }
 
-/* beta and tC for one FUNC(edge), 8.7.2.5.3. The boundary FUNC(strength) only ever
+/* beta and tC for one edge, 8.7.2.5.3. The boundary strength only ever
  * reaches the tables through tC, and only by two quantiser steps. */
 static int FUNC(beta_di)(const hevcd_t *d, int qp)
 {
@@ -178,7 +178,7 @@ static int FUNC(tc_di)(const hevcd_t *d, int qp, int bs)
     return hevcd_tc[q] << (d->sps->bit_depth_luma - 8);
 }
 
-/* Is the FUNC(edge) on this side of an 8x8 cell one the filter may cross. */
+/* Is the edge on this side of an 8x8 cell one the filter may cross. */
 static bool FUNC(edge)(const hevcd_t *d, int x, int y, int which)
 {
     return (d->edges[(y >> 3) * d->edges_stride + (x >> 3)] & which) != 0;
@@ -186,13 +186,13 @@ static bool FUNC(edge)(const hevcd_t *d, int x, int y, int which)
 
 /* 8.7.2.4. Two, one, or nothing at all.
  *
- * Two means an intra block is involved and the step across the FUNC(edge) is
+ * Two means an intra block is involved and the step across the edge is
  * whatever the prediction could not reach; that is worth the strong
  * filter and it is the only case where chroma is touched at all. One
  * means two inter blocks that disagree - a coded residual at a transform
- * FUNC(edge), different reference pictures, or motion a quarter sample apart.
+ * edge, different reference pictures, or motion a quarter sample apart.
  * Nothing means two blocks that were predicted the same way from the same
- * place, where any step across the FUNC(edge) would be something the filter
+ * place, where any step across the edge would be something the filter
  * invented.
  */
 static int FUNC(strength)(const hevcd_t *d, int xp, int yp, int xq, int yq,
@@ -241,7 +241,7 @@ static int FUNC(strength)(const hevcd_t *d, int xp, int yp, int xq, int yq,
         return (DIFFER(p, 0, q, 1) || DIFFER(p, 1, q, 0)) ? 1 : 0;
     }
 
-    /* The same picture twice: either pairing will do, and the FUNC(edge) is
+    /* The same picture twice: either pairing will do, and the edge is
      * quiet if either one is close enough. */
     const bool dritte = !(DIFFER(p, 0, q, 0) || DIFFER(p, 1, q, 1));
     const bool crossed_refs = !(DIFFER(p, 0, q, 1) || DIFFER(p, 1, q, 0));
@@ -250,7 +250,7 @@ static int FUNC(strength)(const hevcd_t *d, int xp, int yp, int xq, int yq,
 }
 
 /* One direction over the whole picture. `vertical` says which edges are
- * looked at, not which way the filter reads: a vertical FUNC(edge) is filtered
+ * looked at, not which way the filter reads: a vertical edge is filtered
  * along x and stepped along y. */
 static void FUNC(one_direction)(hevcd_t *d, bool vertical)
 {
@@ -261,7 +261,7 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical)
 
     for (int y = 0; y < sps->height; y += vertical ? 4 : 8)
         for (int x = 0; x < sps->width; x += vertical ? 8 : 4) {
-            /* The picture's own border is never an FUNC(edge), and neither is a
+            /* The picture's own border is never an edge, and neither is a
              * position the coding tree never put a block boundary at. */
             if (vertical ? x == 0 : y == 0) continue;
             if (!FUNC(edge)(d, x, y, which)) continue;
@@ -282,7 +282,7 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical)
             FUNC(filter_luma)((pixel *)d->plane[0]
                         + (size_t)y * d->stride[0] + x,
                         forward_l, giu_l, FUNC(beta_di)(d, qp), FUNC(tc_di)(d, qp, bs),
-                        keep_p, keep_q, d->sps->bit_depth_luma);
+                        keep_p, keep_q);
 
             /* ⚠️ Chroma is filtered on its own grid, which is eight chroma
              * samples and therefore sixteen luma ones. Filtering it
@@ -306,7 +306,7 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical)
                 FUNC(filter_chroma)((pixel *)d->plane[c]
                              + (size_t)(y / 2) * d->stride[c]
                              + x / 2, forward_c, giu_c, tc,
-                             d->sps->bit_depth_chroma, keep_p, keep_q);
+                             keep_p, keep_q);
             }
         }
 }
@@ -334,7 +334,7 @@ static void FUNC(deblock)(hevcd_t *d)
  *
  * ⚠️ It reads the picture the deblocking filter produced and writes a
  * different one. An implementation that reads and writes the same plane
- * gets the band offset right and the FUNC(edge) offset wrong, in a way that is
+ * gets the band offset right and the edge offset wrong, in a way that is
  * worth a handful of sample values and shows up only where the offsets
  * are large - which is exactly where nobody looks first.
  */
@@ -343,7 +343,7 @@ static int FUNC(sign)(int v)
     return v > 0 ? 1 : (v < 0 ? -1 : 0);
 }
 
-/* Which two neighbours each FUNC(edge) class compares against: horizontal,
+/* Which two neighbours each edge class compares against: horizontal,
  * vertical, and the two diagonals. */
 static const int8_t FUNC(sao_dx)[4][2] = { { -1, 1 }, { 0, 0 }, { -1, 1 }, { 1, -1 } };
 static const int8_t FUNC(sao_dy)[4][2] = { { 0, 0 }, { -1, 1 }, { -1, 1 }, { -1, 1 } };
@@ -382,7 +382,7 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
         return;
     }
 
-    /* By FUNC(edge): each sample is compared with two neighbours along one of
+    /* By edge: each sample is compared with two neighbours along one of
      * four directions, which sorts it into a valley, a step, or a peak,
      * and each of those gets its own offset. */
     const int cl = s->category[c];

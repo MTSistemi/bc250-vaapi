@@ -223,7 +223,13 @@ int hevc_ps_read_sps(hevc_sps_t *out, const uint8_t *rbsp, size_t n)
 
     s.bit_depth_luma = 8 + (int)br_read_ue(&br);
     s.bit_depth_chroma = 8 + (int)br_read_ue(&br);
-    if (s.bit_depth_luma != 8 || s.bit_depth_chroma != 8)
+    /* ⚠️ Main and Main 10, and the two depths must be equal. Every
+     * template in the decoder is built for eight and for ten, and every
+     * line that picks between them reads the LUMA depth. A stream with
+     * ten-bit luma and eight-bit chroma would take the ten-bit path for
+     * both planes and be wrong in the chroma without a word. */
+    if ((s.bit_depth_luma != 8 && s.bit_depth_luma != 10)
+        || s.bit_depth_chroma != s.bit_depth_luma)
         return PS_UNSUPPORTED;
 
     s.log2_max_poc_lsb = 4 + (int)br_read_ue(&br);

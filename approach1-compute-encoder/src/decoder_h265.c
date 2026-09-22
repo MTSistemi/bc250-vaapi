@@ -72,18 +72,25 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
 {
     const int w = sps->width, h = sps->height;
     const size_t n_mvf = (size_t)(w >> 2) * (h >> 2);
+    /* ⚠️ Above eight bits a sample is two bytes. n_planes counts BYTES,
+     * because that is what the SAO snapshot mallocs and copies, and it
+     * doubles as the test below: a sequence that changes depth finds the
+     * size different and reallocates, instead of writing ten-bit samples
+     * into a buffer sized for eight. Luma and chroma share the figure,
+     * which holds while we refuse streams whose two depths differ. */
+    const size_t bytes = sps->bit_depth_luma > 8 ? 2 : 1;
 
     hevcd_img_t *g = NULL;
     for (int i = 0; i < d->n_buf && !g; i++)
         if (!d->buf[i].is_valid) g = &d->buf[i];
     if (!g) return -1;
 
-    if (g->n_planes != (size_t)w * h) {
+    if (g->n_planes != (size_t)w * h * bytes) {
         free_img(g);
-        g->plane[0] = malloc((size_t)w * h);
-        g->plane[1] = malloc((size_t)(w / 2) * (h / 2));
-        g->plane[2] = malloc((size_t)(w / 2) * (h / 2));
-        g->n_planes = (size_t)w * h;
+        g->plane[0] = malloc((size_t)w * h * bytes);
+        g->plane[1] = malloc((size_t)(w / 2) * (h / 2) * bytes);
+        g->plane[2] = malloc((size_t)(w / 2) * (h / 2) * bytes);
+        g->n_planes = (size_t)w * h * bytes;
     }
     if (g->n_mvf != n_mvf) {
         free(g->mvf);

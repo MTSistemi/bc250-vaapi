@@ -236,7 +236,8 @@ void hevcd_predict_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
 void hevcd_dequantize(int16_t *coeff, int log2_size, int qp, int bd);
 void hevcd_transform(int16_t *coeff, int log2_size, bool dst, int bd);
 void hevcd_skip_transform(int16_t *coeff, int log2_size, int bd);
-void hevcd_add(uint8_t *dst, int stride, const int16_t *res, int log2_size,
+void hevcd_add(uint8_t *plane, int stride, int x, int y,
+               const int16_t *res, int log2_size,
                int bd);
 
 /* 6.5.2: the z-scan address of every smallest transform block. Built once

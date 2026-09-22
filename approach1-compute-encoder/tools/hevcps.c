@@ -142,7 +142,13 @@ static void write_picture(FILE *f, hevc_decoder_t *dc,
     const int x0 = sps->crop_left, y0 = sps->crop_top;
     const int w = sps->width - sps->crop_left - sps->crop_right;
     const int h = sps->height - sps->crop_top - sps->crop_bottom;
-    const size_t n = (size_t)w * h + 2 * (size_t)(w / 2) * (h / 2);
+    /* ⚠️ The strides come back in SAMPLES, so every offset into the plane
+     * is multiplied here and nowhere else. Above eight bits a sample is a
+     * native uint16_t, which on this machine is exactly what ffmpeg calls
+     * yuv420p10le - no byte swapping, by luck rather than design, and
+     * worth knowing if this ever runs somewhere big endian. */
+    const size_t bytes = sps->bit_depth_luma > 8 ? 2 : 1;
+    const size_t n = ((size_t)w * h + 2 * (size_t)(w / 2) * (h / 2)) * bytes;
 
     if (n_output == cap_output) {
         const int new_one = cap_output ? cap_output * 2 : 32;
@@ -156,16 +162,18 @@ static void write_picture(FILE *f, hevc_decoder_t *dc,
 
     size_t o = 0;
     for (int y = 0; y < h; y++) {
-        memcpy(data + o, plane[0] + (size_t)(y0 + y) * stride[0] + x0,
-               (size_t)w);
-        o += (size_t)w;
+        memcpy(data + o,
+               plane[0] + ((size_t)(y0 + y) * stride[0] + x0) * bytes,
+               (size_t)w * bytes);
+        o += (size_t)w * bytes;
     }
     for (int p = 1; p < 3; p++)
         for (int y = 0; y < h / 2; y++) {
             memcpy(data + o,
-                   plane[p] + (size_t)(y0 / 2 + y) * stride[p] + x0 / 2,
-                   (size_t)(w / 2));
-            o += (size_t)(w / 2);
+                   plane[p] + ((size_t)(y0 / 2 + y) * stride[p]
+                               + x0 / 2) * bytes,
+                   (size_t)(w / 2) * bytes);
+            o += (size_t)(w / 2) * bytes;
         }
 
     output_order[n_output].order = order;
