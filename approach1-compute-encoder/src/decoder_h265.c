@@ -35,7 +35,7 @@ static void free_img(hevcd_img_t *g)
     for (int i = 0; i < 3; i++) { free(g->plane[i]); g->plane[i] = NULL; }
     free(g->mvf);
     g->mvf = NULL;
-    g->n_piano = 0;
+    g->n_planes = 0;
     g->n_mvf = 0;
     g->is_valid = false;
 }
@@ -78,12 +78,12 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
         if (!d->buf[i].is_valid) g = &d->buf[i];
     if (!g) return -1;
 
-    if (g->n_piano != (size_t)w * h) {
+    if (g->n_planes != (size_t)w * h) {
         free_img(g);
         g->plane[0] = malloc((size_t)w * h);
         g->plane[1] = malloc((size_t)(w / 2) * (h / 2));
         g->plane[2] = malloc((size_t)(w / 2) * (h / 2));
-        g->n_piano = (size_t)w * h;
+        g->n_planes = (size_t)w * h;
     }
     if (g->n_mvf != n_mvf) {
         free(g->mvf);
@@ -102,7 +102,7 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
     d->current = g;
     d->mvf = g->mvf;
     for (int i = 0; i < 3; i++) { d->plane[i] = g->plane[i]; d->stride[i] = g->stride[i]; }
-    d->n_piano = g->n_piano;
+    d->n_planes = g->n_planes;
     return 0;
 }
 

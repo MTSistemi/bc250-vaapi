@@ -71,7 +71,7 @@ typedef struct {
 typedef struct {
     uint8_t *plane[3];
     int stride[3];
-    size_t n_piano;
+    size_t n_planes;
     int poc;
     bool is_valid;
     hevcd_mvf_t *mvf;
@@ -173,7 +173,7 @@ typedef struct {
      * reads them back. */
     uint8_t *plane[3];
     int stride[3];
-    size_t n_piano;
+    size_t n_planes;
 
     /* The picture being decoded, its motion field, and what it predicts
      * from. The harness owns the buffer and fills these in per slice. */

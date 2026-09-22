@@ -64,9 +64,9 @@ static int ha_ssse3(void)
 __attribute__((target("ssse3")))
 static inline __m128i pair(const int8_t *f, int k)
 {
-    const uint16_t due_byte = (uint16_t)((uint8_t)f[k])
+    const uint16_t two_bytes = (uint16_t)((uint8_t)f[k])
                             | (uint16_t)((uint8_t)f[k + 1] << 8);
-    return _mm_set1_epi16((int16_t)due_byte);
+    return _mm_set1_epi16((int16_t)two_bytes);
 }
 
 /* The same pair as two sixteen-bit lanes, for _mm_madd_epi16 when the

@@ -426,16 +426,16 @@ void hevcd_sao(hevcd_t *d)
         serve = d->sao[i].kind[0] || d->sao[i].kind[1] || d->sao[i].kind[2];
     if (!serve) return;
 
-    const size_t measure[3] = { d->n_piano, d->n_piano / 4, d->n_piano / 4 };
+    const size_t measure[3] = { d->n_planes, d->n_planes / 4, d->n_planes / 4 };
     for (int c = 0; c < 3; c++) {
-        if (!d->copy_of[c] || d->n_copy < d->n_piano) {
+        if (!d->copy_of[c] || d->n_copy < d->n_planes) {
             free(d->copy_of[c]);
             d->copy_of[c] = malloc(measure[c]);
             if (!d->copy_of[c]) return;
         }
         memcpy(d->copy_of[c], d->plane[c], measure[c]);
     }
-    d->n_copy = d->n_piano;
+    d->n_copy = d->n_planes;
 
     for (int ry = 0; ry < d->sps->ctb_height; ry++)
         for (int rx = 0; rx < d->sps->ctb_width; rx++) {

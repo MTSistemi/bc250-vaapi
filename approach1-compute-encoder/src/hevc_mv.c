@@ -393,11 +393,11 @@ static bool scaled(const hevcd_t *d, int x, int y, int l, int list_idx, int ref,
     out[1] = m->mv[l][1];
 
     const int poc_neighbour = d->ref_pic[l][m->ref_idx[l]]->poc;
-    const int poc_mine = d->ref_pic[list_idx][ref]->poc;
-    if (poc_neighbour != poc_mine) {
+    const int poc_self = d->ref_pic[list_idx][ref]->poc;
+    if (poc_neighbour != poc_self) {
         int diff = d->current->poc - poc_neighbour;
         if (!diff) diff = 1;
-        scale_of(out, diff, d->current->poc - poc_mine);
+        scale_of(out, diff, d->current->poc - poc_self);
     }
     return true;
 }
