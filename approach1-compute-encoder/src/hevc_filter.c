@@ -28,9 +28,10 @@ static inline int clip(int v, int lo, int hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-static inline uint8_t clip8(int v)
+static inline int clip_pixel(int v, int bd)
 {
-    return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+    const int max = (1 << bd) - 1;
+    return v < 0 ? 0 : (v > max ? max : v);
 }
 
 /* The luma parameter of the coding unit covering a sample. */
@@ -61,7 +62,7 @@ static bool untouchable(const hevcd_t *d, int x, int y)
  * goes wrong.
  */
 static void filter_luma(uint8_t *base, int forward, int giu,
-                        int beta, int tc, bool keep_p, bool keep_q)
+                        int beta, int tc, bool keep_p, bool keep_q, int bd)
 {
 #define P(k, i) ((int)base[(i) * giu - ((k) + 1) * forward])
 #define Q(k, i) ((int)base[(i) * giu + (k) * forward])
@@ -134,17 +135,17 @@ static void filter_luma(uint8_t *base, int forward, int giu,
         int delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
         if (abs(delta) >= tc * 10) continue;
         delta = clip(delta, -tc, tc);
-        WRITE_P(0, i, clip8(p0 + delta));
-        WRITE_Q(0, i, clip8(q0 - delta));
+        WRITE_P(0, i, (uint8_t)clip_pixel(p0 + delta, bd));
+        WRITE_Q(0, i, (uint8_t)clip_pixel(q0 - delta, bd));
         if (touch_p1) {
             const int dp1 = clip((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1,
                                      -(tc >> 1), tc >> 1);
-            WRITE_P(1, i, clip8(p1 + dp1));
+            WRITE_P(1, i, (uint8_t)clip_pixel(p1 + dp1, bd));
         }
         if (touch_q1) {
             const int dq1 = clip((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1,
                                      -(tc >> 1), tc >> 1);
-            WRITE_Q(1, i, clip8(q1 + dq1));
+            WRITE_Q(1, i, (uint8_t)clip_pixel(q1 + dq1, bd));
         }
     }
 #undef P
@@ -156,7 +157,7 @@ static void filter_luma(uint8_t *base, int forward, int giu,
 /* 8.7.2.5.5. Chroma gets one sample each side and no decision at all: it
  * is filtered where the boundary strength is two and nowhere else, which
  * in an intra picture means every edge. */
-static void filter_chroma(uint8_t *base, int forward, int giu, int tc,
+static void filter_chroma(uint8_t *base, int forward, int giu, int tc, int bd,
                          bool keep_p, bool keep_q)
 {
     for (int i = 0; i < 4; i++) {
@@ -166,8 +167,8 @@ static void filter_chroma(uint8_t *base, int forward, int giu, int tc,
         uint8_t *q1 = base + i * giu + forward;
         const int delta = clip(((((int)*q0 - *p0) * 4) + *p1 - *q1 + 4) >> 3,
                                    -tc, tc);
-        if (!keep_p) *p0 = clip8(*p0 + delta);
-        if (!keep_q) *q0 = clip8(*q0 - delta);
+        if (!keep_p) *p0 = (uint8_t)clip_pixel(*p0 + delta, bd);
+        if (!keep_q) *q0 = (uint8_t)clip_pixel(*q0 - delta, bd);
     }
 }
 
@@ -184,13 +185,13 @@ static int qp_chroma(int qp_i)
 static int beta_di(const hevcd_t *d, int qp)
 {
     const int q = clip(qp + d->slice->beta_offset, 0, 51);
-    return hevcd_beta[q];
+    return hevcd_beta[q] << (d->sps->bit_depth_luma - 8);
 }
 
 static int tc_di(const hevcd_t *d, int qp, int bs)
 {
     const int q = clip(qp + 2 * (bs - 1) + d->slice->tc_offset, 0, 53);
-    return hevcd_tc[q];
+    return hevcd_tc[q] << (d->sps->bit_depth_luma - 8);
 }
 
 /* Is the edge on this side of an 8x8 cell one the filter may cross. */
@@ -296,7 +297,7 @@ static void one_direction(hevcd_t *d, bool vertical)
 
             filter_luma(d->plane[0] + (size_t)y * d->stride[0] + x,
                         forward_l, giu_l, beta_di(d, qp), tc_di(d, qp, bs),
-                        keep_p, keep_q);
+                        keep_p, keep_q, d->sps->bit_depth_luma);
 
             /* ⚠️ Chroma is filtered on its own grid, which is eight chroma
              * samples and therefore sixteen luma ones. Filtering it
@@ -312,13 +313,14 @@ static void one_direction(hevcd_t *d, bool vertical)
                 const int tc = hevcd_tc[clip(qp_chroma(clip(qp + off,
                                                                    0, 57))
                                                  + 2 + d->slice->tc_offset,
-                                                 0, 53)];
+                                                 0, 53)]
+                               << (d->sps->bit_depth_chroma - 8);
                 if (!tc) continue;
                 const int forward_c = vertical ? 1 : d->stride[c];
                 const int giu_c = vertical ? d->stride[c] : 1;
                 filter_chroma(d->plane[c] + (size_t)(y / 2) * d->stride[c]
                              + x / 2, forward_c, giu_c, tc,
-                             keep_p, keep_q);
+                             d->sps->bit_depth_chroma, keep_p, keep_q);
             }
         }
 }
@@ -372,6 +374,7 @@ static void sao_block(hevcd_t *d, int c, int rx, int ry,
     const int side = 1 << log2;
     const int x1 = x0 + side < w ? x0 + side : w;
     const int y1 = y0 + side < h ? y0 + side : h;
+    const int bd = c ? d->sps->bit_depth_chroma : d->sps->bit_depth_luma;
     const int stride = d->stride[c];
     uint8_t *plane = d->plane[c];
     const uint8_t *before = d->copy_of[c];
@@ -385,8 +388,10 @@ static void sao_block(hevcd_t *d, int c, int rx, int ry,
             for (int x = x0; x < x1; x++) {
                 if (untouchable(d, x << giu, y << giu)) continue;
                 uint8_t *p = plane + (size_t)y * stride + x;
-                const int k = ((*p >> 3) - s->position[c]) & 31;
-                if (k < 4) *p = clip8(*p + s->off[c][k]);
+                /* Thirty-two bands over the whole range, so the index
+                 * is the sample shifted down by BitDepth - 5. */
+                const int k = ((*p >> (bd - 5)) - s->position[c]) & 31;
+                if (k < 4) *p = (uint8_t)clip_pixel(*p + s->off[c][k], bd);
             }
         return;
     }
@@ -413,7 +418,8 @@ static void sao_block(hevcd_t *d, int c, int rx, int ry,
              * nor down" lands on zero, which is the one with no offset. */
             if (idx <= 2) idx = (idx == 2) ? 0 : idx + 1;
             if (!idx) continue;
-            plane[(size_t)y * stride + x] = clip8(v + s->off[c][idx - 1]);
+            plane[(size_t)y * stride + x] = (uint8_t)
+                clip_pixel(v + s->off[c][idx - 1], bd);
         }
 }
 

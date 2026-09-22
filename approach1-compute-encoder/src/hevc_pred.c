@@ -22,9 +22,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-static inline uint8_t clip8(int v)
+static inline int clip_pixel(int v, int bd)
 {
-    return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+    const int max = (1 << bd) - 1;
+    return v < 0 ? 0 : (v > max ? max : v);
 }
 
 /* The reference array, laid out around the corner: index 0 is the corner
@@ -100,7 +101,9 @@ static void references(const hevcd_t *d, int c_idx, int x0, int y0, int n,
     }
 
     if (!something) {
-        memset(r, 128, 4 * 64 + 1);           /* 1 << (bitDepth - 1) */
+        const int bd = c_idx ? d->sps->bit_depth_chroma
+                             : d->sps->bit_depth_luma;
+        memset(r, 1 << (bd - 1), 4 * 64 + 1);   /* 8.4.4.2.2 */
         return;
     }
 
@@ -147,9 +150,13 @@ static void filter_edge(const hevcd_t *d, int mode, int n, int c_idx, uint8_t *r
     /* The strong smoothing of a 32x32 block, when both edges are close
      * enough to a straight line that a ramp will do: a gradient with no
      * steps at all, which is what a flat sky needs. */
+    /* ⚠️ 1 << (BitDepth - 5), which is the eight that used to be written
+     * here. Table 8-3 above does not move with the depth - that one is a
+     * distance between mode numbers. */
+    const int flat = 1 << (d->sps->bit_depth_luma - 5);
     if (d->sps->strong_intra_smoothing && n == 32
-        && abs(RIF(r, 0) + RIF(r, 2 * n) - 2 * RIF(r, n)) < 8
-        && abs(RIF(r, 0) + RIF(r, -2 * n) - 2 * RIF(r, -n)) < 8) {
+        && abs(RIF(r, 0) + RIF(r, 2 * n) - 2 * RIF(r, n)) < flat
+        && abs(RIF(r, 0) + RIF(r, -2 * n) - 2 * RIF(r, -n)) < flat) {
         for (int i = 1; i < 2 * n; i++) {
             RIF(f, i) = (uint8_t)(((64 - i) * RIF(r, 0)
                                    + i * RIF(r, 2 * n) + 32) >> 6);
@@ -169,7 +176,7 @@ static void filter_edge(const hevcd_t *d, int mode, int n, int c_idx, uint8_t *r
 }
 
 /* 8.4.4.2.5, planar: a bilinear ramp between the four edges. */
-static void planare(const uint8_t *r, int n, int lg, uint8_t *dst, int stride)
+static void planar(const uint8_t *r, int n, int lg, uint8_t *dst, int stride)
 {
     for (int y = 0; y < n; y++)
         for (int x = 0; x < n; x++)
@@ -209,7 +216,7 @@ static void smoothed(const uint8_t *r, int n, int lg, int c_idx,
  * invAngle is for. Without it the samples past the corner are whatever was
  * left there, and the error is confined to one triangle of the block. */
 static void angular(const uint8_t *r, int mode, int n, int c_idx,
-                     uint8_t *dst, int stride)
+                     uint8_t *dst, int stride, int bd)
 {
     const int ang = hevcd_intra_angle[mode - 2];
     const bool vertical = mode >= 18;
@@ -260,12 +267,12 @@ static void angular(const uint8_t *r, int mode, int n, int c_idx,
     if (c_idx == 0 && n < 32) {
         if (mode == HEVCD_INTRA_ANGULAR_26) {
             for (int y = 0; y < n; y++)
-                dst[y * stride] = clip8(RIF(r, 1)
-                                           + ((RIF(r, -(y + 1)) - RIF(r, 0)) >> 1));
+                dst[y * stride] = (uint8_t)clip_pixel(RIF(r, 1)
+                            + ((RIF(r, -(y + 1)) - RIF(r, 0)) >> 1), bd);
         } else if (mode == HEVCD_INTRA_ANGULAR_10) {
             for (int x = 0; x < n; x++)
-                dst[x] = clip8(RIF(r, -1)
-                                   + ((RIF(r, x + 1) - RIF(r, 0)) >> 1));
+                dst[x] = (uint8_t)clip_pixel(RIF(r, -1)
+                            + ((RIF(r, x + 1) - RIF(r, 0)) >> 1), bd);
         }
     }
 }
@@ -274,8 +281,9 @@ void hevcd_predict_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
                          int mode)
 {
     const int n = 1 << log2_size;
+    const int bd = c_idx ? d->sps->bit_depth_chroma : d->sps->bit_depth_luma;
     uint8_t r[4 * 64 + 1];
-    memset(r, 128, sizeof(r));
+    memset(r, 1 << (bd - 1), sizeof(r));
 
     references(d, c_idx, x0, y0, n, r);
     filter_edge(d, mode, n, c_idx, r);
@@ -283,7 +291,7 @@ void hevcd_predict_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
     uint8_t *dst = d->plane[c_idx] + (size_t)y0 * d->stride[c_idx] + x0;
     const int stride = d->stride[c_idx];
 
-    if (mode == HEVCD_INTRA_PLANAR)      planare(r, n, log2_size, dst, stride);
+    if (mode == HEVCD_INTRA_PLANAR)      planar(r, n, log2_size, dst, stride);
     else if (mode == HEVCD_INTRA_DC)     smoothed(r, n, log2_size, c_idx, dst, stride);
-    else                                 angular(r, mode, n, c_idx, dst, stride);
+    else                                 angular(r, mode, n, c_idx, dst, stride, bd);
 }
