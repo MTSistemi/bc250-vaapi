@@ -345,6 +345,16 @@ int hevc_ps_read_pps(hevc_pps_t *out, const uint8_t *rbsp, size_t n)
     p.tiles_enabled = br_read1(&br) != 0;
     p.entropy_coding_sync_enabled = br_read1(&br) != 0;
 
+    /* ⚠️ Tiles and wavefront together are legal in the standard and are
+     * sent by nothing we have seen; kvazaar, the only encoder here that
+     * writes tiles at all, calls the combination experimental. The
+     * substreams would then run per tile per row, and the state a row
+     * continues from would be the tile's rather than the picture's.
+     * Refused rather than guessed at - a guess here decodes into a
+     * plausible-looking scramble instead of failing. */
+    if (p.tiles_enabled && p.entropy_coding_sync_enabled)
+        return PS_UNSUPPORTED;
+
     p.num_tile_columns = 1;
     p.num_tile_rows = 1;
     p.loop_filter_across_tiles = true;

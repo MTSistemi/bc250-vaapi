@@ -21,6 +21,7 @@ gcc -O2 -g -Wall -Wextra -std=gnu11 \
     "$D/src/hevc_wpp.c" \
     "$D/src/hevc_mv.c" \
     "$D/src/hevc_mc.c" \
+    "$D/src/hevc_tiles.c" \
     "$D/src/hevc_dec_tables.c" \
     "$D/src/cabac.c" \
     -pthread -lm

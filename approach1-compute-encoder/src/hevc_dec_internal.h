@@ -115,6 +115,23 @@ typedef struct {
      * unit is a quadtree, so the block above right of a transform block
      * may or may not have come first. */
     int32_t *min_tb_addr_zs;
+    /* 6.5.1. The picture in tile scan and back again, and which tile each
+     * unit belongs to - that one indexed by TILE-SCAN address, because
+     * the walk asks "has the tile changed since the last unit" and the
+     * walk is in tile scan.
+     *
+     * Built for every picture, tiles or not: without them there is one
+     * tile, the two maps are the identity, and nothing downstream needs
+     * to ask which case it is in. */
+    int32_t *rs_to_ts;
+    int32_t *ts_to_rs;
+    int32_t *tile_of_ts;
+    size_t n_tile_map;
+    int n_tiles;
+    /* Which tile the coding tree unit being read belongs to. Set on the
+     * way into hevcd_read_ctu(), because the availability tests are
+     * asked about a neighbour and know nothing about where "here" is. */
+    int tile_now;
     int8_t *qp_y_map;               /* per min coding block */
     /* Which 8x8 cells of the picture have a block boundary on their left
      * edge (bit 0) and on their top edge (bit 1). The deblocking filter
@@ -243,5 +260,8 @@ void hevcd_add(uint8_t *plane, int stride, int x, int y,
 /* 6.5.2: the z-scan address of every smallest transform block. Built once
  * per sequence parameter set. */
 int hevcd_prepare_zscan(hevcd_t *d);
+int hevcd_prepare_tiles(hevcd_t *d);
+void hevcd_free_tiles(hevcd_t *d);
+int hevcd_tile_at(const hevcd_t *d, int x, int y);
 
 #endif /* BC250_HEVC_DEC_INTERNAL_H */

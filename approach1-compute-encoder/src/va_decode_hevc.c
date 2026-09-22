@@ -222,6 +222,22 @@ static void fill_pps(const VAPictureParameterBufferHEVC *p, hevc_pps_t *q)
     q->num_tile_columns = p->num_tile_columns_minus1 + 1;
     q->num_tile_rows = p->num_tile_rows_minus1 + 1;
     q->loop_filter_across_tiles = p->pic_fields.bits.loop_filter_across_tiles_enabled_flag;
+
+    /* ⚠️ VA carries no uniform_spacing flag. Its own header says the
+     * application fills the width arrays whatever the stream said, so
+     * the layout that arrives here is always the explicit one - which is
+     * why this sets uniform_spacing false rather than passing something
+     * through. hevcd_prepare_tiles() then derives the last column and
+     * the last row, as it does for an explicit layout out of a
+     * bitstream, and the totals have to come out right or it refuses.
+     *
+     * The bounds are VA's own array sizes, checked before the copy in
+     * bc250_hevc_dec_decode(). */
+    q->uniform_spacing = false;
+    for (int i = 0; i < q->num_tile_columns - 1; i++)
+        q->column_width[i] = p->column_width_minus1[i] + 1;
+    for (int i = 0; i < q->num_tile_rows - 1; i++)
+        q->row_height[i] = p->row_height_minus1[i] + 1;
     q->loop_filter_across_slices =
         p->pic_fields.bits.pps_loop_filter_across_slices_enabled_flag;
     q->deblocking_filter_override_enabled =
@@ -264,10 +280,19 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
         || (pp->bit_depth_luma_minus8 != 0 && pp->bit_depth_luma_minus8 != 2)
         || pp->bit_depth_chroma_minus8 != pp->bit_depth_luma_minus8)
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-    /* Tiles put the coding tree units in an order of the picture parameter
-     * set's choosing, and nothing here understands that. Refused rather
-     * than decoded into a scramble. */
-    if (pp->pic_fields.bits.tiles_enabled_flag)
+    /* ⚠️ VA's own arrays hold nineteen column widths and twenty-one row
+     * heights. A layout with more than that has nowhere to have come
+     * from, and copying it would read past the end of the structure the
+     * application handed us. */
+    if (pp->num_tile_columns_minus1 > 19 || pp->num_tile_rows_minus1 > 21)
+        return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+    /* ⚠️ Tiles and wavefront together are refused in the parameter set
+     * parse for the same reason they are refused there: the substreams
+     * would run per tile per row and nothing here walks that. Checked
+     * again on this side because the parameter set never gets parsed on
+     * the VA path - it arrives already taken apart. */
+    if (pp->pic_fields.bits.tiles_enabled_flag
+        && pp->pic_fields.bits.entropy_coding_sync_enabled_flag)
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     if (pp->pic_fields.bits.scaling_list_enabled_flag)
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;

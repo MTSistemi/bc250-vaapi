@@ -304,9 +304,11 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
     memset(d->intra_mode, HEVCD_INTRA_DC, serve_pu);
 
     d->sps = sps;
-    if (!d->current) return 5;
-    if (hevcd_prepare_zscan(d)) return 5;
     d->pps = pps;
+    if (!d->current) return 5;
+    /* ⚠️ Before the z-scan, which is built out of these. */
+    if (hevcd_prepare_tiles(d)) return 5;
+    if (hevcd_prepare_zscan(d)) return 5;
     d->slice = sl;
     d->min_pu_width = sps->width >> 2;
     d->min_pu_height = sps->height >> 2;
@@ -339,8 +341,14 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
     }
 
     const int count = sps->ctb_count;
+    const bool tiles = pps->tiles_enabled;
     int progress = 0;
-    for (int addr = sl->segment_address; addr < count; addr++) {
+    int substream = 0;      /* how many substream boundaries have passed */
+
+    /* ⚠️ Tile scan. Without tiles the map is the identity and this is the
+     * raster walk it always was. */
+    for (int ts = d->rs_to_ts[sl->segment_address]; ts < count; ts++) {
+        const int addr = d->ts_to_rs[ts];
         const int cx = addr % sps->ctb_width;
         const int x = cx << sps->log2_ctb;
         const int y = (addr / sps->ctb_width) << sps->log2_ctb;
@@ -360,51 +368,63 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
         if (getenv("HEVC_TRACE")) {
             const long n_read = (long)((d->cabac.ptr - d->cabac.start) * 8
                                       - d->cabac.cache_bits);
-            fprintf(stderr, "ctu %d (%d,%d): %ld bit su %ld" "\n",
-                    addr, x, y, n_read, (long)(n - first) * 8);
+            fprintf(stderr, "ctu ts %d rs %d (%d,%d): %ld bit su %ld" "\n",
+                    ts, addr, x, y, n_read, (long)(n - first) * 8);
         }
         if (hevcd_overrun(&d->cabac)) return 3;
 
         const int fine = hevcd_terminate(&d->cabac);
         if (fine) {
-            /* ⚠️ It has to end after the LAST one, not merely end. */
-            return (addr == count - 1) ? 0 : 1;
+            /* ⚠️ It has to end after the LAST one in TILE SCAN, which
+             * with tiles is not the bottom right unit of the picture. */
+            return (ts == count - 1) ? 0 : 1;
         }
 
-        /* 7.3.8.1: when the next unit starts a row, this substream ends. */
-        if (wpp && addr + 1 < count
-            && (addr + 1) % sps->ctb_width == 0) {
+        /* 7.3.8.1: the substream ends when the next unit starts a new
+         * tile, or under wavefront a new row. */
+        const bool tile_break = tiles && ts + 1 < count
+                                && d->tile_of_ts[ts + 1] != d->tile_of_ts[ts];
+        const bool row_break = wpp && addr + 1 < count
+                               && (addr + 1) % sps->ctb_width == 0;
+        if (tile_break || row_break) {
             if (!hevcd_terminate(&d->cabac))
                 return 6;                  /* the bit is defined to be one */
 
             const size_t n_used = h264d_cabac_byte_pos(&d->cabac);
 
-            /* Where the header says this row ends. */
+            /* Where the header says this substream ends. One entry point
+             * per substream, counted in the order they are walked, which
+             * is why this is a running index and not a row number: under
+             * tiles the substreams are tiles. */
             size_t step = n_used;
-            if (sl->num_entry_point_offsets > 0) {
-                const int row = addr / sps->ctb_width;
-                if (row < sl->num_entry_point_offsets) {
-                    const uint32_t fin = sl->entry_point[row];
-                    const uint32_t ini = row > 0 ? sl->entry_point[row - 1] : 0;
-                    step = (size_t)(fin - ini);
-                    /* A row may stop short of what the header allows - the
-                     * bytes left over are the engine's own look-ahead. It
-                     * may not run past it: that is a row read wrongly. */
-                    if (n_used > step) return 7;
-                }
+            if (substream < sl->num_entry_point_offsets) {
+                const uint32_t fin = sl->entry_point[substream];
+                const uint32_t ini = substream > 0
+                                     ? sl->entry_point[substream - 1] : 0;
+                step = (size_t)(fin - ini);
+                /* A substream may stop short of what the header allows -
+                 * the bytes left over are the engine's own look-ahead. It
+                 * may not run past it: that is one read wrongly. */
+                if (n_used > step) return 7;
             }
+            substream++;
             if (step >= rest) return 3;
             base += step;
             rest -= step;
             h264d_cabac_init_engine(&d->cabac, base, rest);
-            /* 8.6.1: a row under WPP predicts its first group from the
-             * slice's parameter and not from the end of the row above. */
+            /* 8.6.1: a new substream predicts its first quantisation
+             * group from the slice's own parameter, not from where the
+             * previous one happened to end. */
             d->qg_restarts = true;
 
-            /* 9.3.1: from the snapshot of the row above when the unit
-             * above right exists, and from nothing when it does not -
-             * which is what a picture one unit wide always is. */
-            if (have_snapshot && sps->ctb_width >= 2)
+            /* 9.3.1. A tile starts from nothing: no other tile's state
+             * carries into it, which is the whole point of tiles.
+             * ⚠️ A wavefront row is the opposite - it continues from the
+             * snapshot taken two units into the row above - so the two
+             * cases cannot share this line. */
+            if (tile_break)
+                hevcd_cabac_ctx_init(d->cabac.state, init_type, sl->qp);
+            else if (have_snapshot && sps->ctb_width >= 2)
                 memcpy(d->cabac.state, snapshot, HEVCD_CTX);
             else
                 hevcd_cabac_ctx_init(d->cabac.state, init_type, sl->qp);
@@ -433,6 +453,7 @@ void hevc_decoder_destroy(hevc_decoder_t *h)
     if (!h) return;
     for (int i = 0; i < IMG_SLOTS; i++) free_img(&h->buffer[i]);
     hevcd_t *d = &h->d;
+    hevcd_free_tiles(d);
     free(d->ct_depth); free(d->intra_mode); free(d->min_tb_addr_zs);
     free(d->qp_y_map); free(d->edges); free(d->no_filter);
     free(d->skip); free(d->cbf_map);
