@@ -361,12 +361,6 @@ int main(int argc, char **argv)
                 refused++;
                 continue;
             }
-            if (s.dependent_slice_segment) {
-                fprintf(stderr, "dependent slice segments: not supported\n");
-                refused++;
-                continue;
-            }
-
             if (s.first_slice_in_pic) {
                 if (pictures && !quiet)
                     printf("     (%d slice)\n", slices_of_this);

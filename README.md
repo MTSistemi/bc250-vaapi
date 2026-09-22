@@ -58,6 +58,8 @@ Bit-exact conformance against the reference decoder across **all 302 test cases*
 | `VAProfileHEVCMain` | `VAEntrypointEncSlice` | Vulkan Compute ME + Host Slices | 4096x2160 (4K) |
 | `VAProfileH264*` | `VAEntrypointVLD` (Decode) | Multi-Threaded CPU Wavefront | 4096x2160 (4K) |
 | `VAProfileHEVCMain` | `VAEntrypointVLD` (Decode) | Multi-Threaded CPU Wavefront (WPP) | 4096x2160 (4K) |
+| `VAProfileHEVCMain10` | `VAEntrypointVLD` (Decode) | 10-Bit CPU Wavefront (P010) | 4096x2160 (4K) |
+| `VAProfileNone` | `VAEntrypointVideoProc` | Vulkan Compute Scaler & Cropping | 4096x2160 (4K) |
 
 ---
 

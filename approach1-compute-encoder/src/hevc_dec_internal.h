@@ -76,8 +76,18 @@ typedef struct {
     bool is_valid;
     hevcd_mvf_t *mvf;
     size_t n_mvf;
-    int poc_list[2][16];
-    int n_list[2];
+    /* ⚠️ Per SLICE, and kept with the picture because they are read
+     * long after it is finished: a later picture resolves a collocated
+     * motion vector's reference through the list of the slice that
+     * DECODED that block. One pair per picture handed every block the
+     * last slice's. */
+    struct hevcd_img_lists {
+        int poc_list[2][16];
+        int n_list[2];
+    } *lists;
+    size_t n_lists;
+    int32_t *slice_of_ctb;      /* a copy, taken when the picture ends */
+    size_t n_slice_map;
 } hevcd_img_t;
 
 /* One coding tree block's sample adaptive offset, 7.3.8.3.
@@ -92,6 +102,19 @@ typedef struct {
     uint8_t position[3];   /* which four bands, for the band type */
     uint8_t category[3];      /* which way the edge runs, for the edge type */
 } hevcd_sao_t;
+
+/* What one slice says about the loop filters.
+ *
+ * ⚠️ Per slice and not per picture. Two slices of one picture may
+ * disable deblocking differently, carry different beta and tC offsets,
+ * and disagree about whether the filters may cross between them - and
+ * the filters run once, over the whole picture, after every slice of it
+ * has been read. */
+typedef struct {
+    int16_t beta_offset, tc_offset;
+    uint8_t disabled;
+    uint8_t across_slices;
+} hevcd_slice_filter_t;
 
 typedef struct {
     const hevc_sps_t *sps;
@@ -128,6 +151,30 @@ typedef struct {
     int32_t *tile_of_ts;
     size_t n_tile_map;
     int n_tiles;
+    /* Which SLICE each coding tree block was decoded as part of, by
+     * raster address, or -1 for one nothing has reached yet. 6.4.1 wants
+     * the same slice as well as the same tile, and a hole left at the
+     * end of the picture is a slice that never arrived.
+     *
+     * ⚠️ Slices, not slice segments: a dependent segment continues the
+     * slice before it and carries its number. */
+    int32_t *slice_of_ctb;
+    size_t n_slice_map;
+    int slice_now;
+    /* One entry per slice of this picture, indexed by the number in
+     * slice_of_ctb. */
+    hevcd_slice_filter_t *slice_filter;
+    size_t n_slice_filter;
+    /* 9.3.1: the context state as the previous slice segment left it. A
+     * dependent segment starts from here instead of from the table. */
+    uint8_t ctx_at_segment_end[HEVCD_CTX];
+    bool have_segment_end;
+    /* 9.3.2.3: the state two units into a row, which the row below
+     * starts from. ⚠️ Kept here and not in the walk, because with one
+     * slice segment per row the walk that takes it is not the walk that
+     * needs it. */
+    uint8_t wpp_snapshot[HEVCD_CTX];
+    bool have_wpp_snapshot;
     /* Which tile the coding tree unit being read belongs to. Set on the
      * way into hevcd_read_ctu(), because the availability tests are
      * asked about a neighbour and know nothing about where "here" is. */
@@ -263,5 +310,6 @@ int hevcd_prepare_zscan(hevcd_t *d);
 int hevcd_prepare_tiles(hevcd_t *d);
 void hevcd_free_tiles(hevcd_t *d);
 int hevcd_tile_at(const hevcd_t *d, int x, int y);
+int hevcd_slice_at(const hevcd_t *d, int x, int y);
 
 #endif /* BC250_HEVC_DEC_INTERNAL_H */

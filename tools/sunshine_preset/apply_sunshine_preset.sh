@@ -16,8 +16,19 @@ echo -e "${BLUE}======================================================${NC}"
 echo -e "${BLUE}${BOLD}   Apply BC-250 Sunshine Game Streaming Preset      ${NC}"
 echo -e "${BLUE}======================================================${NC}"
 
+MODE="60"
+if [[ "$1" == "--120" || "$1" == "--120fps" ]]; then
+    MODE="120"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE_CONF="$SCRIPT_DIR/sunshine.conf"
+if [ "$MODE" == "120" ]; then
+    SOURCE_CONF="$SCRIPT_DIR/sunshine_120fps.conf"
+    echo -e "  -> Selecting Mode: ${GREEN}120 FPS Ultra-Low-Latency${NC}"
+else
+    SOURCE_CONF="$SCRIPT_DIR/sunshine.conf"
+    echo -e "  -> Selecting Mode: ${GREEN}Standard 60 FPS${NC} (use --120fps for high refresh)"
+fi
 
 # Locate Sunshine config folder (user configuration takes precedence)
 TARGET_DIR="$HOME/.config/sunshine"
@@ -47,7 +58,16 @@ echo -e "\n${GREEN}======================================================${NC}"
 echo -e "${GREEN}${BOLD}   Sunshine Preset Successfully Applied!             ${NC}"
 echo -e "${GREEN}======================================================${NC}"
 echo -e "\nRecommended Moonlight Client Settings:"
-echo -e "  * Resolution: ${GREEN}1920x1080 (1080p)${NC} or ${GREEN}1280x720 (720p)${NC}"
-echo -e "  * Framerate:  ${GREEN}60 FPS${NC}"
-echo -e "  * Bitrate:    ${GREEN}20 - 30 Mbps${NC}"
-echo -e "  * Video Codec: ${GREEN}H.264${NC}"
+if [ "$MODE" == "120" ]; then
+    echo -e "  * Resolution:  ${GREEN}1920x1080 (1080p)${NC} or ${GREEN}1280x720 (720p)${NC}"
+    echo -e "  * Framerate:   ${GREEN}120 FPS${NC}"
+    echo -e "  * Bitrate:     ${GREEN}30 - 45 Mbps${NC}"
+    echo -e "  * Video Codec: ${GREEN}H.264${NC}"
+    echo -e "  * Target Host Latency: ${GREEN}~3 - 5 ms${NC}"
+else
+    echo -e "  * Resolution:  ${GREEN}1920x1080 (1080p)${NC} or ${GREEN}1280x720 (720p)${NC}"
+    echo -e "  * Framerate:   ${GREEN}60 FPS${NC}"
+    echo -e "  * Bitrate:     ${GREEN}20 - 30 Mbps${NC}"
+    echo -e "  * Video Codec: ${GREEN}H.264${NC}"
+    echo -e "  * Target Host Latency: ${GREEN}~8 ms${NC}"
+fi

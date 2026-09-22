@@ -48,6 +48,7 @@ static bool already_done(const hevcd_t *d, int xc, int yc, int xn, int yn)
      * earlier has LOWER z-scan addresses, so it would pass while being
      * on the other side of a wall. */
     if (hevcd_tile_at(d, xn, yn) != d->tile_now) return false;
+    if (hevcd_slice_at(d, xn, yn) != d->slice_now) return false;
     const int w = sps->width >> sps->log2_min_tb;
     const int32_t a = d->min_tb_addr_zs[(yc >> sps->log2_min_tb) * w
                                         + (xc >> sps->log2_min_tb)];
@@ -85,14 +86,19 @@ static neighbours_t neighbours(const hevcd_t *d, int x0, int y0, int w, int h)
      * comes earlier in raster order, and ⚠️ is in the same tile. */
     const int lg = sps->log2_ctb;
     const int mine = d->tile_now;
+    const int my_slice = d->slice_now;
     const bool ctb_left = cx > 0
-        && hevcd_tile_at(d, (cx - 1) << lg, cy << lg) == mine;
+        && hevcd_tile_at(d, (cx - 1) << lg, cy << lg) == mine
+        && hevcd_slice_at(d, (cx - 1) << lg, cy << lg) == my_slice;
     const bool ctb_above = cy > 0
-        && hevcd_tile_at(d, cx << lg, (cy - 1) << lg) == mine;
+        && hevcd_tile_at(d, cx << lg, (cy - 1) << lg) == mine
+        && hevcd_slice_at(d, cx << lg, (cy - 1) << lg) == my_slice;
     const bool ctb_above_left = cx > 0 && cy > 0
-        && hevcd_tile_at(d, (cx - 1) << lg, (cy - 1) << lg) == mine;
+        && hevcd_tile_at(d, (cx - 1) << lg, (cy - 1) << lg) == mine
+        && hevcd_slice_at(d, (cx - 1) << lg, (cy - 1) << lg) == my_slice;
     const bool ctb_above_right = cy > 0 && cx + 1 < sps->ctb_width
-        && hevcd_tile_at(d, (cx + 1) << lg, (cy - 1) << lg) == mine;
+        && hevcd_tile_at(d, (cx + 1) << lg, (cy - 1) << lg) == mine
+        && hevcd_slice_at(d, (cx + 1) << lg, (cy - 1) << lg) == my_slice;
 
     neighbours_t v;
     v.left = ctb_left || xb;
@@ -147,14 +153,27 @@ static void scale_of(int16_t *mv, int td, int tb)
 /* ------------------------------------------------ the temporal candidate */
 
 /* One list of the collocated picture, as picture order counts. */
-static bool take_col(const hevcd_t *d, const hevcd_mvf_t *col, int list_col,
+static bool take_col(const hevcd_t *d, const hevcd_mvf_t *col,
+                       int cx, int cy, int list_col,
                        int list_idx, int ref_idx, int16_t out[2])
 {
     const hevcd_img_t *c = d->col;
     const int r = col->ref_idx[list_col];
-    if (r < 0 || r >= c->n_list[list_col]) return false;
 
-    const int diff_col = c->poc - c->poc_list[list_col][r];
+    /* ⚠️ Through the list of the slice that decoded THIS block of the
+     * collocated picture. The index stored in a motion vector is an
+     * index into that slice's list and means nothing in another's. */
+    if (!c->lists || !c->slice_of_ctb) return false;
+    const int rs = (cy >> d->sps->log2_ctb) * d->sps->ctb_width
+                   + (cx >> d->sps->log2_ctb);
+    if (rs < 0 || (size_t)rs >= c->n_slice_map) return false;
+    const int s = c->slice_of_ctb[rs];
+    if (s < 0 || (size_t)s >= c->n_lists) return false;
+    const struct hevcd_img_lists *L = &c->lists[s];
+
+    if (r < 0 || r >= L->n_list[list_col]) return false;
+
+    const int diff_col = c->poc - L->poc_list[list_col][r];
     const int diff_ora = d->current->poc - d->ref_pic[list_idx][ref_idx]->poc;
 
     out[0] = col->mv[list_col][0];
@@ -165,14 +184,15 @@ static bool take_col(const hevcd_t *d, const hevcd_mvf_t *col, int list_col,
 }
 
 static bool from_collocated(const hevcd_t *d, const hevcd_mvf_t *col,
+                         int cx, int cy,
                          int list_idx, int ref_idx, int16_t out[2])
 {
     if (!col->pred_flag) return false;                  /* an intra block */
 
     if (!(col->pred_flag & HEVCD_PF_L0))
-        return take_col(d, col, 1, list_idx, ref_idx, out);
+        return take_col(d, col, cx, cy, 1, list_idx, ref_idx, out);
     if (col->pred_flag == HEVCD_PF_L0)
-        return take_col(d, col, 0, list_idx, ref_idx, out);
+        return take_col(d, col, cx, cy, 0, list_idx, ref_idx, out);
 
     /* ⚠️ Both lists. Which one to believe depends on whether anything in
      * this picture's own lists comes after it: when nothing does, every
@@ -186,7 +206,7 @@ static bool from_collocated(const hevcd_t *d, const hevcd_mvf_t *col,
 
     const int which = has_future ? (d->slice->collocated_from_l0 ? 1 : 0)
                                  : list_idx;
-    return take_col(d, col, which, list_idx, ref_idx, out);
+    return take_col(d, col, cx, cy, which, list_idx, ref_idx, out);
 }
 
 /* 8.5.3.2.9: the block at the bottom right of this one in the collocated
@@ -209,14 +229,14 @@ static bool temporal(const hevcd_t *d, int x0, int y0, int w, int h,
         && y < sps->height && x < sps->width) {
         x &= ~15; y &= ~15;
         if (from_collocated(d, &d->col->mvf[(y >> 2) * d->min_pu_width + (x >> 2)],
-                         list_idx, ref_idx, out))
+                         x, y, list_idx, ref_idx, out))
             return true;
     }
 
     x = (x0 + (w >> 1)) & ~15;
     y = (y0 + (h >> 1)) & ~15;
     return from_collocated(d, &d->col->mvf[(y >> 2) * d->min_pu_width + (x >> 2)],
-                        list_idx, ref_idx, out);
+                        x, y, list_idx, ref_idx, out);
 }
 
 /* ------------------------------------------------------------- merge mode */

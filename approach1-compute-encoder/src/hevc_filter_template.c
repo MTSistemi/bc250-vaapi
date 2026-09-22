@@ -164,17 +164,34 @@ static int FUNC(qp_chroma)(int qp_i)
     return hevcd_qp_c[qp_i - 30];
 }
 
-/* beta and tC for one edge, 8.7.2.5.3. The boundary strength only ever
- * reaches the tables through tC, and only by two quantiser steps. */
-static int FUNC(beta_di)(const hevcd_t *d, int qp)
+/* Which slice's loop filter settings govern the sample at these
+ * coordinates, or NULL for one no slice ever decoded. */
+static const hevcd_slice_filter_t *FUNC(filter_of)(const hevcd_t *d,
+                                                   int x, int y)
 {
-    const int q = FUNC(clip)(qp + d->slice->beta_offset, 0, 51);
+    const int s = hevcd_slice_at(d, x, y);
+    if (s < 0 || !d->slice_filter || (size_t)s >= d->n_slice_filter)
+        return NULL;
+    return &d->slice_filter[s];
+}
+
+/* beta and tC for one edge, 8.7.2.5.3. The boundary strength only ever
+ * reaches the tables through tC, and only by two quantiser steps.
+ *
+ * ⚠️ The offsets belong to the slice being filtered, which is the one
+ * holding the q side of the edge - not to whichever slice happened to be
+ * read last. */
+static int FUNC(beta_di)(const hevcd_t *d,
+                         const hevcd_slice_filter_t *f, int qp)
+{
+    const int q = FUNC(clip)(qp + f->beta_offset, 0, 51);
     return hevcd_beta[q] << (d->sps->bit_depth_luma - 8);
 }
 
-static int FUNC(tc_di)(const hevcd_t *d, int qp, int bs)
+static int FUNC(tc_di)(const hevcd_t *d, const hevcd_slice_filter_t *f,
+                       int qp, int bs)
 {
-    const int q = FUNC(clip)(qp + 2 * (bs - 1) + d->slice->tc_offset, 0, 53);
+    const int q = FUNC(clip)(qp + 2 * (bs - 1) + f->tc_offset, 0, 53);
     return hevcd_tc[q] << (d->sps->bit_depth_luma - 8);
 }
 
@@ -277,6 +294,15 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical)
             if (!d->pps->loop_filter_across_tiles
                 && hevcd_tile_at(d, xp, yp) != hevcd_tile_at(d, x, y))
                 continue;
+
+            /* ⚠️ The same for a slice boundary, and the same reason: the
+             * two sides were decoded without knowledge of each other. The
+             * flag that governs it belongs to the slice holding q. */
+            const hevcd_slice_filter_t *fq = FUNC(filter_of)(d, x, y);
+            if (!fq || fq->disabled) continue;
+            if (!fq->across_slices
+                && hevcd_slice_at(d, xp, yp) != hevcd_slice_at(d, x, y))
+                continue;
             const int bs = d->mvf
                 ? FUNC(strength)(d, xp, yp, x, y,
                         (d->edges[(y >> 3) * d->edges_stride + (x >> 3)]
@@ -284,13 +310,15 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical)
                 : 2;
             if (!bs) continue;
             const int qp = (FUNC(qp_di)(d, x, y) + FUNC(qp_di)(d, xp, yp) + 1) >> 1;
+            const int beta = FUNC(beta_di)(d, fq, qp);
+            const int tc_l = FUNC(tc_di)(d, fq, qp, bs);
             const bool keep_p = FUNC(untouchable)(d, xp, yp);
             const bool keep_q = FUNC(untouchable)(d, x, y);
             if (keep_p && keep_q) continue;
 
             FUNC(filter_luma)((pixel *)d->plane[0]
                         + (size_t)y * d->stride[0] + x,
-                        forward_l, giu_l, FUNC(beta_di)(d, qp), FUNC(tc_di)(d, qp, bs),
+                        forward_l, giu_l, beta, tc_l,
                         keep_p, keep_q);
 
             /* ⚠️ Chroma is filtered on its own grid, which is eight chroma
@@ -306,7 +334,7 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical)
                                        : d->pps->cr_qp_offset;
                 const int tc = hevcd_tc[FUNC(clip)(FUNC(qp_chroma)(FUNC(clip)(qp + off,
                                                                    0, 57))
-                                                 + 2 + d->slice->tc_offset,
+                                                 + 2 + fq->tc_offset,
                                                  0, 53)]
                                << (d->sps->bit_depth_chroma - 8);
                 if (!tc) continue;
@@ -322,15 +350,13 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical)
 
 /* 8.7.2 over the finished picture.
  *
- * ⚠️ The offsets come from the slice, and one picture may carry several
- * slices with different ones. With a single slice per picture - which is
- * what the harness feeds it - this is exact; with more it would need the
- * offsets kept per coding tree block, the same way the quantisation
- * parameter already is.
+ * The offsets and the on/off switch come from the slice holding each
+ * edge, looked up through slice_of_ctb - so a picture whose slices
+ * disagree about deblocking gets what each of them asked for.
  */
 static void FUNC(deblock)(hevcd_t *d)
 {
-    if (!d->edges || d->slice->deblocking_filter_disabled) return;
+    if (!d->edges) return;
     FUNC(one_direction)(d, true);
     FUNC(one_direction)(d, false);
 }
@@ -415,6 +441,18 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
                 if (hevcd_tile_at(d, (x + ax) << giu, (y + ay) << giu) != here
                     || hevcd_tile_at(d, (x + bx) << giu, (y + by) << giu) != here)
                     continue;
+            }
+            /* ⚠️ And the slice boundary, when the slice this sample
+             * belongs to says the filters may not cross it. */
+            {
+                const hevcd_slice_filter_t *f =
+                    FUNC(filter_of)(d, x << giu, y << giu);
+                if (f && !f->across_slices) {
+                    const int here = hevcd_slice_at(d, x << giu, y << giu);
+                    if (hevcd_slice_at(d, (x + ax) << giu, (y + ay) << giu) != here
+                        || hevcd_slice_at(d, (x + bx) << giu, (y + by) << giu) != here)
+                        continue;
+                }
             }
 
             const int v = before[(size_t)y * stride + x];

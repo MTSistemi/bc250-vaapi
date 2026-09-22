@@ -1412,6 +1412,16 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     }
 
     for (int s = 0; s < ns; s++) {
+        size_t needed = total + 32 + encoder->slice_len[s] * 2;
+        if (needed > encoder->scratch_out_cap) {
+            size_t new_cap = encoder->scratch_out_cap * 2;
+            if (new_cap < needed + 131072) new_cap = needed + 131072;
+            uint8_t *new_buf = realloc(encoder->scratch_out, new_cap);
+            if (new_buf) {
+                encoder->scratch_out = new_buf;
+                encoder->scratch_out_cap = new_cap;
+            }
+        }
         bitstream_t out_bs;
         bs_init(&out_bs, encoder->scratch_out + total, encoder->scratch_out_cap - total);
         bs_write_nal_header_hevc(&out_bs, is_idr ? NAL_UNIT_CODED_SLICE_IDR_W_RADL : NAL_UNIT_CODED_SLICE_TRAIL_R);

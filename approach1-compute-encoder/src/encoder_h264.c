@@ -2717,7 +2717,9 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
          * per slice per frame, so keying it off encoder->use_cabac keeps the
          * common CABAC path at its original, already-validated size instead
          * of paying the CAVLC allowance unconditionally. */
-        size_t bytes_per_mb = encoder->use_cabac ? 768 : 2560;
+        /* Give CABAC generous 1536 bytes/MB headroom (preventing overflows on dense
+         * high-entropy 31M content) while preserving CAVLC's 2560 bytes/MB allowance. */
+        size_t bytes_per_mb = encoder->use_cabac ? 1536 : 2560;
         size_t rbsp_buf_size = (end_mb - start_mb) * bytes_per_mb + 4096;
         uint8_t *slice_rbsp = malloc(rbsp_buf_size);
         if (!slice_rbsp) {
@@ -3069,6 +3071,17 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
 
         if (!slice_overflow) {
             size_t rbsp_len = slices[s].rbsp_len;
+            size_t needed = total_written + 5 + rbsp_len * 2;
+            if (needed > encoder->output_buf_size) {
+                size_t new_cap = encoder->output_buf_size * 2;
+                if (new_cap < needed + 65536) new_cap = needed + 65536;
+                uint8_t *new_buf = realloc(encoder->output_buf, new_cap);
+                if (new_buf) {
+                    encoder->output_buf = new_buf;
+                    encoder->output_buf_size = new_cap;
+                }
+            }
+
             if (total_written + 5 + rbsp_len * 2 <= encoder->output_buf_size) {
                 uint8_t *nal_dst = encoder->output_buf + total_written;
                 nal_dst[0] = 0x00;
@@ -3084,10 +3097,6 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
                                                   rbsp_len);
                 total_written += 5 + ebsp_len;
             } else {
-                /* Previously this guard had no else: the slice was dropped in
-                 * silence, producing a frame with valid SPS/PPS/AUD and no
-                 * picture data (observed as a 1,535-byte "successful" encode on
-                 * pathological content). Fail the frame loudly instead. */
                 fprintf(stderr, "[bc250-h264] slice %d/%d does not fit output_buf "
                                 "(have %zu, used %zu, need %zu) - abandoning frame %u at qp=%d\n",
                         s, num_slices, encoder->output_buf_size, total_written,
@@ -3392,6 +3401,17 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
 
         if (!raw_slice_overflow) {
             size_t rbsp_len = slices[s].rbsp_len;
+            size_t needed = total_written + 5 + rbsp_len * 2;
+            if (needed > encoder->output_buf_size) {
+                size_t new_cap = encoder->output_buf_size * 2;
+                if (new_cap < needed + 65536) new_cap = needed + 65536;
+                uint8_t *new_buf = realloc(encoder->output_buf, new_cap);
+                if (new_buf) {
+                    encoder->output_buf = new_buf;
+                    encoder->output_buf_size = new_cap;
+                }
+            }
+
             if (total_written + 5 + rbsp_len * 2 <= encoder->output_buf_size) {
                 uint8_t *nal_dst = encoder->output_buf + total_written;
                 nal_dst[0] = 0x00;
@@ -3407,8 +3427,6 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
                                                   rbsp_len);
                 total_written += 5 + ebsp_len;
             } else {
-                /* Same silent-drop hazard as h264_encoder_encode_frame() - see
-                 * that function's else branch. */
                 fprintf(stderr, "[bc250-h264] slice %d/%d does not fit output_buf "
                                 "(have %zu, used %zu, need %zu) - abandoning frame %u at qp=%d\n",
                         s, num_slices, encoder->output_buf_size, total_written,

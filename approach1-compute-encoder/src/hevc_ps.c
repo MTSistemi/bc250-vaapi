@@ -492,12 +492,14 @@ int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
     }
 
     if (s.dependent_slice_segment) {
-        /* ⚠️ A dependent slice segment carries no header of its own: it
-         * inherits the previous independent one entire. Nothing here can
-         * reconstruct that, so it is the caller's business. */
-        s.data_bit_offset = br.bitpos;
-        *out = s;
-        return PS_OK;
+        /* ⚠️ A dependent slice segment inherits the previous independent
+         * header entire, and reconstructing that is the caller's
+         * business - but it still carries its OWN entry points, header
+         * extension and byte alignment. Returning here skipped all
+         * three and left data_bit_offset pointing at the alignment bit
+         * instead of at the slice data. So it jumps to the tail rather
+         * than out. */
+        goto tail;
     }
 
     for (int i = 0; i < pps->num_extra_slice_header_bits; i++)
@@ -610,6 +612,7 @@ int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
         && (s.sao_luma || s.sao_chroma || !s.deblocking_filter_disabled))
         s.loop_filter_across_slices = br_read1(&br) != 0;
 
+tail:
     if (pps->tiles_enabled || pps->entropy_coding_sync_enabled) {
         s.num_entry_point_offsets = (int)br_read_ue(&br);
         if (s.num_entry_point_offsets > 0) {

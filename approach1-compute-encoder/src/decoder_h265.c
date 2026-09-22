@@ -32,6 +32,8 @@ struct hevc_decoder {
 
 static void free_img(hevcd_img_t *g)
 {
+    free(g->lists); g->lists = NULL; g->n_lists = 0;
+    free(g->slice_of_ctb); g->slice_of_ctb = NULL; g->n_slice_map = 0;
     for (int i = 0; i < 3; i++) { free(g->plane[i]); g->plane[i] = NULL; }
     free(g->mvf);
     g->mvf = NULL;
@@ -104,7 +106,7 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
     g->stride[1] = g->stride[2] = w / 2;
     g->poc = poc;
     g->is_valid = true;
-    g->n_list[0] = g->n_list[1] = 0;
+    g->n_lists = 0;   /* filled as each slice is read */
 
     d->current = g;
     d->mvf = g->mvf;
@@ -152,13 +154,28 @@ static void build_lists(hevcd_t *d, const hevc_slice_t *sl)
         }
     }
 
-    /* What the indices mean, kept with the picture: a later one that takes
-     * this as its collocated picture asks what it pointed at, and an index
-     * means nothing outside the slice that wrote it. */
-    for (int l = 0; l < 2; l++) {
-        d->current->n_list[l] = d->n_refs[l];
-        for (int i = 0; i < d->n_refs[l]; i++)
-            d->current->poc_list[l][i] = d->ref_pic[l][i]->poc;
+    /* What the indices mean, kept with the picture and with the SLICE:
+     * a later picture that takes this as its collocated one asks what a
+     * stored index pointed at, and an index means nothing outside the
+     * slice that wrote it. */
+    if (d->slice_now >= 0) {
+        hevcd_img_t *g = d->current;
+        if ((size_t)d->slice_now >= g->n_lists) {
+            const size_t want = (size_t)d->slice_now + 64;
+            void *p = realloc(g->lists, want * sizeof *g->lists);
+            if (p) {
+                g->lists = p;
+                g->n_lists = want;
+            }
+        }
+        if ((size_t)d->slice_now < g->n_lists) {
+            for (int l = 0; l < 2; l++) {
+                g->lists[d->slice_now].n_list[l] = d->n_refs[l];
+                for (int i = 0; i < d->n_refs[l]; i++)
+                    g->lists[d->slice_now].poc_list[l][i] =
+                        d->ref_pic[l][i]->poc;
+            }
+        }
     }
 
     d->col = NULL;
@@ -239,15 +256,17 @@ static const char *slice_reason(int e)
  * read correctly ends with end_of_slice_segment_flag set exactly after the
  * last coding tree unit, and with the arithmetic decoder at the end of the
  * NAL. One bin read against the wrong context almost never lands there. */
-static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
-                          const hevc_pps_t *pps, const hevc_slice_t *sl,
-                          const uint8_t *rbsp, size_t n)
+/* Everything one picture needs before any of its slices is read.
+ *
+ * ⚠️ Called once per PICTURE. It used to run at the top of walk_slice(),
+ * which is once per SLICE, and the difference did not show while every
+ * picture had exactly one. A second slice arrived to find the first
+ * slice's work erased - and then the loop filters ran over the whole
+ * picture using boundary strengths that only the last slice had written.
+ */
+static int prepare_picture(hevcd_t *d, const hevc_sps_t *sps,
+                           const hevc_pps_t *pps)
 {
-    /* ⚠️ P and B slices are read through, not reconstructed. Their
-     * samples are meaningless until motion compensation exists; what the
-     * walk proves is that every bin of their syntax was read against the
-     * right context. */
-
     const size_t serve_cb = (size_t)sps->min_cb_width * sps->min_cb_height;
     const size_t serve_pu = (size_t)(sps->width >> 2) * (sps->height >> 2);
     if (!d->ct_depth || d->n_ct_depth < serve_cb) {
@@ -309,13 +328,76 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
     /* ⚠️ Before the z-scan, which is built out of these. */
     if (hevcd_prepare_tiles(d)) return 5;
     if (hevcd_prepare_zscan(d)) return 5;
+
+    if (!d->slice_of_ctb || d->n_slice_map < (size_t)sps->ctb_count) {
+        free(d->slice_of_ctb);
+        d->slice_of_ctb = malloc((size_t)sps->ctb_count
+                                 * sizeof *d->slice_of_ctb);
+        d->n_slice_map = (size_t)sps->ctb_count;
+        if (!d->slice_of_ctb) { d->n_slice_map = 0; return 5; }
+    }
+    /* ⚠️ Minus one, not zero: zero is a real slice number. A unit still
+     * holding minus one when the picture ends is one no slice ever
+     * covered. */
+    for (int i = 0; i < sps->ctb_count; i++) d->slice_of_ctb[i] = -1;
+    d->slice_now = -1;
+    /* Nothing carries across a picture boundary. */
+    d->have_segment_end = false;
+    d->have_wpp_snapshot = false;
+    return 0;
+}
+
+static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
+                          const hevc_pps_t *pps, const hevc_slice_t *sl,
+                          const uint8_t *rbsp, size_t n)
+{
+    /* ⚠️ P and B slices are read through, not reconstructed. Their
+     * samples are meaningless until motion compensation exists; what the
+     * walk proves is that every bin of their syntax was read against the
+     * right context. */
+
+    /* ⚠️ The maps belong to the picture and were built by
+     * prepare_picture() before the first slice arrived. Nothing is
+     * allocated or wiped here: a slice that did that would erase the
+     * slices before it. */
+    if (!d->ct_depth || !d->intra_mode || !d->edges || !d->no_filter
+        || !d->sao || !d->cbf_map || !d->skip || !d->qp_y_map
+        || !d->rs_to_ts || !d->min_tb_addr_zs)
+        return 5;
+    if (!d->current) return 5;
     d->slice = sl;
+
+    /* ⚠️ Kept because the filters run after every slice has been read,
+     * by which time d->slice is the last one. Reading the offsets from
+     * there applied one slice's settings to the whole picture. */
+    if (d->slice_now >= 0) {
+        if ((size_t)d->slice_now >= d->n_slice_filter) {
+            const size_t want = (size_t)d->slice_now + 64;
+            hevcd_slice_filter_t *p = realloc(d->slice_filter,
+                                              want * sizeof *p);
+            if (!p) return 5;
+            d->slice_filter = p;
+            d->n_slice_filter = want;
+        }
+        hevcd_slice_filter_t *f = &d->slice_filter[d->slice_now];
+        f->beta_offset = (int16_t)sl->beta_offset;
+        f->tc_offset = (int16_t)sl->tc_offset;
+        f->disabled = sl->deblocking_filter_disabled ? 1 : 0;
+        f->across_slices = sl->loop_filter_across_slices ? 1 : 0;
+    }
+
     d->min_pu_width = sps->width >> 2;
     d->min_pu_height = sps->height >> 2;
-    d->qp_y = sl->qp;
-    d->qp_y_pred = sl->qp;
-    d->qp_y_prev = sl->qp;
-    d->qg_restarts = true;
+    /* ⚠️ 8.6.1: a dependent segment continues the quantisation parameter
+     * prediction of the segment before it. Only an independent one
+     * restarts from the slice's own parameter. */
+    const bool dependent = sl->dependent_slice_segment && d->have_segment_end;
+    if (!dependent) {
+        d->qp_y = sl->qp;
+        d->qp_y_pred = sl->qp;
+        d->qp_y_prev = sl->qp;
+        d->qg_restarts = true;
+    }
     d->slice_end = false;
 
     const size_t first = sl->data_bit_offset >> 3;
@@ -327,8 +409,36 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
 
     const bool wpp = pps->entropy_coding_sync_enabled;
     const int init_type = hevcd_init_type(sl->type, sl->cabac_init_flag);
-    uint8_t snapshot[HEVCD_CTX];
-    bool have_snapshot = false;
+
+    /* 9.3.1, in the order the clause gives them. The engine is always
+     * restarted - that part is per segment - and only the context state
+     * is in question.
+     *
+     * ⚠️ The wavefront rule outranks the dependent-segment one. When
+     * every row is its own dependent segment, as kvazaar writes with
+     * --wpp --slices wpp, both apply and taking the second is wrong by
+     * half a picture. */
+    {
+        const int first_ts = d->rs_to_ts[sl->segment_address];
+        const bool starts_tile = pps->tiles_enabled
+            && (first_ts == 0
+                || d->tile_of_ts[first_ts - 1] != d->tile_of_ts[first_ts]);
+        const bool starts_row = wpp
+            && (sl->segment_address % sps->ctb_width) == 0;
+
+        if (starts_tile) {
+            /* already initialised above */
+        } else if (starts_row && dependent && d->have_wpp_snapshot
+                   && sps->ctb_width >= 2) {
+            /* ⚠️ `dependent` is not decoration. The synchronisation is
+             * conditional on the unit above right being available, and
+             * 6.4.1 availability wants the same slice - which an
+             * independent segment, by starting a new slice, never has. */
+            memcpy(d->cabac.state, d->wpp_snapshot, HEVCD_CTX);
+        } else if (dependent) {
+            memcpy(d->cabac.state, d->ctx_at_segment_end, HEVCD_CTX);
+        }
+    }
 
     /* ⚠️ Only a slice that starts at the first unit and carries one entry
      * point per row: anything else - a slice segment starting mid picture,
@@ -358,8 +468,8 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
         /* 9.3.2.3: after the second unit of a row, so the row below can
          * start from here. */
         if (wpp && cx == 1) {
-            memcpy(snapshot, d->cabac.state, HEVCD_CTX);
-            have_snapshot = true;
+            memcpy(d->wpp_snapshot, d->cabac.state, HEVCD_CTX);
+            d->have_wpp_snapshot = true;
         }
         /* HEVC_TRACE: how far into the NAL each coding tree unit got.
          * When a slice does not land, this says where it stopped being
@@ -375,9 +485,14 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
 
         const int fine = hevcd_terminate(&d->cabac);
         if (fine) {
-            /* ⚠️ It has to end after the LAST one in TILE SCAN, which
-             * with tiles is not the bottom right unit of the picture. */
-            return (ts == count - 1) ? 0 : 1;
+            /* end_of_slice_segment_flag. ⚠️ Wherever it lands, this
+             * segment is over and that is legitimate: another one
+             * carries on from the next address. Whether the picture
+             * ended up whole is asked at the end of the picture, where
+             * the question belongs - see hevc_decoder_end_picture(). */
+            memcpy(d->ctx_at_segment_end, d->cabac.state, HEVCD_CTX);
+            d->have_segment_end = true;
+            return 0;
         }
 
         /* 7.3.8.1: the substream ends when the next unit starts a new
@@ -424,8 +539,8 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
              * cases cannot share this line. */
             if (tile_break)
                 hevcd_cabac_ctx_init(d->cabac.state, init_type, sl->qp);
-            else if (have_snapshot && sps->ctb_width >= 2)
-                memcpy(d->cabac.state, snapshot, HEVCD_CTX);
+            else if (d->have_wpp_snapshot && sps->ctb_width >= 2)
+                memcpy(d->cabac.state, d->wpp_snapshot, HEVCD_CTX);
             else
                 hevcd_cabac_ctx_init(d->cabac.state, init_type, sl->qp);
         }
@@ -454,6 +569,7 @@ void hevc_decoder_destroy(hevc_decoder_t *h)
     for (int i = 0; i < IMG_SLOTS; i++) free_img(&h->buffer[i]);
     hevcd_t *d = &h->d;
     hevcd_free_tiles(d);
+    free(d->slice_filter);
     free(d->ct_depth); free(d->intra_mode); free(d->min_tb_addr_zs);
     free(d->qp_y_map); free(d->edges); free(d->no_filter);
     free(d->skip); free(d->cbf_map);
@@ -479,6 +595,9 @@ int hevc_decoder_begin_picture(hevc_decoder_t *h, const hevc_sps_t *sps,
     h->sps = *sps;
     h->pps = *pps;
     if (open_picture(&h->d, &h->sps, poc)) return -1;
+    /* ⚠️ Here and not in walk_slice(): once per picture, not once per
+     * slice. See prepare_picture(). */
+    if (prepare_picture(&h->d, &h->sps, &h->pps)) return -1;
     for (int i = 0; i < IMG_SLOTS; i++)
         if (&h->buffer[i] == h->d.current) h->surface_id[i] = id;
     h->is_open = true;
@@ -489,8 +608,43 @@ int hevc_decoder_slice(hevc_decoder_t *h, const hevc_slice_t *sl,
                        const uint8_t *rbsp, size_t n)
 {
     if (!h->is_open || !h->d.current) return 5;
-    h->last_one = *sl;
+
+    if (sl->dependent_slice_segment && h->d.slice_now >= 0) {
+        /* ⚠️ Everything except the few fields a dependent segment really
+         * does carry. h->last_one already holds the header this one
+         * continues - which may itself be a merged dependent segment, so
+         * a run of them chains correctly. */
+        const int addr = sl->segment_address;
+        const int n_ep = sl->num_entry_point_offsets;
+        const size_t off = sl->data_bit_offset;
+        const int nal = sl->nal_type;
+        uint32_t ep[600];
+        if (n_ep > 0) memcpy(ep, sl->entry_point, (size_t)n_ep * sizeof ep[0]);
+
+        h->last_one.dependent_slice_segment = true;
+        h->last_one.first_slice_in_pic = false;
+        h->last_one.segment_address = addr;
+        h->last_one.num_entry_point_offsets = n_ep;
+        if (n_ep > 0) memcpy(h->last_one.entry_point, ep,
+                             (size_t)n_ep * sizeof ep[0]);
+        h->last_one.data_bit_offset = off;
+        h->last_one.nal_type = nal;
+    } else {
+        h->last_one = *sl;
+    }
+    /* ⚠️ The picture order count comes from the picture, not from the
+     * slice segment header. Only the first segment of a picture carries
+     * what it is derived from, so every caller fills it in for that one
+     * and leaves the rest at zero - and build_lists() then looks up
+     * `poc + delta_poc` in the buffer, finds nothing, and hands the slice
+     * an empty reference list without a word. */
+    h->last_one.poc = h->d.current->poc;
     h->d.slice = &h->last_one;
+    /* ⚠️ A dependent segment is not a new slice, it is the rest of the
+     * one before it, so it keeps that number. An independent one starts
+     * a new slice. */
+    if (!sl->dependent_slice_segment || h->d.slice_now < 0)
+        h->d.slice_now++;
     build_lists(&h->d, &h->last_one);
     return walk_slice(&h->d, &h->sps, &h->pps, &h->last_one, rbsp, n);
 }
@@ -498,6 +652,22 @@ int hevc_decoder_slice(hevc_decoder_t *h, const hevc_slice_t *sl,
 void hevc_decoder_end_picture(hevc_decoder_t *h)
 {
     if (!h->is_open || !h->d.current) return;
+    /* ⚠️ Before the filters or after makes no difference to them, but
+     * it has to happen while the map is still this picture's: the next
+     * begin_picture() clears it. */
+    if (h->d.slice_of_ctb && h->d.current) {
+        hevcd_img_t *g = h->d.current;
+        const size_t n = (size_t)h->sps.ctb_count;
+        if (g->n_slice_map < n) {
+            free(g->slice_of_ctb);
+            g->slice_of_ctb = malloc(n * sizeof *g->slice_of_ctb);
+            g->n_slice_map = g->slice_of_ctb ? n : 0;
+        }
+        if (g->slice_of_ctb)
+            memcpy(g->slice_of_ctb, h->d.slice_of_ctb,
+                   n * sizeof *g->slice_of_ctb);
+    }
+
     if (h->d.slice) { hevcd_deblock(&h->d); hevcd_sao(&h->d); }
     h->is_open = false;
 }

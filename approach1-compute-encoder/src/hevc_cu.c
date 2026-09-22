@@ -38,7 +38,11 @@ static bool available(const hevcd_t *d, int x, int y)
 {
     if (x < 0 || y < 0 || x >= d->sps->width || y >= d->sps->height)
         return false;
-    return hevcd_tile_at(d, x, y) == d->tile_now;
+    if (hevcd_tile_at(d, x, y) != d->tile_now) return false;
+    /* ⚠️ And the same slice. A unit in a slice that has not been decoded
+     * yet reads back as minus one and is refused by the same comparison,
+     * which is what makes this also answer "has it happened yet". */
+    return hevcd_slice_at(d, x, y) == d->slice_now;
 }
 
 /* ------------------------------------------------------------------- SAO */
@@ -63,9 +67,11 @@ static void read_sao(hevcd_t *d, int rx, int ry)
      * never wrote - which desynchronises everything after it. */
     const int lg = d->sps->log2_ctb;
     const bool can_left = rx > 0
-        && hevcd_tile_at(d, (rx - 1) << lg, ry << lg) == d->tile_now;
+        && hevcd_tile_at(d, (rx - 1) << lg, ry << lg) == d->tile_now
+        && hevcd_slice_at(d, (rx - 1) << lg, ry << lg) == d->slice_now;
     const bool can_up = ry > 0
-        && hevcd_tile_at(d, rx << lg, (ry - 1) << lg) == d->tile_now;
+        && hevcd_tile_at(d, rx << lg, (ry - 1) << lg) == d->tile_now
+        && hevcd_slice_at(d, rx << lg, (ry - 1) << lg) == d->slice_now;
 
     if (can_left && hevcd_bin(c, HEVCD_CTX_SAO_MERGE_FLAG)) {
         *mine = d->sao[ry * ctb_stride + rx - 1];
@@ -1075,6 +1081,11 @@ int hevcd_read_ctu(hevcd_t *d, int x0, int y0)
      * here rather than in each availability test, which is handed a
      * neighbour and has no idea where "here" is. */
     d->tile_now = hevcd_tile_at(d, x0, y0);
+    if (d->slice_of_ctb) {
+        const int rs = (y0 >> sps->log2_ctb) * sps->ctb_width
+                       + (x0 >> sps->log2_ctb);
+        if (rs >= 0 && rs < sps->ctb_count) d->slice_of_ctb[rs] = d->slice_now;
+    }
 
     if (sl->sao_luma || sl->sao_chroma)
         read_sao(d, x0 >> sps->log2_ctb, y0 >> sps->log2_ctb);

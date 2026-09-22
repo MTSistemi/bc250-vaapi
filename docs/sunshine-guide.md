@@ -19,7 +19,18 @@ By dynamically shifting motion estimation between GPU CUs and Zen 2 CPU cores, 3
 
 ## Quick Start Configuration
 
-### 1. Driver Installation & Environment Setup
+### 1. Automated Preset Application
+
+You can apply the pre-tuned Sunshine streaming configuration with one command:
+```bash
+# Standard 60 FPS streaming (~8ms host latency)
+./tools/sunshine_preset/apply_sunshine_preset.sh
+
+# High-Refresh 120 FPS Ultra-Low-Latency streaming (~3-5ms host latency)
+./tools/sunshine_preset/apply_sunshine_preset.sh --120fps
+```
+
+### 2. Manual Driver Installation & Environment Setup
 
 Ensure the driver library is in your library path (e.g., `/usr/lib/x86_64-linux-gnu/dri/bc250_drv_video.so`).
 
@@ -29,7 +40,7 @@ To configure Sunshine to use the BC-250 driver, launch Sunshine with the followi
 export LIBVA_DRIVER_NAME=bc250
 export LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
 
-# Recommended: Enable 4 slices per frame for ultra-fast parallel client decode
+# Recommended: Enable 4 slices per frame for 60fps (or 2 slices for 120fps high refresh)
 export BC250_SLICES_PER_FRAME=4
 
 # Recommended: Pin the 2 encoder worker threads to CPU cores 6 & 7 (leaving cores 0-5 100% free for 3D games)
