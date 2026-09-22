@@ -321,6 +321,12 @@ void h264d_reconstruct_range(h264_decoder_t *d, int first, int count,
     }
 
     pthread_mutex_lock(&p->m);
+    /* ⚠️ The workers are about to be handed pointers that belong to the
+     * caller, `d` and what it points at. That is safe for exactly one
+     * reason: this function does not return until every worker has
+     * finished, on the wait below. Make this asynchronous and those
+     * pointers outlive their owner - it is the cheapest possible way to
+     * turn a decoder into a heisenbug. */
     p->kind = 0;
     p->d = d;
     p->first = first;
@@ -421,6 +427,12 @@ int h264d_slices_pool(h264_decoder_t *d, const h264d_slice_input_t *in,
         return first_error;
     }
 
+    /* ⚠️ The workers are about to be handed pointers that belong to the
+     * caller, `d` and what it points at. That is safe for exactly one
+     * reason: this function does not return until every worker has
+     * finished, on the wait below. Make this asynchronous and those
+     * pointers outlive their owner - it is the cheapest possible way to
+     * turn a decoder into a heisenbug. */
     p->kind = 2;
     p->d = d;
     p->in = in;
