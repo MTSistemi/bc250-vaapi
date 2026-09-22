@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/MTSistemi/bc250-vaapi/security/advisories/new
+    about: A stream or a VA-API call that crashes the host process or touches memory it should not. Please do not open a public issue.
+  - name: The shared encoder and GPU layer
+    url: https://github.com/simpmix/bc250-encoding-decoding-fix/issues
+    about: Bugs in code we did not change belong upstream too.
