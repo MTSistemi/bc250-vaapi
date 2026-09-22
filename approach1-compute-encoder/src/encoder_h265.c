@@ -390,6 +390,10 @@ struct hevc_encoder {
 
     /* Dynamic asymmetric CPU/GPU load balancing governor & SIMD ME config */
     dynamic_governor_t governor;
+    /* Frames the governor has told us to keep off the GPU, counted so one
+     * in every step_down_hysteresis can go anyway and bring back a
+     * measurement. See hevc_encoder_encode_frame(). */
+    uint32_t governor_skips;
     cpu_simd_me_config_t me_cfg;
 };
 
@@ -1474,12 +1478,36 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
 
     if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
+        /* ⚠️ The governor's tiers mean something narrower here than in the
+         * H.264 encoder. The GPU's only job in this one is the motion
+         * search, so there is no reduced-search dispatch to fall back on:
+         * tiers 0 and 1 both run it, and tiers 2 and 3 do not run it at
+         * all. Not running it is already a complete fallback - the CPU
+         * search is what happens when num_gpu_mvs stays at zero, which is
+         * exactly the state an I frame is in. */
+        const governor_tier_t tier = dynamic_governor_get_tier(&encoder->governor);
+        bool use_gpu_me = (tier < GOV_TIER_2_CPU_OFFLOAD);
+
+        /* ⚠️ And that search is also the only thing that measures the GPU.
+         * Skipping it leaves the governor with no new latency, so the
+         * moving average never decays and the encoder would stay on the
+         * CPU for the rest of the stream. One frame in every
+         * step_down_hysteresis goes to the GPU anyway, purely to bring
+         * back a reading. */
+        if (!use_gpu_me) {
+            const uint32_t every = encoder->governor.step_down_hysteresis;
+            encoder->governor_skips++;
+            use_gpu_me = every && (encoder->governor_skips % every == 0);
+        }
+
         /* Run lightweight subgroup-accelerated GPU motion estimation on P-frames (~0.4ms) */
-        if (!is_idr && encoder->has_ref) {
+        if (!is_idr && encoder->has_ref && use_gpu_me) {
             gpu_compute_begin_picture(gpu_ctx, input_surface);
             gpu_compute_dispatch_me_only(gpu_ctx, input_surface, (int)encoder->width, (int)encoder->height);
             gpu_compute_end_picture(gpu_ctx);
             gpu_compute_sync(gpu_ctx);
+            dynamic_governor_update(&encoder->governor,
+                                    gpu_compute_get_last_latency_ms(gpu_ctx));
 
             void *mv_data = NULL;
             size_t mv_size = 0;
@@ -1489,6 +1517,11 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
                 memcpy(encoder->gpu_mvs, mv_data, copy_bytes);
                 encoder->num_gpu_mvs = (uint32_t)(copy_bytes / sizeof(gpu_mv_t));
             }
+        } else if (tier == GOV_TIER_3_FAILOVER && !is_idr && encoder->has_ref) {
+            /* One skipped frame is the whole emergency. Step back down so
+             * the next frame tries the GPU again instead of waiting for a
+             * measurement that can only come from trying. */
+            dynamic_governor_notify_failover_handled(&encoder->governor);
         }
 
         gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
