@@ -268,6 +268,15 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical)
 
             const int xp = vertical ? x - 1 : x;
             const int yp = vertical ? y : y - 1;
+
+            /* ⚠️ 8.7.2: a tile boundary is not filtered across unless the
+             * picture parameter set allows it. The two sides were decoded
+             * independently and neither knows what the other chose, so
+             * smoothing between them invents detail rather than removing
+             * it. */
+            if (!d->pps->loop_filter_across_tiles
+                && hevcd_tile_at(d, xp, yp) != hevcd_tile_at(d, x, y))
+                continue;
             const int bs = d->mvf
                 ? FUNC(strength)(d, xp, yp, x, y,
                         (d->edges[(y >> 3) * d->edges_stride + (x >> 3)]
@@ -396,6 +405,17 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
             if (x + ax < 0 || x + ax >= w || x + bx < 0 || x + bx >= w) continue;
             if (y + ay < 0 || y + ay >= h || y + by < 0 || y + by >= h) continue;
             if (FUNC(untouchable)(d, x << giu, y << giu)) continue;
+            /* ⚠️ And a neighbour in another tile is outside as far as this
+             * sample is concerned, unless the parameter set says the
+             * filters may cross. Same rule as the deblocking above, and
+             * the same reason. Chroma coordinates are shifted back up to
+             * luma to ask, because tiles are laid out in luma units. */
+            if (!d->pps->loop_filter_across_tiles) {
+                const int here = hevcd_tile_at(d, x << giu, y << giu);
+                if (hevcd_tile_at(d, (x + ax) << giu, (y + ay) << giu) != here
+                    || hevcd_tile_at(d, (x + bx) << giu, (y + by) << giu) != here)
+                    continue;
+            }
 
             const int v = before[(size_t)y * stride + x];
             int idx = 2 + FUNC(sign)(v - before[(size_t)(y + ay) * stride + x + ax])

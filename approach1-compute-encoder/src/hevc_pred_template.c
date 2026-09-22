@@ -34,6 +34,9 @@ static bool FUNC(already_decoded)(const hevcd_t *d, int x, int y, int x_cur, int
     const hevc_sps_t *sps = d->sps;
     if (x < 0 || y < 0 || x >= sps->width || y >= sps->height)
         return false;
+    /* ⚠️ Same wall as in already_done(): an earlier tile has lower
+     * addresses and would otherwise look like a legitimate neighbour. */
+    if (hevcd_tile_at(d, x, y) != d->tile_now) return false;
     const int stride = sps->width >> sps->log2_min_tb;
     const int a = d->min_tb_addr_zs[(y >> sps->log2_min_tb) * stride
                                     + (x >> sps->log2_min_tb)];

@@ -26,10 +26,19 @@
 /* ------------------------------------------------------------- neighbours */
 
 /* Whether the block at these coordinates has already been decoded and
- * belongs to the same slice. 6.4.1, simplified: one slice, one tile. */
+ * may be used from here. 6.4.1, still simplified to one slice.
+ *
+ * ⚠️ A tile boundary is a wall, and this function decides CABAC
+ * contexts: the most probable intra modes and the split flag's context
+ * both ask it. A neighbour wrongly called available does not make a
+ * slightly wrong picture, it makes the arithmetic decoder disagree with
+ * the encoder about which context to use, and everything after that is
+ * noise. */
 static bool available(const hevcd_t *d, int x, int y)
 {
-    return x >= 0 && y >= 0 && x < d->sps->width && y < d->sps->height;
+    if (x < 0 || y < 0 || x >= d->sps->width || y >= d->sps->height)
+        return false;
+    return hevcd_tile_at(d, x, y) == d->tile_now;
 }
 
 /* ------------------------------------------------------------------- SAO */
@@ -47,12 +56,22 @@ static void read_sao(hevcd_t *d, int rx, int ry)
     memset(mine, 0, sizeof *mine);
 
     /* Merging is how the encoder says "the same as next door" in two
-     * bins instead of thirty. */
-    if (rx > 0 && hevcd_bin(c, HEVCD_CTX_SAO_MERGE_FLAG)) {
+     * bins instead of thirty.
+     *
+     * ⚠️ Next door has to be in the same tile. The flag is not even sent
+     * when it is not, so reading it there consumes a bin the encoder
+     * never wrote - which desynchronises everything after it. */
+    const int lg = d->sps->log2_ctb;
+    const bool can_left = rx > 0
+        && hevcd_tile_at(d, (rx - 1) << lg, ry << lg) == d->tile_now;
+    const bool can_up = ry > 0
+        && hevcd_tile_at(d, rx << lg, (ry - 1) << lg) == d->tile_now;
+
+    if (can_left && hevcd_bin(c, HEVCD_CTX_SAO_MERGE_FLAG)) {
         *mine = d->sao[ry * ctb_stride + rx - 1];
         return;
     }
-    if (ry > 0 && hevcd_bin(c, HEVCD_CTX_SAO_MERGE_FLAG)) {
+    if (can_up && hevcd_bin(c, HEVCD_CTX_SAO_MERGE_FLAG)) {
         *mine = d->sao[(ry - 1) * ctb_stride + rx];
         return;
     }
@@ -506,8 +525,12 @@ static int skip_context(const hevcd_t *d, int x0, int y0)
     const int l = sps->log2_min_cb;
     int n = 0;
 
-    if (x0 > 0 && d->skip[(y0 >> l) * stride + ((x0 - 1) >> l)]) n++;
-    if (y0 > 0 && d->skip[((y0 - 1) >> l) * stride + (x0 >> l)]) n++;
+    /* ⚠️ available(), not "inside the picture". The two agree until a
+     * tile boundary runs between here and the neighbour. */
+    if (available(d, x0 - 1, y0)
+        && d->skip[(y0 >> l) * stride + ((x0 - 1) >> l)]) n++;
+    if (available(d, x0, y0 - 1)
+        && d->skip[((y0 - 1) >> l) * stride + (x0 >> l)]) n++;
     return n;
 }
 
@@ -1027,7 +1050,12 @@ int hevcd_prepare_zscan(hevcd_t *d)
         for (int x = 0; x < w; x++) {
             const int cx = (x << sps->log2_min_tb) >> sps->log2_ctb;
             const int cy = (y << sps->log2_min_tb) >> sps->log2_ctb;
-            int32_t a = (int32_t)(sps->ctb_width * cy + cx) << (diff * 2);
+            /* ⚠️ Tile scan. Raster is right only while there is one
+             * tile, and wrong in a way that looks like a corrupt
+             * picture rather than a wrong address. */
+            const int rs = sps->ctb_width * cy + cx;
+            const int ts = d->rs_to_ts ? d->rs_to_ts[rs] : rs;
+            int32_t a = (int32_t)ts << (diff * 2);
             for (int i = 0; i < diff; i++) {
                 const int m = 1 << i;
                 a += ((m & x) ? m * m : 0) + ((m & y) ? 2 * m * m : 0);
@@ -1042,6 +1070,11 @@ int hevcd_read_ctu(hevcd_t *d, int x0, int y0)
 {
     const hevc_sps_t *sps = d->sps;
     const hevc_slice_t *sl = d->slice;
+
+    /* Which tile everything inside this unit belongs to. Worked out once
+     * here rather than in each availability test, which is handed a
+     * neighbour and has no idea where "here" is. */
+    d->tile_now = hevcd_tile_at(d, x0, y0);
 
     if (sl->sao_luma || sl->sao_chroma)
         read_sao(d, x0 >> sps->log2_ctb, y0 >> sps->log2_ctb);

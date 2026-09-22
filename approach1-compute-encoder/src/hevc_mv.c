@@ -44,6 +44,10 @@ static bool already_done(const hevcd_t *d, int xc, int yc, int xn, int yn)
     const hevc_sps_t *sps = d->sps;
     if (xn < 0 || yn < 0 || xn >= sps->width || yn >= sps->height)
         return false;
+    /* ⚠️ The order test below is not enough on its own: a tile decoded
+     * earlier has LOWER z-scan addresses, so it would pass while being
+     * on the other side of a wall. */
+    if (hevcd_tile_at(d, xn, yn) != d->tile_now) return false;
     const int w = sps->width >> sps->log2_min_tb;
     const int32_t a = d->min_tb_addr_zs[(yc >> sps->log2_min_tb) * w
                                         + (xc >> sps->log2_min_tb)];
@@ -77,12 +81,18 @@ static neighbours_t neighbours(const hevcd_t *d, int x0, int y0, int w, int h)
     const int xb = x0 & mask, yb = y0 & mask;
     const int cx = x0 >> sps->log2_ctb, cy = y0 >> sps->log2_ctb;
 
-    /* One slice and one tile: a coding tree block exists if it is inside
-     * the picture and comes earlier in raster order. */
-    const bool ctb_left = cx > 0;
-    const bool ctb_above = cy > 0;
-    const bool ctb_above_left = cx > 0 && cy > 0;
-    const bool ctb_above_right = cy > 0 && cx + 1 < sps->ctb_width;
+    /* One slice: a coding tree block exists if it is inside the picture,
+     * comes earlier in raster order, and ⚠️ is in the same tile. */
+    const int lg = sps->log2_ctb;
+    const int mine = d->tile_now;
+    const bool ctb_left = cx > 0
+        && hevcd_tile_at(d, (cx - 1) << lg, cy << lg) == mine;
+    const bool ctb_above = cy > 0
+        && hevcd_tile_at(d, cx << lg, (cy - 1) << lg) == mine;
+    const bool ctb_above_left = cx > 0 && cy > 0
+        && hevcd_tile_at(d, (cx - 1) << lg, (cy - 1) << lg) == mine;
+    const bool ctb_above_right = cy > 0 && cx + 1 < sps->ctb_width
+        && hevcd_tile_at(d, (cx + 1) << lg, (cy - 1) << lg) == mine;
 
     neighbours_t v;
     v.left = ctb_left || xb;

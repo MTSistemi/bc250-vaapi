@@ -208,6 +208,7 @@ set(SOURCES
     src/hevc_filter.c
     src/hevc_mv.c
     src/hevc_mc.c
+    src/hevc_tiles.c
     src/hevc_wpp.c
     src/hevc_dec_tables.c
     src/h264_mb_cabac.c
