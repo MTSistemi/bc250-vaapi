@@ -175,14 +175,23 @@ void hevcd_skip_transform(int16_t *coeff, int log2_size, int bd)
         coeff[i] = (int16_t)clip16((((int)coeff[i] << 7) + add) >> shift);
 }
 
-/* The residual onto the prediction, clipped back into the picture's own
- * depth. */
+/* One copy per depth, then the one line that chooses.
+ *
+ * ⚠️ `stride` is in samples. At eight bits that is also the number of
+ * bytes, which is why a mistake here would stay hidden. */
+#define BIT_DEPTH 8
+#include "hevc_pixel.h"
+#include "hevc_add_template.c"
+#undef BIT_DEPTH
+
+#define BIT_DEPTH 10
+#include "hevc_pixel.h"
+#include "hevc_add_template.c"
+#undef BIT_DEPTH
+
 void hevcd_add(uint8_t *dst, int stride, const int16_t *res, int log2_size,
                int bd)
 {
-    const int n = 1 << log2_size;
-    for (int y = 0; y < n; y++)
-        for (int x = 0; x < n; x++)
-            dst[y * stride + x] = (uint8_t)
-                clip_pixel(dst[y * stride + x] + res[y * n + x], bd);
+    if (bd > 8) add_residual_10((uint16_t *)dst, stride, res, log2_size);
+    else        add_residual_8(dst, stride, res, log2_size);
 }
