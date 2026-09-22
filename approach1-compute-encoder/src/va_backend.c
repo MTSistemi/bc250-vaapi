@@ -873,6 +873,20 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                     if (seq->intra_period > 0) {
                         h264_encoder_set_gop_size(c->h264_enc, seq->intra_period);
                     }
+                    /* SPS frame-cropping window: ffmpeg aligns context height to 16 (1080->1088).
+                     * Pass sequence crop offsets so the stream carries true display dimensions. */
+                    h264_encoder_set_cropping(c->h264_enc,
+                                              seq->frame_cropping_flag,
+                                              seq->frame_crop_left_offset,
+                                              seq->frame_crop_right_offset,
+                                              seq->frame_crop_top_offset,
+                                              seq->frame_crop_bottom_offset);
+                    if (getenv("BC250_DEBUG_RC")) {
+                        fprintf(stderr, "[bc250-rc] SeqParam H264: cropping=%u l=%u r=%u t=%u b=%u\n",
+                                (unsigned)seq->frame_cropping_flag,
+                                seq->frame_crop_left_offset, seq->frame_crop_right_offset,
+                                seq->frame_crop_top_offset, seq->frame_crop_bottom_offset);
+                    }
                     if (seq->bits_per_second > 0) {
                         unsigned int pct = c->h264_state.rc_target_percentage;
                         if (pct == 0 || pct > 100) pct = 100;

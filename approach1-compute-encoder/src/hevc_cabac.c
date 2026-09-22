@@ -445,10 +445,11 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
      * from scan_pos_last down to 0 - absCoeff[0] is always the last-scan-
      * position coefficient itself, inferred significant, never coded). */
     int16_t abs_coeff[16];
-    int16_t sign[16];
+    uint32_t sign_bits;
     int num_nonzero = 1;
-    abs_coeff[0] = (int16_t)(coeff[pos_raster] < 0 ? -coeff[pos_raster] : coeff[pos_raster]);
-    sign[0] = (int16_t)(coeff[pos_raster] < 0 ? 1 : 0);
+    int last_val = coeff[pos_raster];
+    abs_coeff[0] = (int16_t)(last_val < 0 ? -last_val : last_val);
+    sign_bits = (uint32_t)(last_val < 0);
 
     int sig_base = is_luma ? 0 : 27;
     for (int sp = scan_pos_last - 1; sp >= 0; sp--) {
@@ -459,7 +460,7 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
         hevc_cabac_encode_bin(cb, HEVC_CTX_SIG_FLAG + sig_base + ctx_sig, (uint32_t)sig);
         if (sig) {
             abs_coeff[num_nonzero] = (int16_t)(val < 0 ? -val : val);
-            sign[num_nonzero] = (int16_t)(val < 0 ? 1 : 0);
+            sign_bits = (sign_bits << 1) | (uint32_t)(val < 0);
             num_nonzero++;
         }
     }
@@ -489,9 +490,9 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
     }
 
     /* Sign bits (bypass), decreasing-scan-position order, no sign hiding
-     * (this project's PPS sets sign_data_hiding_flag=0). */
-    for (int idx = 0; idx < num_nonzero; idx++)
-        hevc_cabac_encode_bypass(cb, (uint32_t)sign[idx]);
+     * (this project's PPS sets sign_data_hiding_flag=0). Batched into a
+     * single bypass emission call, saving num_nonzero-1 branch/write loops. */
+    hevc_cabac_encode_bypass_bins(cb, sign_bits, num_nonzero);
 
     /* coeff_abs_level_remaining. */
     if (!c1 || num_nonzero > C1FLAG_NUMBER) {

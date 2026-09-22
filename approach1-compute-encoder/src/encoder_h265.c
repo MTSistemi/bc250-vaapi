@@ -335,6 +335,7 @@ struct hevc_encoder {
     bool     has_ref;
     int qp;
     int pps_init_qp;
+    int qp_hint_applied;         /* Last QP explicitly handed to hevc_encoder_set_qp(), or -1 if never called yet */
     rate_control_t rc;
     uint32_t quality_level;      /* 1..7 (1 = Quality, 4 = Balanced, 7 = Speed) */
     uint32_t max_frame_bits;     /* Maximum frame size in bits (0 = unlimited) */
@@ -444,6 +445,7 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
             (double)enc->fps, width, height);
     enc->rc.current_qp = enc->qp;
     enc->rc.base_qp = enc->qp;
+    enc->qp_hint_applied = -1; /* no explicit QP hint applied yet - see hevc_encoder_set_qp() */
     enc->quality_level = 4;
     enc->max_frame_bits = 0;
 
@@ -562,25 +564,16 @@ void hevc_encoder_set_qp(hevc_encoder_t *encoder, int qp)
     if (encoder) {
         if (qp < 0) qp = 0;
         if (qp > 51) qp = 51;
-        encoder->qp = qp;
-        /* In a bitrate-driven mode the loop owns its own state.
-         *
-         * va_backend.c calls this for EVERY picture, with pic_init_qp out of
-         * the VAEncPictureParameterBufferHEVC - and pic_init_qp is the PPS's
-         * starting QP, not an instruction to restart rate control. Resetting
-         * base_qp and current_qp here handed the feedback loop its starting
-         * value again before every single frame, so it could never walk
-         * anywhere: measured on a BC-250, QP stayed at 30 for the whole
-         * sequence while the stream ran at 1.3 Mbit/s against an 8 Mbit/s
-         * request. The H.264 path has no per-picture call like this.
-         *
-         * In RC_CQP there is no loop to protect and the caller's QP is the
-         * whole point, so that path is untouched.
-         */
-        if (encoder->rc.mode == RC_CQP) {
+        /* va_backend.c calls this for EVERY picture with pic_init_qp out of
+         * VAEncPictureParameterBufferHEVC. To prevent per-frame unchanged hints
+         * from stomping the rate controller's QP walk, only reset base_qp/current_qp
+         * when the hint genuinely changes. */
+        if (qp != encoder->qp_hint_applied) {
             encoder->rc.base_qp = qp;
             encoder->rc.current_qp = qp;
+            encoder->qp_hint_applied = qp;
         }
+        encoder->qp = qp;
     }
 }
 
@@ -1074,11 +1067,15 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     /* Step 1: decide + reconstruct all 4 luma PUs in z-order */
     for (int pu = 0; pu < 4; pu++) {
         int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-        int mode = (enc->quality_level >= 4) ? HEVC_MODE_DC : hevc_choose_luma_mode(y_min, enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch, px, py);
-        pu_modes[pu] = mode;
-
         uint8_t pred[16];
-        hevc_predict_4x4(enc->recon_y, cw, cw, ch, px, py, mode, 1, y_min, pred);
+        int mode;
+        if (enc->quality_level >= 4) {
+            mode = HEVC_MODE_DC;
+            hevc_predict_4x4(enc->recon_y, cw, cw, ch, px, py, mode, 1, y_min, pred);
+        } else {
+            mode = hevc_choose_luma_mode(y_min, enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch, px, py, pred);
+        }
+        pu_modes[pu] = mode;
 
         int16_t residual[16];
         for (int y = 0; y < 4; y++)
@@ -1117,15 +1114,19 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             res_cr[y * 4 + x] = (int16_t)(enc->src_cr[(cy + y) * ccw + (cx + x)] - pred_cr[y * 4 + x]);
         }
 
+    /* Chroma quantizes at QpC, not QpY - Rec. ITU-T H.265 Table 8-10.
+     * Passing luma QP directly causes divergence from the standard when QP >= 30. */
+    int cqp = hevc_chroma_qp_from_luma(qp);
+
     int16_t coeff_cb[16], coeff_cr[16];
-    hevc_transform_quant_4x4(res_cb, qp, 0, coeff_cb);
-    hevc_transform_quant_4x4(res_cr, qp, 0, coeff_cr);
+    hevc_transform_quant_4x4(res_cb, cqp, 0, coeff_cb);
+    hevc_transform_quant_4x4(res_cr, cqp, 0, coeff_cr);
     int cbf_cb = any_nonzero16(coeff_cb);
     int cbf_cr = any_nonzero16(coeff_cr);
 
     if (cbf_cb) {
         int16_t rres_cb[16];
-        hevc_dequant_itransform_4x4(coeff_cb, qp, 0, rres_cb);
+        hevc_dequant_itransform_4x4(coeff_cb, cqp, 0, rres_cb);
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++)
                 enc->recon_cb[(cy + y) * ccw + (cx + x)] = clip8i(pred_cb[y * 4 + x] + rres_cb[y * 4 + x]);
@@ -1136,7 +1137,7 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
 
     if (cbf_cr) {
         int16_t rres_cr[16];
-        hevc_dequant_itransform_4x4(coeff_cr, qp, 0, rres_cr);
+        hevc_dequant_itransform_4x4(coeff_cr, cqp, 0, rres_cr);
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++)
                 enc->recon_cr[(cy + y) * ccw + (cx + x)] = clip8i(pred_cr[y * 4 + x] + rres_cr[y * 4 + x]);

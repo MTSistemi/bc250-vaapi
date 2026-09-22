@@ -209,13 +209,8 @@ static void gather_neighbors(const uint8_t *plane, int stride, int width, int he
 
 /* ===================== prediction (8.4.4.2.5-8.4.4.2.7) ===================== */
 
-void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
-                      int x0, int y0, int mode, int is_luma, int y_min,
-                      uint8_t pred_out[16]) {
-    uint8_t left[5], top[5], corner;
-    int avail_left = 0, avail_top = 0;
-    gather_neighbors(recon_plane, stride, width, height, x0, y0, is_luma, y_min, left, top, &corner, &avail_left, &avail_top);
-
+static inline void predict_from_refs(const uint8_t left[5], const uint8_t top[5], uint8_t corner,
+                                     int mode, int is_luma, uint8_t pred_out[16]) {
     switch (mode) {
     case HEVC_MODE_PLANAR:
         for (int y = 0; y < 4; y++)
@@ -227,27 +222,6 @@ void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int hei
         break;
 
     case HEVC_MODE_DC: {
-        /* No branching on availability here, deliberately.
-         *
-         * gather_neighbors() has already run the reference sample
-         * substitution of Rec. ITU-T H.265 8.4.4.2.2: it scans bottom-left to
-         * top-right, takes the first available sample and fills every
-         * unavailable one from its neighbour (all 128 when the block has no
-         * neighbours at all). By the time we get here left[] and top[] are
-         * full, and there is no longer any such thing as an unavailable
-         * reference - which is exactly the state 8.4.4.2.5 assumes when it
-         * computes dcVal over BOTH edges and applies the boundary filter for
-         * luma below 32x32.
-         *
-         * Branching on avail_left/avail_top computed dcVal from one edge with
-         * different rounding, and filtered only that edge. A decoder does
-         * neither, so every block touching a picture edge came out a few
-         * units off - and since this encoder predicts DC everywhere, that
-         * difference then rode the prediction chain across the whole picture.
-         * Measured on a BC-250 before this: the encoder's own reconstruction
-         * reached 53.7 dB against the source while the decoded stream sat at
-         * 24.1 dB, and the two disagreed on 56% of pixels.
-         */
         int dc = (left[0] + left[1] + left[2] + left[3] +
                   top[0] + top[1] + top[2] + top[3] + 4) >> 3;
         for (int i = 0; i < 16; i++) pred_out[i] = (uint8_t)dc;
@@ -285,25 +259,58 @@ void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int hei
     }
 }
 
-int hevc_choose_luma_mode(int y_min, const uint8_t *src_y, const uint8_t *recon_y, int stride,
-                           int width, int height, int x0, int y0) {
-    static const int candidates[4] = { HEVC_MODE_PLANAR, HEVC_MODE_DC, HEVC_MODE_HORIZONTAL, HEVC_MODE_VERTICAL };
-    int best_mode = HEVC_MODE_DC;
-    long best_sad = -1;
+void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
+                      int x0, int y0, int mode, int is_luma, int y_min,
+                      uint8_t pred_out[16]) {
+    uint8_t left[5], top[5], corner;
+    int avail_left = 0, avail_top = 0;
+    gather_neighbors(recon_plane, stride, width, height, x0, y0, is_luma, y_min, left, top, &corner, &avail_left, &avail_top);
+    predict_from_refs(left, top, corner, mode, is_luma, pred_out);
+}
 
-    for (int c = 0; c < 4; c++) {
-        uint8_t pred[16];
-        hevc_predict_4x4(recon_y, stride, width, height, x0, y0, candidates[c], 1, y_min, pred);
-        long sad = 0;
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++) {
-                int src = src_y[(y0 + y) * stride + (x0 + x)];
-                int p = pred[y * 4 + x];
-                int d = src - p;
-                sad += d < 0 ? -d : d;
-            }
-        if (best_sad < 0 || sad < best_sad) { best_sad = sad; best_mode = candidates[c]; }
+static inline int sad_4x4(const uint8_t a[16], const uint8_t b[16]) {
+    int sad = 0;
+    for (int i = 0; i < 16; i++) {
+        int d = (int)a[i] - (int)b[i];
+        sad += d < 0 ? -d : d;
     }
+    return sad;
+}
+
+int hevc_choose_luma_mode(int y_min, const uint8_t *src_y, const uint8_t *recon_y, int stride,
+                           int width, int height, int x0, int y0, uint8_t pred_out[16]) {
+    /* Gather ONCE for all candidates instead of 4 separate calls */
+    uint8_t left[5], top[5], corner;
+    gather_neighbors(recon_y, stride, width, height, x0, y0, 1, y_min, left, top, &corner, NULL, NULL);
+
+    /* Hoist 4x4 source block into contiguous 16 bytes for vectorized SAD */
+    uint8_t src16[16];
+    const uint8_t *srow = src_y + (size_t)y0 * (size_t)stride + (size_t)x0;
+    memcpy(src16 + 0,  srow,                      4);
+    memcpy(src16 + 4,  srow + stride,             4);
+    memcpy(src16 + 8,  srow + 2 * (size_t)stride, 4);
+    memcpy(src16 + 12, srow + 3 * (size_t)stride, 4);
+
+    predict_from_refs(left, top, corner, HEVC_MODE_PLANAR, 1, pred_out);
+    int best_mode = HEVC_MODE_PLANAR;
+    int best_sad = sad_4x4(src16, pred_out);
+
+#define HEVC_TRY_MODE(M) do {                                              \
+        uint8_t pred_[16];                                                 \
+        predict_from_refs(left, top, corner, (M), 1, pred_);               \
+        int sad_ = sad_4x4(src16, pred_);                                  \
+        if (sad_ < best_sad) {                                             \
+            best_sad = sad_;                                               \
+            best_mode = (M);                                               \
+            memcpy(pred_out, pred_, 16);                                   \
+        }                                                                  \
+    } while (0)
+
+    HEVC_TRY_MODE(HEVC_MODE_DC);
+    HEVC_TRY_MODE(HEVC_MODE_HORIZONTAL);
+    HEVC_TRY_MODE(HEVC_MODE_VERTICAL);
+#undef HEVC_TRY_MODE
+
     return best_mode;
 }
 
@@ -601,6 +608,19 @@ static inline void inverse_transform_4x4(const int16_t coeff[16], const int16_t 
     if (ha_sse41()) { inverse_transform_4x4_sse(coeff, M, out); return; }
 #endif
     inverse_transform_4x4_scalar(coeff, M, out);
+}
+
+int hevc_chroma_qp_from_luma(int qp_luma) {
+    /* qPiCb = Clip3(-QpBdOffsetC, 57, QpY + pps_cb_qp_offset +
+     * slice_cb_qp_offset). Both PPS chroma offsets are written as 0 and
+     * pps_slice_chroma_qp_offsets_present_flag is 0 (see write_pps()), and
+     * QpBdOffsetC is 0 at 8-bit, so qPi is just QpY clamped - and Cb and Cr
+     * therefore share one value. */
+    static const int qpc_30_43[14] = { 29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37 };
+    int qpi = qp_luma < 0 ? 0 : (qp_luma > 57 ? 57 : qp_luma);
+    if (qpi < 30) return qpi;
+    if (qpi > 43) return qpi - 6;
+    return qpc_30_43[qpi - 30];
 }
 
 void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,

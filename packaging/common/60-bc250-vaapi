@@ -21,6 +21,10 @@ for dev in /sys/bus/pci/devices/*/; do
     [ "$(cat "$dev/vendor")" = "0x1002" ] || continue
     [ "$(cat "$dev/device")" = "0x13fe" ] || continue
     echo "LIBVA_DRIVER_NAME=bc250"
+    echo "OMP_WAIT_POLICY=PASSIVE"
+    echo "GOMP_SPINCOUNT=0"
+    echo "OMP_NUM_THREADS=2"
+    echo "OMP_DYNAMIC=FALSE"
     exit 0
 done
 

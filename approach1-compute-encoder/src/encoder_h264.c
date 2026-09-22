@@ -131,6 +131,7 @@ struct h264_encoder {
     h264_sps_t sps;
     h264_pps_t pps;
     rate_control_t rc;
+    int qp_hint_applied;         /* Last QP explicitly handed to h264_encoder_set_qp(), or -1 if never called yet */
     bool cbr_intent;             /* see h264_encoder_set_cbr_intent's doc comment */
     uint64_t last_frame_sad;     /* Sum of macroblock motion SAD from previous frame */
     int num_slices;              /* Configured slices per frame (1..16) */
@@ -1731,6 +1732,7 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
      * reaction, not an opt-out of hitting the target the way real VBR is. */
     rc_init(&encoder->rc, RC_LOW_LATENCY, bitrate, (double)encoder->fps, width, height);
     encoder->last_frame_sad = 0;
+    encoder->qp_hint_applied = -1; /* no explicit QP hint applied yet - see h264_encoder_set_qp() */
 
     /* 4 bytes/pixel + slack. Was 2 bytes/pixel, which is ~50x more than
      * real 1440p desktop content needs at QP 12 (measured max 148,542
@@ -1844,6 +1846,17 @@ void h264_encoder_set_gop_size(h264_encoder_t *encoder, uint32_t gop_size) {
     }
 }
 
+void h264_encoder_set_cropping(h264_encoder_t *encoder, int enable,
+                               uint32_t left, uint32_t right,
+                               uint32_t top, uint32_t bottom) {
+    if (!encoder) return;
+    encoder->sps.frame_cropping = enable ? true : false;
+    encoder->sps.crop_left   = enable ? left   : 0;
+    encoder->sps.crop_right  = enable ? right  : 0;
+    encoder->sps.crop_top    = enable ? top    : 0;
+    encoder->sps.crop_bottom = enable ? bottom : 0;
+}
+
 void h264_encoder_set_num_slices(h264_encoder_t *encoder, int num_slices) {
     if (encoder && num_slices >= 1 && num_slices <= 16) {
         encoder->num_slices = num_slices;
@@ -1937,9 +1950,16 @@ void h264_encoder_set_qp(h264_encoder_t *encoder, int qp) {
          * ffmpeg-testsrc testing never has, which is why this went
          * uncaught all session until a real VA-API consumer (Sunshine)
          * exercised it for the first time. */
+        /* Only reset rate-control state the first time this value is seen, or when it
+         * genuinely changes. A resend of the SAME hint (e.g. from Sunshine's per-frame
+         * pic_init_qp) is then a no-op, and the rate controller's feedback loop is left
+         * alone to keep walking frame to frame. A genuinely new hint still applies immediately. */
+        if (qp != encoder->qp_hint_applied) {
+            encoder->rc.base_qp = qp;
+            encoder->rc.current_qp = qp;
+            encoder->qp_hint_applied = qp;
+        }
         encoder->pps.pic_init_qp = qp - 26;
-        encoder->rc.base_qp = qp;
-        encoder->rc.current_qp = qp;
     }
 }
 

@@ -1,0 +1,15 @@
+{
+  "scale": 1.0,
+  "bitrate": 190000000,
+  "codec": "h264",
+  "encoders": [
+    {
+      "encoder": "vaapi",
+      "codec": "h264"
+    }
+  ],
+  "foveation": {
+    "enable": true
+  },
+  "tcp_only": false
+}
