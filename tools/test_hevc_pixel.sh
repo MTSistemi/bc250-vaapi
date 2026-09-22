@@ -88,8 +88,8 @@ done
 check "max TU 16" "$S1" "max-tu-size=16:qp=28"
 check "TU maximum 8" "$S1" "max-tu-size=8:qp=28"
 check "TU maximum 4" "$S1" "max-tu-size=4:qp=28"
-check "profondita' TU intra 1" "$S1" "tu-intra-depth=1:qp=28"
-check "profondita' TU intra 4" "$S1" "tu-intra-depth=4:qp=28"
+check "intra TU depth 1" "$S1" "tu-intra-depth=1:qp=28"
+check "intra TU depth 4" "$S1" "tu-intra-depth=4:qp=28"
 check "CTU 16, TU 8" "$S1" "ctu=16:max-tu-size=8:qp=28"
 
 echo
@@ -98,43 +98,43 @@ check "sign hide off" "$S1" "signhide=0:qp=28"
 check "transform skip" "$S1" "tskip=1:qp=28"
 check "strong smoothing off" "$S1" "strong-intra-smoothing=0:qp=28"
 check "strong smoothing on" "$S1" "strong-intra-smoothing=1:qp=28"
-check "rd maximum" "$S1" "rd=6:qp=28"
-check "aq forte" "$S2" "aq-mode=2:aq-strength=1.5:qp=28"
+check "maximum rd" "$S1" "rd=6:qp=28"
+check "strong aq" "$S2" "aq-mode=2:aq-strength=1.5:qp=28"
 check "rdoq off" "$S1" "rdoq-level=0:qp=28"
-check "psy-rd forte" "$S1" "psy-rd=4.0:qp=28"
+check "strong psy-rd" "$S1" "psy-rd=4.0:qp=28"
 check "lossless" "$S1" "lossless=1"
 
 echo
-echo "il filter di deblocking"
+echo "the deblocking filter"
 check "filter off" "$S1" "qp=28:deblock=false"
-check "scostamenti +3/+3" "$S1" "qp=28:deblock=3,3"
-check "scostamenti -3/-3" "$S1" "qp=28:deblock=-3,-3"
-check "scostamenti +6/-6" "$S1" "qp=28:deblock=6,-6"
-check "scostamenti -6/+6" "$S1" "qp=28:deblock=-6,6"
-check "filter a qp alto" "$S1" "qp=48"
-check "filter a qp basso" "$S1" "qp=6"
-check "filter con CTU 16" "$S1" "qp=34:ctu=16"
-check "filter con TU 4" "$S1" "qp=34:max-tu-size=4"
+check "offsets +3/+3" "$S1" "qp=28:deblock=3,3"
+check "offsets -3/-3" "$S1" "qp=28:deblock=-3,-3"
+check "offsets +6/-6" "$S1" "qp=28:deblock=6,-6"
+check "offsets -6/+6" "$S1" "qp=28:deblock=-6,6"
+check "filter at high qp" "$S1" "qp=48"
+check "filter at low qp" "$S1" "qp=6"
+check "filter with CTU 16" "$S1" "qp=34:ctu=16"
+check "filter with TU 4" "$S1" "qp=34:max-tu-size=4"
 
 echo
-echo "il sample adaptive offset"
+echo "the sample adaptive offset"
 check "sao off" "$S1" "qp=28:sao=0"
-check "sao a qp 34" "$S1" "qp=34"
-check "sao a qp 44" "$S1" "qp=44"
-check "sao first del deblocking" "$S1" "qp=34:sao-non-deblock=1"
-check "sao con CTU 16" "$S1" "qp=34:ctu=16"
-check "sao con CTU 32" "$S1" "qp=34:ctu=32"
-check "sao, limit di offset" "$S1" "qp=44:sao-lookahead-depth=0"
-check "sao su mandelbrot" "mandelbrot=size=320x240" "qp=32"
+check "sao at qp 34" "$S1" "qp=34"
+check "sao at qp 44" "$S1" "qp=44"
+check "sao before deblocking" "$S1" "qp=34:sao-non-deblock=1"
+check "sao with CTU 16" "$S1" "qp=34:ctu=16"
+check "sao with CTU 32" "$S1" "qp=34:ctu=32"
+check "sao, offset limit" "$S1" "qp=44:sao-lookahead-depth=0"
+check "sao on mandelbrot" "mandelbrot=size=320x240" "qp=32"
 
 echo
 # ⚠️ Rate control is where the quantisation parameter stops standing still.
 # A decoder can be byte-exact on every constant-QP stream in the world and
 # still be wrong here, because only here does the parameter get predicted
 # from the neighbours rather than read from the slice header.
-echo "check_of di stream, un QP per group"
+echo "stream control, one QP per group"
 check "crf" "$S2" "crf=28"
-check "crf basso" "$S2" "crf=12"
+check "low crf" "$S2" "crf=12"
 check "crf, group 32" "$S2" "crf=28:qg-size=32"
 check "crf, group 16" "$S2" "crf=28:qg-size=16"
 check "crf, CTU 32" "$S2" "crf=28:ctu=32"
@@ -142,7 +142,7 @@ check "crf, CTU 16" "$S2" "crf=28:ctu=16"
 check "crf 1920x1080" "testsrc2=size=1920x1080:rate=25" "crf=30"
 check "crf mandelbrot" "mandelbrot=size=320x240" "crf=20"
 check "bitrate fixed" "$S2" "bitrate=300"
-check "aq 3 con crf" "$S2" "crf=28:aq-mode=3"
+check "aq 3 with crf" "$S2" "crf=28:aq-mode=3"
 
 echo
 echo "sizes"
@@ -153,9 +153,9 @@ check "1920x1080" "testsrc2=size=1920x1080:rate=25" "qp=30"
 check "32x32" "testsrc2=size=32x32:rate=25" "qp=28"
 
 echo
-echo "other contents"
+echo "other content"
 check "mandelbrot" "mandelbrot=size=320x240" "qp=24"
-check "quasi noise" "$S1" "qp=4"
+check "almost noise" "$S1" "qp=4"
 check "flat grey" "color=c=gray:size=176x144" "qp=28"
 
 echo

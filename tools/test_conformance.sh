@@ -93,7 +93,7 @@ check "intra no-deblock" "$SRC1" 176x144 \
     -frames:v 1 -c:v libx264 -profile:v main -qp 26 -x264opts no-deblock
 
 echo
-echo "sizes non multiple di 16"
+echo "sizes that are not multiples of 16"
 check "58x50, edges to be cropped" "testsrc2=size=58x50:rate=25" 58x50 \
     -frames:v 1 -c:v libx264 -profile:v main -qp 24
 check "320x240" "$SRC2" 320x240 \
@@ -122,7 +122,7 @@ check "16 pictures, 3 B, no pyramid" "$SRC1" 176x144     -frames:v 16 -c:v libx2
 check "12 pictures B, high 8x8" "$SRC1" 176x144     -frames:v 12 -c:v libx264 -profile:v high -qp 26 -bf 2 -g 6 -x264opts b-pyramid=none
 check "12 pictures B, 320x240" "$SRC2" 320x240     -frames:v 12 -c:v libx264 -profile:v high -qp 24 -bf 2 -g 6 -x264opts b-pyramid=none
 check "10 pictures, pyramid B" "$SRC1" 176x144     -frames:v 10 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 30
-check "20 pictures, all i default di x264" "$SRC1" 176x144     -frames:v 20 -c:v libx264 -profile:v high -preset slow -crf 25 -g 10
+check "20 pictures, every x264 default" "$SRC1" 176x144     -frames:v 20 -c:v libx264 -profile:v high -preset slow -crf 25 -g 10
 
 echo
 echo "CAVLC"
@@ -209,7 +209,7 @@ check "12 pictures temporal, 58x50" "testsrc2=size=58x50:rate=25" 58x50 \
     -frames:v 12 -c:v libx264 -profile:v high -qp 26 -bf 2 -g 6 $TD
 
 echo
-echo "matrices di quantisation"
+echo "quantisation matrices"
 
 # A distinct value in every position: a list kept in the wrong order then
 # cannot come out right by accident. The 4x4 lists run 8..38 and the 8x8

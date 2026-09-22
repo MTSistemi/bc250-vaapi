@@ -107,7 +107,7 @@ check "12 pictures B CAVLC" "$S1" -frames:v 12 -c:v libx264 -profile:v high \
     -qp 24 -bf 2 -g 6 -x264opts cabac=0:b-pyramid=none
 
 echo
-echo "matrices di quantisation"
+echo "quantisation matrices"
 check "intra, matrices JVT" "$S1" -frames:v 1 -c:v libx264 -profile:v high \
     -qp 22 -x264opts cqm=jvt
 check "12 pictures, matrices JVT" "$S1" -frames:v 12 -c:v libx264 \
