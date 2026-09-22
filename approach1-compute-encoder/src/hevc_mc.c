@@ -32,14 +32,6 @@ static inline int clip_pixel(int v, int bd)
 /* ⚠️ A motion vector may point off the edge of the reference picture, and
  * legitimately: an object entering the frame was not there before. The
  * edge sample is repeated outwards rather than the fetch being refused. */
-static inline int sample_at(const uint8_t *p, int stride, int w, int h,
-                           int x, int y)
-{
-    x = x < 0 ? 0 : (x >= w ? w - 1 : x);
-    y = y < 0 ? 0 : (y >= h ? h - 1 : y);
-    return p[(size_t)y * stride + x];
-}
-
 /* ------------------------------------------------- the vector paths */
 
 /* SSE2 is part of the x86-64 ABI, so the two stages that take fourteen
@@ -482,27 +474,27 @@ static bool use_vectors(int bd)
 #endif
 }
 
-#define DUE_STRADE(nome, TIPO)                                             \
-static void nome##_any(const TIPO *s, int sp, int w, int h,                \
+#define BOTH_WAYS(nome, TYPE)                                             \
+static void nome##_any(const TYPE *s, int sp, int w, int h,                \
                        const int8_t *f, int16_t *o, int po,                \
                        int down, bool vec)                                 \
 {                                                                          \
-    IF_VETTORE(nome)                                                       \
+    IF_VECTOR(nome)                                                       \
     nome(s, sp, w, h, f, o, po, down);                                     \
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
-#define IF_VETTORE(nome) if (vec) { nome##_v(s, sp, w, h, f, o, po); return; }
+#define IF_VECTOR(nome) if (vec) { nome##_v(s, sp, w, h, f, o, po); return; }
 #else
-#define IF_VETTORE(nome) (void)vec;
+#define IF_VECTOR(nome) (void)vec;
 #endif
 
-DUE_STRADE(horiz8, uint8_t)
-DUE_STRADE(horiz4, uint8_t)
-DUE_STRADE(vert8, uint8_t)
-DUE_STRADE(vert4, uint8_t)
-DUE_STRADE(vert8_16, int16_t)
-DUE_STRADE(vert4_16, int16_t)
+BOTH_WAYS(horiz8, uint8_t)
+BOTH_WAYS(horiz4, uint8_t)
+BOTH_WAYS(vert8, uint8_t)
+BOTH_WAYS(vert4, uint8_t)
+BOTH_WAYS(vert8_16, int16_t)
+BOTH_WAYS(vert4_16, int16_t)
 
 /* One rectangle of one plane, at a fractional position, into fourteen-bit
  * intermediate values.
@@ -557,14 +549,14 @@ static void interpolate(const uint8_t *ref_pic, int stride, int w_pic, int h_pic
         for (int r = 0; r < bh; r++) {
             int sy = by + r;
             sy = sy < 0 ? 0 : (sy >= h_pic ? h_pic - 1 : sy);
-            const uint8_t *riga_rif = ref_pic + (size_t)sy * stride;
+            const uint8_t *ref_row = ref_pic + (size_t)sy * stride;
             uint8_t *o = border + (size_t)r * sp;
-            if (left > 0) memset(o, riga_rif[0], (size_t)left);
+            if (left > 0) memset(o, ref_row[0], (size_t)left);
             if (right > left)
-                memcpy(o + left, riga_rif + bx + left,
+                memcpy(o + left, ref_row + bx + left,
                        (size_t)(right - left));
             if (bw > right)
-                memset(o + right, riga_rif[w_pic - 1], (size_t)(bw - right));
+                memset(o + right, ref_row[w_pic - 1], (size_t)(bw - right));
         }
         src = border;
     }

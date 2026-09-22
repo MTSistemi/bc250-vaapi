@@ -47,7 +47,7 @@ static int p(const ref_t *r, int x, int y)
 }
 
 /* clause 8.3.1.2.1 to 8.3.1.2.9 */
-static void letterale4(uint8_t out[16], int mode, const ref_t *r,
+static void literal4(uint8_t out[16], int mode, const ref_t *r,
                        int avail_top, int avail_left)
 {
     for (int y = 0; y < 4; y++) {
@@ -159,7 +159,7 @@ static void filter_literal(const uint8_t t[16], const uint8_t l[8], uint8_t c,
 }
 
 /* clause 8.3.2.2.2 to 8.3.2.2.10 */
-static void letterale8(uint8_t out[64], int mode, const ref_t *r,
+static void literal8(uint8_t out[64], int mode, const ref_t *r,
                        int avail_top, int avail_left)
 {
     for (int y = 0; y < 8; y++) {
@@ -249,7 +249,7 @@ static void letterale8(uint8_t out[64], int mode, const ref_t *r,
 
 
 /* clause 8.3.3, Intra_16x16 */
-static void letterale16(uint8_t out[256], int mode, const ref_t *r,
+static void literal16(uint8_t out[256], int mode, const ref_t *r,
                         int avail_top, int avail_left)
 {
     int H = 0, V = 0, a = 0, b = 0, cc = 0;
@@ -346,7 +346,7 @@ static void letteraleC(uint8_t out[64], int mode, const ref_t *r,
     }
 }
 
-static int prova16(void)
+static int check16(void)
 {
     uint8_t t[16], l[16], c, ours[256], its[256];
     int faults = 0;
@@ -358,7 +358,7 @@ static int prova16(void)
                 int at = (disp >> 1) & 1, al = disp & 1;
                 ref_t r = { t, l, c };
                 h264d_pred16x16(ours, 16, mode, t, l, c, at, al);
-                letterale16(its, mode, &r, at, al);
+                literal16(its, mode, &r, at, al);
                 if (memcmp(ours, its, 256)) {
                     if (faults < 3)
                         printf("  16x16 mode %d, top=%d left=%d: differ\n", mode, at, al);
@@ -409,7 +409,7 @@ static const char *mode_name[9] = {
     "Vertical Right", "Horizontal Down", "Vertical Left", "Horizontal Up"
 };
 
-static int prova4(void)
+static int check4(void)
 {
     uint8_t t[8], l[4], c, ours[16], its[16];
     int faults = 0;
@@ -425,7 +425,7 @@ static int prova4(void)
                 int at = (disp >> 1) & 1, al = disp & 1;
                 ref_t r = { t, l, c };
                 h264d_pred4x4(ours, 4, mode, t, l, c, at, al);
-                letterale4(its, mode, &r, at, al);
+                literal4(its, mode, &r, at, al);
                 if (memcmp(ours, its, 16)) {
                     if (faults < 6) {
                         printf("  4x4 mode %d (%s), top=%d left=%d:\n",
@@ -448,7 +448,7 @@ static int prova4(void)
     return faults;
 }
 
-static int prova8(void)
+static int check8(void)
 {
     uint8_t t[16], l[8], c, ours[64], its[64];
     int faults = 0;
@@ -473,7 +473,7 @@ static int prova8(void)
                 ref_t r = { ft, fl, fc };
 
                 h264d_pred8x8_luma(ours, 8, mode, t, l, c, at, al, ac, top_right);
-                letterale8(its, mode, &r, at, al);
+                literal8(its, mode, &r, at, al);
                 if (memcmp(ours, its, 64)) {
                     if (faults < 4) {
                         printf("  8x8 mode %d (%s), top=%d left=%d top-right=%d:\n",
@@ -497,17 +497,17 @@ static int prova8(void)
 int main(void)
 {
     printf("1. Intra_4x4, nine modes against the literal standard\n");
-    int g4 = prova4();
+    int g4 = check4();
     if (g4) { printf("   %d blocks differ\n", g4); return 1; }
     printf("   20000 rounds x 9 modes: identical\n");
 
     printf("2. Intra_8x8, nine modes plus the reference filter\n");
-    int g8 = prova8();
+    int g8 = check8();
     if (g8) { printf("   %d blocks differ\n", g8); return 1; }
     printf("   20000 rounds x 9 modes: identical\n");
 
     printf("3. Intra_16x16, four modes\n");
-    int g16 = prova16();
+    int g16 = check16();
     if (g16) { printf("   %d blocks differ\n", g16); return 1; }
     printf("   20000 rounds x 4 modes: identical\n");
 

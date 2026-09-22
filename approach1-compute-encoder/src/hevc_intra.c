@@ -431,12 +431,12 @@ static void inverse_transform_4x4_sse(const int16_t coeff[16], const int16_t M[4
     /* pass 2: out[r*4+c] = clip((sum_k M[k][c] * tmp[r][k] + 2048) >> 12) */
     __m128i row_m[4];
     for (int k = 0; k < 4; k++) row_m[k] = row_i32(M[k]);
-    const __m128i duemila48 = _mm_set1_epi32(2048);
+    const __m128i half_a_step = _mm_set1_epi32(2048);
     for (int r = 0; r < 4; r++) {
         __m128i acc = _mm_setzero_si128();
         for (int k = 0; k < 4; k++)
             acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_set1_epi32(tmp[r][k]), row_m[k]));
-        acc = _mm_srai_epi32(_mm_add_epi32(acc, duemila48), 12);
+        acc = _mm_srai_epi32(_mm_add_epi32(acc, half_a_step), 12);
         /* packs saturates to int16 exactly as clip_coeff does */
         _mm_storel_epi64((__m128i *)&out[r * 4], _mm_packs_epi32(acc, acc));
     }

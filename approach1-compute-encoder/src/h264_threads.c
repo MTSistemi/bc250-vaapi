@@ -77,7 +77,7 @@ struct h264d_pool {
 };
 
 /* How far a row has to have got before the row below may touch column x. */
-static inline void attendi(const atomic_int *p, int up_to)
+static inline void await_row(const atomic_int *p, int up_to)
 {
     int rounds = 0;
     while (atomic_load_explicit(p, memory_order_acquire) < up_to) {
@@ -140,7 +140,7 @@ static void work(struct h264d_pool *p)
 
         for (int x = x0; x <= x1; x++) {
             if (wait_for)
-                attendi(&p->progress_of[r - 1], x + 2);
+                await_row(&p->progress_of[r - 1], x + 2);
 
             if (p->kind == 0) {
                 c.mb_idx = r * mb_w + x;
