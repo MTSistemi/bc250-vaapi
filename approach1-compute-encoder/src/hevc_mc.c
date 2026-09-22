@@ -21,9 +21,12 @@
 
 #define MAX_SIDE 64
 
-static inline uint8_t clip8(int v)
+/* ⚠️ Clip3(0, (1 << BitDepth) - 1, v). The same thing as a clip to 255
+ * at eight bits and nowhere else. */
+static inline int clip_pixel(int v, int bd)
 {
-    return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+    const int max = (1 << bd) - 1;
+    return v < 0 ? 0 : (v > max ? max : v);
 }
 
 /* ⚠️ A motion vector may point off the edge of the reference picture, and
@@ -300,7 +303,7 @@ static void one_pred_v(uint8_t *dst, int stride, int w, int h,
             v = _mm_srai_epi16(_mm_add_epi16(v, trentadue), 6);
             _mm_storel_epi64((__m128i *)(o + c), _mm_packus_epi16(v, v));
         }
-        for (; c < w; c++) o[c] = clip8((s[c] + 32) >> 6);
+        for (; c < w; c++) o[c] = (uint8_t)clip_pixel((s[c] + 32) >> 6, 8);
     }
 }
 
@@ -331,7 +334,7 @@ static void two_pred_v(uint8_t *dst, int stride, int w, int h,
             _mm_storel_epi64((__m128i *)(o + c),
                              _mm_packus_epi16(sixteen, sixteen));
         }
-        for (; c < w; c++) o[c] = clip8((sa[c] + sb[c] + 64) >> 7);
+        for (; c < w; c++) o[c] = (uint8_t)clip_pixel((sa[c] + sb[c] + 64) >> 7, 8);
     }
 }
 
@@ -342,11 +345,11 @@ static void two_pred_v(uint8_t *dst, int stride, int w, int h,
  * with no widening step of its own. */
 static void one_weighted_v(uint8_t *dst, int stride, int w, int h,
                          const int16_t *a, int stride_a,
-                         int peso, int off, int den)
+                         int weight, int off, int den)
 {
     const int log2wd = den + 6;
     const __m128i zero = _mm_setzero_si128();
-    const __m128i pv = _mm_set1_epi32((int32_t)(uint32_t)(uint16_t)peso);
+    const __m128i pv = _mm_set1_epi32((int32_t)(uint32_t)(uint16_t)weight);
     const __m128i rounding = _mm_set1_epi32(1 << (log2wd - 1));
     const __m128i ov = _mm_set1_epi32(off);
     const __m128i giu = _mm_cvtsi32_si128(log2wd);
@@ -367,7 +370,7 @@ static void one_weighted_v(uint8_t *dst, int stride, int w, int h,
         }
         for (; c < w; c++) {
             const int v = s[c];
-            o[c] = clip8(((v * peso + (1 << (log2wd - 1))) >> log2wd) + off);
+            o[c] = (uint8_t)clip_pixel(((v * weight + (1 << (log2wd - 1))) >> log2wd) + off, 8);
         }
     }
 }
@@ -404,8 +407,8 @@ static void two_weighted_v(uint8_t *dst, int stride, int w, int h,
                              _mm_packus_epi16(sixteen, sixteen));
         }
         for (; c < w; c++)
-            o[c] = clip8((sa[c] * pa + sb[c] * pb
-                              + ((oa + ob + 1) << log2wd)) >> (log2wd + 1));
+            o[c] = (uint8_t)clip_pixel((sa[c] * pa + sb[c] * pb
+                              + ((oa + ob + 1) << log2wd)) >> (log2wd + 1), 8);
     }
 }
 
@@ -422,7 +425,7 @@ static void two_weighted_v(uint8_t *dst, int stride, int w, int h,
  * three quarters of the decoder's time. */
 #define HORIZONTAL(nome, N)                                               \
 static void nome(const uint8_t *src, int sp, int w, int h,                 \
-                 const int8_t *f, int16_t *out, int pf)                  \
+                 const int8_t *f, int16_t *out, int pf, int down)          \
 {                                                                          \
     for (int r = 0; r < h; r++) {                                          \
         const uint8_t *s = src + (size_t)r * sp;                           \
@@ -430,7 +433,7 @@ static void nome(const uint8_t *src, int sp, int w, int h,                 \
         for (int c = 0; c < w; c++) {                                      \
             int v = 0;                                                     \
             for (int k = 0; k < N; k++) v += f[k] * s[c + k];              \
-            o[c] = (int16_t)v;                                             \
+            o[c] = (int16_t)(v >> down);                                   \
         }                                                                  \
     }                                                                      \
 }
@@ -438,9 +441,9 @@ static void nome(const uint8_t *src, int sp, int w, int h,                 \
 /* The same down a column. `TYPE` is whole samples on the way in and the
  * fourteen-bit output of a horizontal pass on the way back, `DOWN` the
  * shift that takes the second pass back to fourteen bits. */
-#define VERTICAL(nome, N, TYPE, DOWN)                                      \
+#define VERTICAL(nome, N, TYPE)                                            \
 static void nome(const TYPE *src, int sp, int w, int h,                    \
-                 const int8_t *f, int16_t *out, int pf)                  \
+                 const int8_t *f, int16_t *out, int pf, int down)          \
 {                                                                          \
     for (int r = 0; r < h; r++) {                                          \
         const TYPE *s = src + (size_t)r * sp;                              \
@@ -448,29 +451,58 @@ static void nome(const TYPE *src, int sp, int w, int h,                    \
         for (int c = 0; c < w; c++) {                                      \
             int v = 0;                                                     \
             for (int k = 0; k < N; k++) v += f[k] * s[(size_t)k * sp + c]; \
-            o[c] = (int16_t)(v >> (DOWN));                                  \
+            o[c] = (int16_t)(v >> down);                                   \
         }                                                                  \
     }                                                                      \
 }
 
 HORIZONTAL(horiz8, 8)
 HORIZONTAL(horiz4, 4)
-VERTICAL(vert8, 8, uint8_t, 0)
-VERTICAL(vert4, 4, uint8_t, 0)
-VERTICAL(vert8_16, 8, int16_t, 6)
-VERTICAL(vert4_16, 4, int16_t, 6)
+VERTICAL(vert8, 8, uint8_t)
+VERTICAL(vert4, 4, uint8_t)
+VERTICAL(vert8_16, 8, int16_t)
+VERTICAL(vert4_16, 4, int16_t)
 
 /* ------------------------------------------------ and which one to use */
 
+/* ⚠️ The vector paths are eight bit only. They pack to unsigned bytes,
+ * which at ten bits would saturate everything above 255 and hand back a
+ * picture that looks decoded. So the depth decides, not only the
+ * processor - and BC250_HEVC_NOSIMD forces the scalar path, so the suites
+ * can be run through the code that carries every other depth. */
+static bool use_vectors(int bd)
+{
 #if defined(__x86_64__) || defined(_M_X64)
-#define HORIZ(n) (ha_ssse3() ? horiz##n##_v : horiz##n)
-#define VERT(n) (ha_ssse3() ? vert##n##_v : vert##n)
-#define VERT16(n) (ha_ssse3() ? vert##n##_16_v : vert##n##_16)
+    static int allowed = -1;
+    if (allowed < 0) allowed = getenv("BC250_HEVC_NOSIMD") ? 0 : 1;
+    return allowed && ha_ssse3() && bd == 8;
 #else
-#define HORIZ(n) horiz##n
-#define VERT(n) vert##n
-#define VERT16(n) vert##n##_16
+    (void)bd;
+    return false;
 #endif
+}
+
+#define DUE_STRADE(nome, TIPO)                                             \
+static void nome##_any(const TIPO *s, int sp, int w, int h,                \
+                       const int8_t *f, int16_t *o, int po,                \
+                       int down, bool vec)                                 \
+{                                                                          \
+    IF_VETTORE(nome)                                                       \
+    nome(s, sp, w, h, f, o, po, down);                                     \
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+#define IF_VETTORE(nome) if (vec) { nome##_v(s, sp, w, h, f, o, po); return; }
+#else
+#define IF_VETTORE(nome) (void)vec;
+#endif
+
+DUE_STRADE(horiz8, uint8_t)
+DUE_STRADE(horiz4, uint8_t)
+DUE_STRADE(vert8, uint8_t)
+DUE_STRADE(vert4, uint8_t)
+DUE_STRADE(vert8_16, int16_t)
+DUE_STRADE(vert4_16, int16_t)
 
 /* One rectangle of one plane, at a fractional position, into fourteen-bit
  * intermediate values.
@@ -480,10 +512,16 @@ VERTICAL(vert4_16, 4, int16_t, 6)
 static void interpolate(const uint8_t *ref_pic, int stride, int w_pic, int h_pic,
                       int x, int y, int w, int h, int fx, int fy,
                       const int8_t *filter_kind, int count, int before,
-                      int16_t *out, int out_stride)
+                      int16_t *out, int out_stride, int bd)
 {
     const int8_t *fh = filter_kind + (size_t)fx * count;
     const int8_t *fv = filter_kind + (size_t)fy * count;
+
+    /* 8.5.3.3.3.2: shift1 after the horizontal pass, shift2 after the
+     * vertical one. ⚠️ Only the first moves with the depth; the six is
+     * six at every depth the standard defines. */
+    const int down = bd - 8;
+    const bool vec = use_vectors(bd);
 
     /* The rectangle of whole samples the passes will read: as far back as
      * the filter reaches, and only in the directions it actually filters. */
@@ -533,25 +571,27 @@ static void interpolate(const uint8_t *ref_pic, int stride, int w_pic, int h_pic
 
     if (!fx && !fy) {
 #if defined(__x86_64__) || defined(_M_X64)
-        copy14_v(src, sp, w, h, out, out_stride);
-#else
+        if (vec) { copy14_v(src, sp, w, h, out, out_stride); return; }
+#endif
+        /* shift3 = 14 - BitDepth: the samples go up to fourteen bits, they
+         * do not come down. */
+        const int up = 14 - bd;
         for (int r = 0; r < h; r++)
             for (int c = 0; c < w; c++)
                 out[r * out_stride + c] =
-                    (int16_t)(src[(size_t)r * sp + c] << 6);
-#endif
+                    (int16_t)(src[(size_t)r * sp + c] << up);
         return;
     }
 
     if (!fy) {
-        if (count == 8) HORIZ(8)(src, sp, w, h, fh, out, out_stride);
-        else             HORIZ(4)(src, sp, w, h, fh, out, out_stride);
+        if (count == 8) horiz8_any(src, sp, w, h, fh, out, out_stride, down, vec);
+        else            horiz4_any(src, sp, w, h, fh, out, out_stride, down, vec);
         return;
     }
 
     if (!fx) {
-        if (count == 8) VERT(8)(src, sp, w, h, fv, out, out_stride);
-        else             VERT(4)(src, sp, w, h, fv, out, out_stride);
+        if (count == 8) vert8_any(src, sp, w, h, fv, out, out_stride, down, vec);
+        else            vert4_any(src, sp, w, h, fv, out, out_stride, down, vec);
         return;
     }
 
@@ -560,39 +600,44 @@ static void interpolate(const uint8_t *ref_pic, int stride, int w_pic, int h_pic
     int16_t middle[(MAX_SIDE + 7) * MAX_SIDE];
     const int tall = h + count - 1;
     if (count == 8) {
-        HORIZ(8)(src, sp, w, tall, fh, middle, MAX_SIDE);
-        VERT16(8)(middle, MAX_SIDE, w, h, fv, out, out_stride);
+        horiz8_any(src, sp, w, tall, fh, middle, MAX_SIDE, down, vec);
+        vert8_16_any(middle, MAX_SIDE, w, h, fv, out, out_stride, 6, vec);
     } else {
-        HORIZ(4)(src, sp, w, tall, fh, middle, MAX_SIDE);
-        VERT16(4)(middle, MAX_SIDE, w, h, fv, out, out_stride);
+        horiz4_any(src, sp, w, tall, fh, middle, MAX_SIDE, down, vec);
+        vert4_16_any(middle, MAX_SIDE, w, h, fv, out, out_stride, 6, vec);
     }
 }
 
 /* ------------------------------------- fourteen bits back down to eight */
 
 static void one_pred(uint8_t *dst, int stride, int w, int h,
-                const int16_t *a, int stride_a)
+                const int16_t *a, int stride_a, int bd)
 {
 #if defined(__x86_64__) || defined(_M_X64)
-    one_pred_v(dst, stride, w, h, a, stride_a);
-#else
+    if (use_vectors(bd)) { one_pred_v(dst, stride, w, h, a, stride_a); return; }
+#endif
+    /* 8.5.3.3.4.2: shift1 = 14 - BitDepth, offset1 = 1 << (shift1 - 1) */
+    const int sh = 14 - bd, add = 1 << (13 - bd);
     for (int r = 0; r < h; r++)
         for (int c = 0; c < w; c++)
-            dst[r * stride + c] = clip8((a[r * stride_a + c] + 32) >> 6);
-#endif
+            dst[r * stride + c] = (uint8_t)
+                clip_pixel((a[r * stride_a + c] + add) >> sh, bd);
 }
 
 static void two_pred(uint8_t *dst, int stride, int w, int h,
-                const int16_t *a, const int16_t *b, int stride_p)
+                const int16_t *a, const int16_t *b, int stride_p, int bd)
 {
 #if defined(__x86_64__) || defined(_M_X64)
-    two_pred_v(dst, stride, w, h, a, b, stride_p);
-#else
+    if (use_vectors(bd)) {
+        two_pred_v(dst, stride, w, h, a, b, stride_p);
+        return;
+    }
+#endif
+    const int sh = 15 - bd, add = 1 << (14 - bd);
     for (int r = 0; r < h; r++)
         for (int c = 0; c < w; c++)
-            dst[r * stride + c] =
-                clip8((a[r * stride_p + c] + b[r * stride_p + c] + 64) >> 7);
-#endif
+            dst[r * stride + c] = (uint8_t)clip_pixel(
+                (a[r * stride_p + c] + b[r * stride_p + c] + add) >> sh, bd);
 }
 
 /* 8.5.3.3.4.3. ⚠️ Used whenever the slice carries a weight table, even
@@ -602,42 +647,45 @@ static void two_pred(uint8_t *dst, int stride, int w, int h,
  * wrong. */
 static void one_weighted(uint8_t *dst, int stride, int w, int h,
                        const int16_t *a, int stride_a,
-                       int peso, int off, int den)
+                       int weight, int off, int den, int bd)
 {
-    const int log2wd = den + 6;
+    const int log2wd = den + 14 - bd;
+    const int o = off * (1 << (bd - 8));
 #if defined(__x86_64__) || defined(_M_X64)
-    /* log2wd is den + 6 and den is never negative, so the other branch is
-     * unreachable on any stream the parser accepts. It stays anyway. */
-    if (log2wd >= 1) {
-        one_weighted_v(dst, stride, w, h, a, stride_a, peso, off, den);
+    /* log2wd is den + 6 at eight bits and den is never negative, so the
+     * other branch is unreachable on any stream the parser accepts. It
+     * stays anyway. */
+    if (use_vectors(bd) && log2wd >= 1) {
+        one_weighted_v(dst, stride, w, h, a, stride_a, weight, off, den);
         return;
     }
 #endif
     for (int r = 0; r < h; r++)
         for (int c = 0; c < w; c++) {
             const int v = a[r * stride_a + c];
-            dst[r * stride + c] = clip8(
-                log2wd >= 1 ? (((v * peso + (1 << (log2wd - 1))) >> log2wd) + off)
-                            : (v * peso + off));
+            dst[r * stride + c] = (uint8_t)clip_pixel(
+                log2wd >= 1 ? (((v * weight + (1 << (log2wd - 1))) >> log2wd) + o)
+                            : (v * weight + o), bd);
         }
 }
 
 static void two_weighted(uint8_t *dst, int stride, int w, int h,
                        const int16_t *a, const int16_t *b, int stride_p,
-                       int pa, int pb, int oa, int ob, int den)
+                       int pa, int pb, int oa, int ob, int den, int bd)
 {
-    const int log2wd = den + 6;
+    const int log2wd = den + 14 - bd;
+    const int sa = oa * (1 << (bd - 8)), sb = ob * (1 << (bd - 8));
 #if defined(__x86_64__) || defined(_M_X64)
-    two_weighted_v(dst, stride, w, h, a, b, stride_p, pa, pb, oa, ob, den);
-    (void)log2wd;
-    return;
-#else
+    if (use_vectors(bd)) {
+        two_weighted_v(dst, stride, w, h, a, b, stride_p, pa, pb, oa, ob, den);
+        return;
+    }
+#endif
     for (int r = 0; r < h; r++)
         for (int c = 0; c < w; c++)
-            dst[r * stride + c] = clip8(
+            dst[r * stride + c] = (uint8_t)clip_pixel(
                 (a[r * stride_p + c] * pa + b[r * stride_p + c] * pb
-                 + ((oa + ob + 1) << log2wd)) >> (log2wd + 1));
-#endif
+                 + ((sa + sb + 1) << log2wd)) >> (log2wd + 1), bd);
 }
 
 /* Does this slice carry a weight table at all. */
@@ -660,6 +708,10 @@ void hevcd_predict_inter(hevcd_t *d, int x0, int y0, int w, int h,
     const bool weights = has_weights(d);
 
     for (int plane = 0; plane < 3; plane++) {
+        /* ⚠️ Luma and chroma carry their own depth. Equal in every profile
+         * we accept, and reading the wrong one would be invisible until
+         * the day they are not. */
+        const int bd = plane ? sps->bit_depth_chroma : sps->bit_depth_luma;
         const int giu = plane ? 1 : 0;
         const int pw = w >> giu, ph = h >> giu;
         const int px = x0 >> giu, py = y0 >> giu;
@@ -680,38 +732,39 @@ void hevcd_predict_inter(hevcd_t *d, int x0, int y0, int w, int h,
                       mvx & ((1 << steps) - 1), mvy & ((1 << steps) - 1),
                       plane ? &hevcd_epel[0][0] : &hevcd_qpel[0][0],
                       plane ? 4 : 8, plane ? 1 : 3,
-                      p[l], MAX_SIDE);
+                      p[l], MAX_SIDE, bd);
         }
 
         uint8_t *dst = d->plane[plane] + (size_t)py * d->stride[plane] + px;
 
         if (!weights) {
             if (usa[0] && usa[1])
-                two_pred(dst, d->stride[plane], pw, ph, p[0], p[1], MAX_SIDE);
+                two_pred(dst, d->stride[plane], pw, ph, p[0], p[1], MAX_SIDE, bd);
             else
-                one_pred(dst, d->stride[plane], pw, ph, p[usa[0] ? 0 : 1], MAX_SIDE);
+                one_pred(dst, d->stride[plane], pw, ph, p[usa[0] ? 0 : 1],
+                         MAX_SIDE, bd);
             continue;
         }
 
         const int den = plane ? d->slice->chroma_log2_weight_denom
                               : d->slice->luma_log2_weight_denom;
-        int peso[2] = { 1 << den, 1 << den }, off[2] = { 0, 0 };
+        int weight[2] = { 1 << den, 1 << den }, off[2] = { 0, 0 };
         for (int l = 0; l < 2; l++) {
             if (!usa[l]) continue;
             const int i = m->ref_idx[l];
-            peso[l] = plane ? d->slice->chroma_weight[l][i][plane - 1]
-                            : d->slice->luma_weight[l][i];
+            weight[l] = plane ? d->slice->chroma_weight[l][i][plane - 1]
+                              : d->slice->luma_weight[l][i];
             off[l] = plane ? d->slice->chroma_offset[l][i][plane - 1]
                            : d->slice->luma_offset[l][i];
         }
 
         if (usa[0] && usa[1])
             two_weighted(dst, d->stride[plane], pw, ph, p[0], p[1], MAX_SIDE,
-                       peso[0], peso[1], off[0], off[1], den);
+                       weight[0], weight[1], off[0], off[1], den, bd);
         else {
             const int l = usa[0] ? 0 : 1;
             one_weighted(dst, d->stride[plane], pw, ph, p[l], MAX_SIDE,
-                       peso[l], off[l], den);
+                       weight[l], off[l], den, bd);
         }
     }
 }

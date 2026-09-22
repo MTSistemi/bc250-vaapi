@@ -639,21 +639,26 @@ static void ricostruisci_tb(hevcd_t *d, int c_idx, int x, int y,
     /* 8.6.2: with the bypass the coefficients are the residual already.
      * Everything below this point - the scaling, the two transform stages,
      * the rounding - exists to undo a quantisation that never happened. */
+    /* ⚠️ Luma and chroma carry their own depth. They are equal in every
+     * profile we accept, and reading the wrong one would be invisible
+     * until the day they are not. */
+    const int bd = c_idx ? d->sps->bit_depth_chroma : d->sps->bit_depth_luma;
+
     if (d->cu.transquant_bypass) {
         hevcd_add(d->plane[c_idx] + (size_t)y * d->stride[c_idx] + x,
-                       d->stride[c_idx], d->coeff, log2_size);
+                       d->stride[c_idx], d->coeff, log2_size, bd);
         return;
     }
 
-    hevcd_dequantizza(d->coeff, log2_size, block_qp(d, c_idx));
+    hevcd_dequantize(d->coeff, log2_size, block_qp(d, c_idx), bd);
     if (d->transform_skip)
-        hevcd_skip_transform(d->coeff, log2_size);
+        hevcd_skip_transform(d->coeff, log2_size, bd);
     else
         hevcd_transform(d->coeff, log2_size,
                         c_idx == 0 && log2_size == 2
-                        && d->cu.pred_mode == HEVCD_MODE_INTRA);
+                        && d->cu.pred_mode == HEVCD_MODE_INTRA, bd);
     hevcd_add(d->plane[c_idx] + (size_t)y * d->stride[c_idx] + x,
-                   d->stride[c_idx], d->coeff, log2_size);
+                   d->stride[c_idx], d->coeff, log2_size, bd);
 }
 
 static void read_tu(hevcd_t *d, int x0, int y0, int x_base, int y_base,

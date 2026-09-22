@@ -27,16 +27,19 @@ static inline int clip16(int v)
     return v < -32768 ? -32768 : (v > 32767 ? 32767 : v);
 }
 
-static inline uint8_t clip8(int v)
+/* ⚠️ Clip3(0, (1 << BitDepth) - 1, v), not Clip3(0, 255, v). The two are
+ * the same thing at eight bits and nowhere else. */
+static inline int clip_pixel(int v, int bd)
 {
-    return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+    const int max = (1 << bd) - 1;
+    return v < 0 ? 0 : (v > max ? max : v);
 }
 
 /* 8.6.3. m[x][y] is 16 throughout: a stream with its own quantisation
  * matrices is refused at the parameter set. */
-void hevcd_dequantizza(int16_t *coeff, int log2_size, int qp)
+void hevcd_dequantize(int16_t *coeff, int log2_size, int qp, int bd)
 {
-    const int shift = 8 + log2_size - 5;       /* BitDepth + Log2(nTbS) - 5 */
+    const int shift = bd + log2_size - 5;      /* BitDepth + Log2(nTbS) - 5 */
     const int add = 1 << (shift - 1);
     const int64_t scale_of = (int64_t)hevcd_level_scale[qp % 6] << (qp / 6);
     const int count = 1 << (2 * log2_size);
@@ -134,7 +137,7 @@ static void dst4(const int16_t *src, int stride, int32_t *out)
 /* 8.6.4.2: columns first with a shift of seven, then rows with what is
  * left. Both stages clip to sixteen bits, which the standard says and
  * which matters: the intermediate really can leave the range. */
-void hevcd_transform(int16_t *coeff, int log2_size, bool dst)
+void hevcd_transform(int16_t *coeff, int log2_size, bool dst, int bd)
 {
     const int n = 1 << log2_size;
     int16_t tmp[32 * 32];
@@ -147,7 +150,10 @@ void hevcd_transform(int16_t *coeff, int log2_size, bool dst)
             tmp[y * n + x] = (int16_t)clip16((row[y] + 64) >> 7);
     }
 
-    const int shift = 20 - 8;
+    /* ⚠️ Only the second stage moves with the depth. The seven above is
+     * seven at ten bits too: the standard fixes it, and making it look
+     * symmetrical would be wrong. */
+    const int shift = 20 - bd;
     const int add = 1 << (shift - 1);
     for (int y = 0; y < n; y++) {
         if (dst) dst4(tmp + y * n, 1, row);
@@ -160,20 +166,23 @@ void hevcd_transform(int16_t *coeff, int log2_size, bool dst)
 /* 8.6.2: a block whose transform was skipped is scaled and nothing else.
  * The seven and the final shift are the two stages the transform would
  * have done, with the transform taken out from between them. */
-void hevcd_skip_transform(int16_t *coeff, int log2_size)
+void hevcd_skip_transform(int16_t *coeff, int log2_size, int bd)
 {
     const int count = 1 << (2 * log2_size);
-    const int shift = 20 - 8;
+    const int shift = 20 - bd;
     const int add = 1 << (shift - 1);
     for (int i = 0; i < count; i++)
         coeff[i] = (int16_t)clip16((((int)coeff[i] << 7) + add) >> shift);
 }
 
-/* The residual onto the prediction, clipped back into eight bits. */
-void hevcd_add(uint8_t *dst, int stride, const int16_t *res, int log2_size)
+/* The residual onto the prediction, clipped back into the picture's own
+ * depth. */
+void hevcd_add(uint8_t *dst, int stride, const int16_t *res, int log2_size,
+               int bd)
 {
     const int n = 1 << log2_size;
     for (int y = 0; y < n; y++)
         for (int x = 0; x < n; x++)
-            dst[y * stride + x] = clip8(dst[y * stride + x] + res[y * n + x]);
+            dst[y * stride + x] = (uint8_t)
+                clip_pixel(dst[y * stride + x] + res[y * n + x], bd);
 }
