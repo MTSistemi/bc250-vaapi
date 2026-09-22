@@ -71,7 +71,7 @@ typedef struct {
 typedef struct {
     uint8_t *plane[3];
     int stride[3];
-    size_t n_piano;
+    size_t n_planes;
     int poc;
     bool is_valid;
     hevcd_mvf_t *mvf;
@@ -173,7 +173,7 @@ typedef struct {
      * reads them back. */
     uint8_t *plane[3];
     int stride[3];
-    size_t n_piano;
+    size_t n_planes;
 
     /* The picture being decoded, its motion field, and what it predicts
      * from. The harness owns the buffer and fills these in per slice. */
@@ -233,10 +233,11 @@ void hevcd_predict_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
                          int mode);
 
 /* 8.6.2 to 8.6.4: the coefficients into a residual, and onto the picture. */
-void hevcd_dequantizza(int16_t *coeff, int log2_size, int qp);
-void hevcd_transform(int16_t *coeff, int log2_size, bool dst);
-void hevcd_skip_transform(int16_t *coeff, int log2_size);
-void hevcd_add(uint8_t *dst, int stride, const int16_t *res, int log2_size);
+void hevcd_dequantize(int16_t *coeff, int log2_size, int qp, int bd);
+void hevcd_transform(int16_t *coeff, int log2_size, bool dst, int bd);
+void hevcd_skip_transform(int16_t *coeff, int log2_size, int bd);
+void hevcd_add(uint8_t *dst, int stride, const int16_t *res, int log2_size,
+               int bd);
 
 /* 6.5.2: the z-scan address of every smallest transform block. Built once
  * per sequence parameter set. */

@@ -2,288 +2,30 @@
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: GPL-3.0-only
  *
- * hevc_pred.c - intra prediction, Rec. ITU-T H.265 clause 8.4.4.2.
+ * hevc_pred.c - intra prediction, one copy per bit depth.
  *
- * Thirty-five modes over blocks from 4x4 to 32x32: planar, DC, and
- * thirty-three angles. All of them read one row above the block and one
- * column to its left, twice as long as the block in each direction, and
- * all of them are built on the same three steps - gather the reference
- * samples, substitute the ones that are not there, filter them, predict.
- *
- * ⚠️ The substitution is not padding. A sample that has not been decoded
- * yet takes the value of the last one that has, walking anticlockwise from
- * the bottom left; a block at the top left corner of a picture, with
- * nothing around it at all, takes mid-grey everywhere. Getting that wrong
- * shows up only at the edges of things, which is where it is least
- * visible and most annoying to find.
+ * The work is in hevc_pred_template.c. This file exists to include it
+ * twice and to pick between the two.
  */
 #include "hevc_dec_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-static inline uint8_t clip8(int v)
-{
-    return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
-}
+#define BIT_DEPTH 8
+#include "hevc_pixel.h"
+#include "hevc_pred_template.c"
+#undef BIT_DEPTH
 
-/* The reference array, laid out around the corner: index 0 is the corner
- * sample p[-1][-1], 1..2N is the row above, and -1..-2N the column to the
- * left. One array instead of two, so the angular modes that reach across
- * the corner can walk straight through it. */
-#define RIF(r, i) ((r)[64 + (i)])
-
-/* Clause 6.4.1 through the z-scan order: whether the block at (x, y) has
- * already been decoded.
- *
- * ⚠️ Not "is it above or to the left". A coding tree unit is walked as a
- * quadtree, so the block above right of a transform block may or may not
- * have been decoded depending on where both sit in the tree. The z-scan
- * address is what answers that, and comparing coordinates instead gets the
- * top-right reference samples wrong for exactly the blocks where they
- * matter. */
-static bool gia_decodificato(const hevcd_t *d, int x, int y, int x_cur, int y_cur)
-{
-    const hevc_sps_t *sps = d->sps;
-    if (x < 0 || y < 0 || x >= sps->width || y >= sps->height)
-        return false;
-    const int stride = sps->width >> sps->log2_min_tb;
-    const int a = d->min_tb_addr_zs[(y >> sps->log2_min_tb) * stride
-                                    + (x >> sps->log2_min_tb)];
-    const int b = d->min_tb_addr_zs[(y_cur >> sps->log2_min_tb) * stride
-                                    + (x_cur >> sps->log2_min_tb)];
-    return a < b;
-}
-
-/* 8.4.4.2.2: gather, then substitute. */
-static void references(const hevcd_t *d, int c_idx, int x0, int y0, int n,
-                        uint8_t *r)
-{
-    const uint8_t *plane = d->plane[c_idx];
-    const int stride = d->stride[c_idx];
-    const int scale_of = c_idx ? 1 : 0;          /* chroma is half resolution */
-    const int lx = x0 << scale_of, ly = y0 << scale_of;   /* in luma coordinates */
-    const int unit = 1 << scale_of;             /* luma samples per sample */
-
-    bool c_e[4 * 64 + 1];
-    memset(c_e, 0, sizeof(c_e));
-    bool something = false;
-
-    /* The column to the left, from the bottom up, then the corner, then
-     * the row above from left to right: the order the substitution walks. */
-    for (int i = 0; i < 2 * n; i++) {
-        const int y = y0 + 2 * n - 1 - i;
-        const int ok = gia_decodificato(d, lx - unit, ly + ((2 * n - 1 - i) << scale_of),
-                                        lx, ly);
-        if (ok && y < (d->sps->height >> scale_of)) {
-            RIF(r, -(2 * n - i)) = plane[y * stride + x0 - 1];
-            c_e[64 - (2 * n - i)] = true;
-            something = true;
-        }
-    }
-    {
-        const int ok = gia_decodificato(d, lx - unit, ly - unit, lx, ly);
-        if (ok) {
-            RIF(r, 0) = plane[(y0 - 1) * stride + x0 - 1];
-            c_e[64] = true;
-            something = true;
-        }
-    }
-    for (int i = 0; i < 2 * n; i++) {
-        const int x = x0 + i;
-        const int ok = gia_decodificato(d, lx + (i << scale_of), ly - unit, lx, ly);
-        if (ok && x < (d->sps->width >> scale_of)) {
-            RIF(r, i + 1) = plane[(y0 - 1) * stride + x];
-            c_e[64 + i + 1] = true;
-            something = true;
-        }
-    }
-
-    if (!something) {
-        memset(r, 128, 4 * 64 + 1);           /* 1 << (bitDepth - 1) */
-        return;
-    }
-
-    /* Walk from the bottom left, anticlockwise: each hole takes the value
-     * of the one before it. The first hole, if it is at the very start,
-     * takes the first sample that does exist. */
-    if (!c_e[64 - 2 * n]) {
-        int k = 64 - 2 * n;
-        while (k <= 64 + 2 * n && !c_e[k]) k++;
-        r[64 - 2 * n] = r[k];
-        c_e[64 - 2 * n] = true;
-    }
-    for (int k = 64 - 2 * n + 1; k <= 64 + 2 * n; k++)
-        if (!c_e[k]) { r[k] = r[k - 1]; c_e[k] = true; }
-}
-
-/* 8.4.4.2.3: whether to smooth the references, and how much. */
-static void filter_edge(const hevcd_t *d, int mode, int n, int c_idx, uint8_t *r)
-{
-    if (c_idx != 0 || n == 4 || mode == HEVCD_INTRA_DC)
-        return;
-
-    /* Table 8-3, by log2 of the block side: 8 has a threshold of seven,
-     * 16 of one, 32 of none. A four is handled above, and there is no
-     * entry for it here - which is what the two zeros are holding.
-     *
-     * ⚠️ Indexed by the logarithm, not by the size. The first version of
-     * this was off by one place and read past the end for a 32, which is
-     * a wrong smoothing decision on exactly the blocks where smoothing
-     * matters most. */
-    static const int threshold[6] = { 0, 0, 0, 7, 1, 0 };
-    int lg = 0;
-    while ((1 << lg) < n) lg++;
-    /* For planar this comes out as ten, which is what the clause intends:
-     * the mode is as far from horizontal and vertical as anything gets. */
-    const int dv = abs(mode - 26), dh = abs(mode - 10);
-    const int dist = dv < dh ? dv : dh;
-    if (dist <= threshold[lg])
-        return;
-
-    uint8_t f[4 * 64 + 1];
-    memcpy(f, r, sizeof(f));
-
-    /* The strong smoothing of a 32x32 block, when both edges are close
-     * enough to a straight line that a ramp will do: a gradient with no
-     * steps at all, which is what a flat sky needs. */
-    if (d->sps->strong_intra_smoothing && n == 32
-        && abs(RIF(r, 0) + RIF(r, 2 * n) - 2 * RIF(r, n)) < 8
-        && abs(RIF(r, 0) + RIF(r, -2 * n) - 2 * RIF(r, -n)) < 8) {
-        for (int i = 1; i < 2 * n; i++) {
-            RIF(f, i) = (uint8_t)(((64 - i) * RIF(r, 0)
-                                   + i * RIF(r, 2 * n) + 32) >> 6);
-            RIF(f, -i) = (uint8_t)(((64 - i) * RIF(r, 0)
-                                    + i * RIF(r, -2 * n) + 32) >> 6);
-        }
-    } else {
-        RIF(f, 0) = (uint8_t)((RIF(r, -1) + 2 * RIF(r, 0) + RIF(r, 1) + 2) >> 2);
-        for (int i = 1; i < 2 * n; i++) {
-            RIF(f, i) = (uint8_t)((RIF(r, i - 1) + 2 * RIF(r, i)
-                                   + RIF(r, i + 1) + 2) >> 2);
-            RIF(f, -i) = (uint8_t)((RIF(r, -(i - 1)) + 2 * RIF(r, -i)
-                                    + RIF(r, -(i + 1)) + 2) >> 2);
-        }
-    }
-    memcpy(r, f, sizeof(f));
-}
-
-/* 8.4.4.2.5, planar: a bilinear ramp between the four edges. */
-static void planare(const uint8_t *r, int n, int lg, uint8_t *dst, int stride)
-{
-    for (int y = 0; y < n; y++)
-        for (int x = 0; x < n; x++)
-            dst[y * stride + x] = (uint8_t)
-                (((n - 1 - x) * RIF(r, -(y + 1)) + (x + 1) * RIF(r, n + 1)
-                  + (n - 1 - y) * RIF(r, x + 1) + (y + 1) * RIF(r, -(n + 1))
-                  + n) >> (lg + 1));
-}
-
-/* 8.4.4.2.5, DC: the average, with the two edges smoothed into it on small
- * luma blocks so the join does not show. */
-static void smoothed(const uint8_t *r, int n, int lg, int c_idx,
-                     uint8_t *dst, int stride)
-{
-    int sum = n;
-    for (int i = 0; i < n; i++)
-        sum += RIF(r, i + 1) + RIF(r, -(i + 1));
-    const int dc = sum >> (lg + 1);
-
-    for (int y = 0; y < n; y++)
-        for (int x = 0; x < n; x++)
-            dst[y * stride + x] = (uint8_t)dc;
-
-    if (c_idx != 0 || n >= 32)
-        return;
-    dst[0] = (uint8_t)((RIF(r, -1) + 2 * dc + RIF(r, 1) + 2) >> 2);
-    for (int x = 1; x < n; x++)
-        dst[x] = (uint8_t)((RIF(r, x + 1) + 3 * dc + 2) >> 2);
-    for (int y = 1; y < n; y++)
-        dst[y * stride] = (uint8_t)((RIF(r, -(y + 1)) + 3 * dc + 2) >> 2);
-}
-
-/* 8.4.4.2.6, the thirty-three angles.
- *
- * ⚠️ A mode whose angle is negative reaches past the corner and needs the
- * other edge projected onto its own reference line - which is what
- * invAngle is for. Without it the samples past the corner are whatever was
- * left there, and the error is confined to one triangle of the block. */
-static void angular(const uint8_t *r, int mode, int n, int c_idx,
-                     uint8_t *dst, int stride)
-{
-    const int ang = hevcd_intra_angle[mode - 2];
-    const bool vertical = mode >= 18;
-
-    /* One reference line, built in the direction the mode walks. */
-    int16_t ref_pic[3 * 64 + 1];
-    int16_t *base = ref_pic + 64;
-    const int sign = vertical ? 1 : -1;
-
-    (void)sign;
-    /* Index 0 is the corner either way; after that the row above for a
-     * vertical mode and the column to the left for a horizontal one. */
-    base[0] = RIF(r, 0);
-    for (int x = 1; x <= n; x++)
-        base[x] = vertical ? RIF(r, x) : RIF(r, -x);
-
-    if (ang < 0) {
-        const int until = (n * ang) >> 5;
-        if (until < -1) {
-            const int inv = hevcd_inv_angle[mode - 11];
-            for (int x = -1; x >= until; x--) {
-                const int k = ((x * inv + 128) >> 8);
-                base[x] = vertical ? RIF(r, -k) : RIF(r, k);
-            }
-        }
-    } else {
-        for (int x = n + 1; x <= 2 * n; x++)
-            base[x] = vertical ? RIF(r, x) : RIF(r, -x);
-    }
-
-    for (int y = 0; y < n; y++) {
-        const int idx = ((y + 1) * ang) >> 5;
-        const int fatt = ((y + 1) * ang) & 31;
-        for (int x = 0; x < n; x++) {
-            int v;
-            if (fatt)
-                v = ((32 - fatt) * base[x + idx + 1]
-                     + fatt * base[x + idx + 2] + 16) >> 5;
-            else
-                v = base[x + idx + 1];
-            if (vertical) dst[y * stride + x] = (uint8_t)v;
-            else           dst[x * stride + y] = (uint8_t)v;
-        }
-    }
-
-    /* The exactly vertical and exactly horizontal modes smooth their first
-     * line against the other edge, on small luma blocks. */
-    if (c_idx == 0 && n < 32) {
-        if (mode == HEVCD_INTRA_ANGULAR_26) {
-            for (int y = 0; y < n; y++)
-                dst[y * stride] = clip8(RIF(r, 1)
-                                           + ((RIF(r, -(y + 1)) - RIF(r, 0)) >> 1));
-        } else if (mode == HEVCD_INTRA_ANGULAR_10) {
-            for (int x = 0; x < n; x++)
-                dst[x] = clip8(RIF(r, -1)
-                                   + ((RIF(r, x + 1) - RIF(r, 0)) >> 1));
-        }
-    }
-}
+#define BIT_DEPTH 10
+#include "hevc_pixel.h"
+#include "hevc_pred_template.c"
+#undef BIT_DEPTH
 
 void hevcd_predict_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
                          int mode)
 {
-    const int n = 1 << log2_size;
-    uint8_t r[4 * 64 + 1];
-    memset(r, 128, sizeof(r));
-
-    references(d, c_idx, x0, y0, n, r);
-    filter_edge(d, mode, n, c_idx, r);
-
-    uint8_t *dst = d->plane[c_idx] + (size_t)y0 * d->stride[c_idx] + x0;
-    const int stride = d->stride[c_idx];
-
-    if (mode == HEVCD_INTRA_PLANAR)      planare(r, n, log2_size, dst, stride);
-    else if (mode == HEVCD_INTRA_DC)     smoothed(r, n, log2_size, c_idx, dst, stride);
-    else                                 angular(r, mode, n, c_idx, dst, stride);
+    const int bd = c_idx ? d->sps->bit_depth_chroma : d->sps->bit_depth_luma;
+    if (bd > 8) predict_intra_10(d, c_idx, x0, y0, log2_size, mode);
+    else        predict_intra_8(d, c_idx, x0, y0, log2_size, mode);
 }
