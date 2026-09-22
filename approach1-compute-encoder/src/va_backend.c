@@ -47,6 +47,8 @@ VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list
     profile_list[i++] = VAProfileH264Main;
     profile_list[i++] = VAProfileH264High;
     profile_list[i++] = VAProfileHEVCMain;
+    /* Decode only: the encoder here is eight bit. */
+    profile_list[i++] = VAProfileHEVCMain10;
 
     *num_profiles = i;
     return VA_STATUS_SUCCESS;
@@ -63,7 +65,8 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
                                 profile == VAProfileH264Baseline ||
                                 profile == VAProfileH264Main ||
                                 profile == VAProfileH264High ||
-                                profile == VAProfileHEVCMain);
+                                profile == VAProfileHEVCMain ||
+                                profile == VAProfileHEVCMain10);
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -71,41 +74,44 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
 
-    /* Everything here can be encoded, and H.264 and H.265 can be
-     * decoded. */
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-#endif
-    const int decodificabile = (profile == VAProfileH264ConstrainedBaseline ||
-                                profile == VAProfileH264Baseline ||
-                                profile == VAProfileH264Main ||
-                                profile == VAProfileH264High ||
-                                profile == VAProfileHEVCMain);
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
-    const int count = decodificabile ? 2 : 1;
+    /* H.264 and H.265 can be both encoded and decoded. Main 10 can only
+     * be decoded: the encoder writes eight-bit streams and says so in its
+     * own sequence parameter set. */
+    const int can_decode = (profile == VAProfileH264ConstrainedBaseline ||
+                            profile == VAProfileH264Baseline ||
+                            profile == VAProfileH264Main ||
+                            profile == VAProfileH264High ||
+                            profile == VAProfileHEVCMain ||
+                            profile == VAProfileHEVCMain10);
+    const int can_encode = (profile != VAProfileHEVCMain10);
+    const int count = (can_decode ? 1 : 0) + (can_encode ? 1 : 0);
 
     if (!entrypoint_list) {
         *num_entrypoints = count;
         return VA_STATUS_SUCCESS;
     }
 
-    entrypoint_list[0] = VAEntrypointEncSlice;
-    if (decodificabile) entrypoint_list[1] = VAEntrypointVLD;
-    *num_entrypoints = count;
+    int n = 0;
+    if (can_encode) entrypoint_list[n++] = VAEntrypointEncSlice;
+    if (can_decode) entrypoint_list[n++] = VAEntrypointVLD;
+    *num_entrypoints = n;
     return VA_STATUS_SUCCESS;
 }
 
 VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEntrypoint entrypoint, VAConfigAttrib *attrib_list, int num_attribs) {
-    (void)ctx; (void)profile;
+    (void)ctx;
     if (!attrib_list) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     for (int i = 0; i < num_attribs; i++) {
         switch (attrib_list[i].type) {
             case VAConfigAttribRTFormat:
-                attrib_list[i].value = VA_RT_FORMAT_YUV420;
+                /* Main 10 takes ten-bit render targets and nothing else:
+                 * offering eight as well would let an application create
+                 * NV12 surfaces for a stream the decoder will write ten
+                 * bits into. */
+                attrib_list[i].value = (profile == VAProfileHEVCMain10)
+                                     ? VA_RT_FORMAT_YUV420_10
+                                     : VA_RT_FORMAT_YUV420;
                 break;
             case VAConfigAttribRateControl:
                 /* Meaningless for decoding, and saying so is better than
@@ -251,8 +257,17 @@ VAStatus bc250_QueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
 }
 
 VAStatus bc250_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config, VASurfaceAttrib *attrib_list, unsigned int *num_attribs) {
-    (void)ctx; (void)config;
     if (!num_attribs) return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    /* ⚠️ The pixel format depends on the config, so this one cannot
+     * ignore it the way it used to. An unknown config answers NV12,
+     * which is what every caller got before. */
+    bc250_driver_data *data = get_driver_data(ctx);
+    int ten_bit = 0;
+    if (data && VALID_ID(config, MAX_CONFIGS)
+        && data->configs[config].allocated) {
+        ten_bit = data->configs[config].profile == VAProfileHEVCMain10;
+    }
 
     if (!attrib_list) {
         *num_attribs = 3;
@@ -263,7 +278,7 @@ VAStatus bc250_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config, V
     attrib_list[i].type = VASurfaceAttribPixelFormat;
     attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
     attrib_list[i].value.type = VAGenericValueTypeInteger;
-    attrib_list[i].value.value.i = VA_FOURCC_NV12;
+    attrib_list[i].value.value.i = ten_bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
     i++;
 
     attrib_list[i].type = VASurfaceAttribMaxWidth;
@@ -317,7 +332,14 @@ VAStatus bc250_CreateSurfaces(VADriverContextP ctx, int width, int height, int f
              * (via the `allocated < num_surfaces` check below) is the
              * failure this driver can actually recover from; hammering
              * the allocator again cannot be made safe from here. */
-            if (gpu_compute_create_image(&data->gpu, width, height, format, &surf->image, &surf->memory) != 0) {
+            /* ⚠️ Two different vocabularies. `format` here is VA's
+             * render-target format, where YUV420 is 1; the image layer
+             * wants GPU_IMAGE_NV12 or GPU_IMAGE_P010, where 1 is P010.
+             * Handing one straight to the other allocated every
+             * eight-bit surface as sixteen. */
+            const int gpu_format = (format == VA_RT_FORMAT_YUV420_10)
+                                 ? GPU_IMAGE_P010 : GPU_IMAGE_NV12;
+            if (gpu_compute_create_image(&data->gpu, width, height, gpu_format, &surf->image, &surf->memory) != 0) {
                 memset(surf, 0, sizeof(*surf));
                 break;
             }
@@ -482,7 +504,7 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                     }
                 }
             } else if (entry == VAEntrypointVLD) {
-                if (prof == VAProfileHEVCMain)
+                if (prof == VAProfileHEVCMain || prof == VAProfileHEVCMain10)
                     c->h265_dec = hevc_decoder_create(&data->gpu, picture_width,
                                                       picture_height);
                 else
@@ -1273,7 +1295,7 @@ VAStatus bc250_QueryImageFormats(VADriverContextP ctx, VAImageFormat *format_lis
     if (!num_formats) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     if (!format_list) {
-        *num_formats = 2;
+        *num_formats = 3;
         return VA_STATUS_SUCCESS;
     }
 
@@ -1281,6 +1303,11 @@ VAStatus bc250_QueryImageFormats(VADriverContextP ctx, VAImageFormat *format_lis
     format_list[i].fourcc = VA_FOURCC_NV12;
     format_list[i].byte_order = VA_LSB_FIRST;
     format_list[i].bits_per_pixel = 12;
+    i++;
+
+    format_list[i].fourcc = VA_FOURCC_P010;
+    format_list[i].byte_order = VA_LSB_FIRST;
+    format_list[i].bits_per_pixel = 24;
     i++;
 
     format_list[i].fourcc = VA_FOURCC_RGBA;
@@ -1320,6 +1347,16 @@ VAStatus bc250_CreateImage(VADriverContextP ctx, VAImageFormat *format, int widt
                 image->data_size = width * height * 3 / 2;
                 image->pitches[1] = width;
                 image->offsets[1] = width * height;
+            } else if (format->fourcc == VA_FOURCC_P010) {
+                /* The same shape with two bytes a sample. A derived image
+                 * overwrites all of this with the real Vulkan layout; a
+                 * plain vaCreateImage keeps it. */
+                image->num_planes = 2;
+                image->pitches[0] = width * 2;
+                image->offsets[0] = 0;
+                image->data_size = width * height * 3;
+                image->pitches[1] = width * 2;
+                image->offsets[1] = width * height * 2;
             } else {
                 image->num_planes = 1;
                 image->pitches[0] = width * 4;
@@ -1383,10 +1420,11 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
     }
     bc250_surface *surf = &data->surfaces[surface];
 
+    const int ten_bit = surf->image.format == GPU_IMAGE_P010;
     VAImageFormat fmt = {
-        .fourcc = VA_FOURCC_NV12,
+        .fourcc = ten_bit ? VA_FOURCC_P010 : VA_FOURCC_NV12,
         .byte_order = VA_LSB_FIRST,
-        .bits_per_pixel = 12
+        .bits_per_pixel = ten_bit ? 24 : 12
     };
     VAStatus status = bc250_CreateImage(ctx, &fmt, surf->width, surf->height, image);
     if (status != VA_STATUS_SUCCESS) {
@@ -1612,9 +1650,13 @@ VAStatus bc250_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         return VA_STATUS_ERROR_UNIMPLEMENTED;
     }
 
+    /* What the surface actually holds, which the importer on the other
+     * side of the fd has no other way to learn. */
+    const int ten_bit = surf->image.format == GPU_IMAGE_P010;
+
     VADRMPRIMESurfaceDescriptor *desc = (VADRMPRIMESurfaceDescriptor *)descriptor;
     memset(desc, 0, sizeof(*desc));
-    desc->fourcc = VA_FOURCC_NV12;
+    desc->fourcc = ten_bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
     desc->width = (uint32_t)surf->width;
     desc->height = (uint32_t)surf->height;
     desc->num_objects = 1;
@@ -1624,20 +1666,22 @@ VAStatus bc250_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 
     if (flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS) {
         desc->num_layers = 2;
-        desc->layers[0].drm_format = DRM_FORMAT_R8;
+        desc->layers[0].drm_format = ten_bit ? DRM_FORMAT_R16 : DRM_FORMAT_R8;
         desc->layers[0].num_planes = 1;
         desc->layers[0].object_index[0] = 0;
         desc->layers[0].offset[0] = (uint32_t)layout.y_offset;
         desc->layers[0].pitch[0] = layout.y_pitch;
 
-        desc->layers[1].drm_format = DRM_FORMAT_GR88;
+        desc->layers[1].drm_format = ten_bit ? DRM_FORMAT_GR1616
+                                            : DRM_FORMAT_GR88;
         desc->layers[1].num_planes = 1;
         desc->layers[1].object_index[0] = 0;
         desc->layers[1].offset[0] = (uint32_t)layout.uv_offset;
         desc->layers[1].pitch[0] = layout.uv_pitch;
     } else {
         desc->num_layers = 1;
-        desc->layers[0].drm_format = DRM_FORMAT_NV12;
+        desc->layers[0].drm_format = ten_bit ? DRM_FORMAT_P010
+                                            : DRM_FORMAT_NV12;
         desc->layers[0].num_planes = 2;
         desc->layers[0].object_index[0] = 0;
         desc->layers[0].object_index[1] = 0;

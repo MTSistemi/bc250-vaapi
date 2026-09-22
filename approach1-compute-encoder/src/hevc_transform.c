@@ -189,9 +189,15 @@ void hevcd_skip_transform(int16_t *coeff, int log2_size, int bd)
 #include "hevc_add_template.c"
 #undef BIT_DEPTH
 
-void hevcd_add(uint8_t *dst, int stride, const int16_t *res, int log2_size,
-               int bd)
+/* ⚠️ The plane and the coordinates, not a pointer the caller has already
+ * moved. `stride` counts samples: at eight bits that is the same number
+ * of bytes, at ten it is half of them, and the only place that knows
+ * which is here. */
+void hevcd_add(uint8_t *plane, int stride, int x, int y,
+               const int16_t *res, int log2_size, int bd)
 {
-    if (bd > 8) add_residual_10((uint16_t *)dst, stride, res, log2_size);
-    else        add_residual_8(dst, stride, res, log2_size);
+    const size_t off = (size_t)y * stride + x;
+    if (bd > 8) add_residual_10((uint16_t *)plane + off, stride,
+                                res, log2_size);
+    else        add_residual_8(plane + off, stride, res, log2_size);
 }

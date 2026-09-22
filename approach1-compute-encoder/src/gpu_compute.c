@@ -1510,7 +1510,16 @@ void gpu_compute_terminate(gpu_context_t *ctx) {
 #define BC250_ALLOC_MAX_ATTEMPTS 7
 
 int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int format, gpu_image_t *image, gpu_memory_t *memory) {
-    (void)format;
+    /* One sample per plane component, eight bits or sixteen. Everything
+     * else about the allocation - the two separate images, the packed
+     * bind, the export flags - is the same either way, so the format
+     * reaches only these two VkFormats. */
+    const VkFormat vk_y = (format == GPU_IMAGE_P010)
+                          ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
+    const VkFormat vk_uv = (format == GPU_IMAGE_P010)
+                           ? VK_FORMAT_R16G16_UNORM : VK_FORMAT_R8G8_UNORM;
+
+    image->format = format;
     image->width = width;
     image->height = height;
     /* Matches the real initialLayout used below for both y_plane and uv_plane. */
@@ -1543,7 +1552,7 @@ int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int form
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = ctx->get_memory_fd_khr ? &ext_image_info : NULL,
             .imageType = VK_IMAGE_TYPE_2D,
-            .format = VK_FORMAT_R8_UNORM,
+            .format = vk_y,
             .extent = { (uint32_t)width, (uint32_t)height, 1 },
             .mipLevels = 1,
             .arrayLayers = 1,
@@ -1559,7 +1568,7 @@ int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int form
         }
 
         VkImageCreateInfo uv_info = y_info;
-        uv_info.format = VK_FORMAT_R8G8_UNORM;
+        uv_info.format = vk_uv;
         uv_info.extent.width = width / 2;
         uv_info.extent.height = height / 2;
         result = vkCreateImage(ctx->device, &uv_info, NULL, &image->uv_plane);
@@ -1639,13 +1648,13 @@ int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int form
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image = image->y_plane,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = VK_FORMAT_R8_UNORM,
+        .format = vk_y,
         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
     };
     VK_CHECK(vkCreateImageView(ctx->device, &view_info, NULL, &image->y_view));
 
     view_info.image = image->uv_plane;
-    view_info.format = VK_FORMAT_R8G8_UNORM;
+    view_info.format = vk_uv;
     VK_CHECK(vkCreateImageView(ctx->device, &view_info, NULL, &image->uv_view));
 
     return 0;
@@ -1818,6 +1827,52 @@ int gpu_compute_get_nv12_layout(gpu_context_t *ctx, gpu_image_t *image, gpu_memo
     return 0;
 }
 
+/* The ten-bit upload. See gpu_compute.h: the shift into P010's high bits
+ * is here, and the plane addressing is whatever Vulkan says it is, asked
+ * for through the same query the eight-bit path uses. */
+int gpu_compute_upload_p010(gpu_context_t *ctx, gpu_image_t *image,
+                            gpu_memory_t memory,
+                            const uint16_t *y_plane, int y_pitch,
+                            const uint16_t *uv_plane, int uv_pitch,
+                            int width, int height) {
+    if (!ctx || !image || !memory.memory || !y_plane || !uv_plane) return -1;
+
+    gpu_nv12_layout_t lay;
+    if (gpu_compute_get_nv12_layout(ctx, image, memory, &lay) != 0) return -1;
+
+    uint8_t *mapped = (uint8_t *)memory.mapped_ptr;
+    int needs_unmap = 0;
+    if (!mapped) {
+        if (vkMapMemory(ctx->device, memory.memory, 0, memory.size, 0,
+                        (void **)&mapped) != VK_SUCCESS) {
+            return -1;
+        }
+        needs_unmap = 1;
+    }
+
+    for (int r = 0; r < height; r++) {
+        uint16_t *o = (uint16_t *)(mapped + lay.y_offset
+                                   + (size_t)r * lay.y_pitch);
+        const uint16_t *s = (const uint16_t *)((const uint8_t *)y_plane
+                                               + (size_t)r * y_pitch);
+        for (int x = 0; x < width; x++) o[x] = (uint16_t)(s[x] << 6);
+    }
+
+    /* One row of interleaved Cb/Cr is two samples per luma column. */
+    for (int r = 0; r < height / 2; r++) {
+        uint16_t *o = (uint16_t *)(mapped + lay.uv_offset
+                                   + (size_t)r * lay.uv_pitch);
+        const uint16_t *s = (const uint16_t *)((const uint8_t *)uv_plane
+                                               + (size_t)r * uv_pitch);
+        for (int x = 0; x < width; x++) o[x] = (uint16_t)(s[x] << 6);
+    }
+
+    if (needs_unmap) {
+        vkUnmapMemory(ctx->device, memory.memory);
+    }
+    return 0;
+}
+
 int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
                            const uint8_t *y_plane, int y_pitch,
                            const uint8_t *uv_plane, int uv_pitch,
@@ -1854,14 +1909,17 @@ int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t
         needs_unmap = 1;
     }
 
+    /* See the download: a row is `width` samples, not `width` bytes. */
+    const size_t row = (size_t)width * (image->format == GPU_IMAGE_P010 ? 2 : 1);
+
     uint8_t *dst_y = mapped + layout_y.offset;
     for (int r = 0; r < height; r++) {
-        memcpy(dst_y + (size_t)r * layout_y.rowPitch, y_plane + (size_t)r * y_pitch, width);
+        memcpy(dst_y + (size_t)r * layout_y.rowPitch, y_plane + (size_t)r * y_pitch, row);
     }
 
     uint8_t *dst_uv = mapped + uv_offset + layout_uv.offset;
     for (int r = 0; r < height / 2; r++) {
-        memcpy(dst_uv + (size_t)r * layout_uv.rowPitch, uv_plane + (size_t)r * uv_pitch, width);
+        memcpy(dst_uv + (size_t)r * layout_uv.rowPitch, uv_plane + (size_t)r * uv_pitch, row);
     }
 
     if (needs_unmap) {
@@ -1958,14 +2016,19 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
         needs_unmap = 1;
     }
 
+    /* ⚠️ A row is `width` SAMPLES, and a P010 sample is two bytes. Both
+      * planes carry the same number of bytes per row here, because the
+      * chroma one is half as wide and twice as deep. */
+    const size_t row = (size_t)width * (image->format == GPU_IMAGE_P010 ? 2 : 1);
+
     const uint8_t *src_y = mapped + layout_y.offset;
     for (int r = 0; r < height; r++) {
-        copy_from_wc(y_plane + (size_t)r * y_pitch, src_y + (size_t)r * layout_y.rowPitch, (size_t)width);
+        copy_from_wc(y_plane + (size_t)r * y_pitch, src_y + (size_t)r * layout_y.rowPitch, row);
     }
 
     const uint8_t *src_uv = mapped + uv_offset + layout_uv.offset;
     for (int r = 0; r < height / 2; r++) {
-        copy_from_wc(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, (size_t)width);
+        copy_from_wc(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, row);
     }
 
     if (needs_unmap) {

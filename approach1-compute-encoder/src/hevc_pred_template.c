@@ -16,7 +16,7 @@ static inline int FUNC(clip_pixel)(int v)
 
 /* The reference array, laid out around the corner: index 0 is the corner
  * sample p[-1][-1], 1..2N is the row above, and -1..-2N the column to the
- * left. One array instead of two, so the FUNC(angular) modes that reach across
+ * left. One array instead of two, so the angular modes that reach across
  * the corner can walk straight through it. */
 #define RIF(r, i) ((r)[64 + (i)])
 
@@ -89,7 +89,10 @@ static void FUNC(references)(const hevcd_t *d, int c_idx, int x0, int y0, int n,
     if (!something) {
         const int bd = c_idx ? d->sps->bit_depth_chroma
                              : d->sps->bit_depth_luma;
-        memset(r, 1 << (bd - 1), 4 * 64 + 1);   /* 8.4.4.2.2 */
+        /* ⚠️ Not memset: it writes bytes, and above eight bits the
+         * value truncates to zero and the count covers half the array.
+         * 8.4.4.2.2. */
+        for (int i = 0; i < 4 * 64 + 1; i++) r[i] = 1 << (bd - 1);
         return;
     }
 
@@ -106,7 +109,7 @@ static void FUNC(references)(const hevcd_t *d, int c_idx, int x0, int y0, int n,
         if (!c_e[k]) { r[k] = r[k - 1]; c_e[k] = true; }
 }
 
-/* 8.4.4.2.3: whether to smooth the FUNC(references), and how much. */
+/* 8.4.4.2.3: whether to smooth the references, and how much. */
 static void FUNC(filter_edge)(const hevcd_t *d, int mode, int n, int c_idx, pixel *r)
 {
     if (c_idx != 0 || n == 4 || mode == HEVCD_INTRA_DC)
@@ -123,7 +126,7 @@ static void FUNC(filter_edge)(const hevcd_t *d, int mode, int n, int c_idx, pixe
     static const int threshold[6] = { 0, 0, 0, 7, 1, 0 };
     int lg = 0;
     while ((1 << lg) < n) lg++;
-    /* For FUNC(planar) this comes out as ten, which is what the clause intends:
+    /* For planar this comes out as ten, which is what the clause intends:
      * the mode is as far from horizontal and vertical as anything gets. */
     const int dv = abs(mode - 26), dh = abs(mode - 10);
     const int dist = dv < dh ? dv : dh;
@@ -161,7 +164,7 @@ static void FUNC(filter_edge)(const hevcd_t *d, int mode, int n, int c_idx, pixe
     memcpy(r, f, sizeof(f));
 }
 
-/* 8.4.4.2.5, FUNC(planar): a bilinear ramp between the four edges. */
+/* 8.4.4.2.5, planar: a bilinear ramp between the four edges. */
 static void FUNC(planar)(const pixel *r, int n, int lg, pixel *dst, int stride)
 {
     for (int y = 0; y < n; y++)
@@ -172,7 +175,7 @@ static void FUNC(planar)(const pixel *r, int n, int lg, pixel *dst, int stride)
                   + n) >> (lg + 1));
 }
 
-/* 8.4.4.2.5, DC: the average, with the two edges FUNC(smoothed) into it on small
+/* 8.4.4.2.5, DC: the average, with the two edges smoothed into it on small
  * luma blocks so the join does not show. */
 static void FUNC(smoothed)(const pixel *r, int n, int lg, int c_idx,
                      pixel *dst, int stride)
@@ -202,7 +205,7 @@ static void FUNC(smoothed)(const pixel *r, int n, int lg, int c_idx,
  * invAngle is for. Without it the samples past the corner are whatever was
  * left there, and the error is confined to one triangle of the block. */
 static void FUNC(angular)(const pixel *r, int mode, int n, int c_idx,
-                     pixel *dst, int stride, int bd)
+                     pixel *dst, int stride)
 {
     const int ang = hevcd_intra_angle[mode - 2];
     const bool vertical = mode >= 18;
@@ -269,7 +272,7 @@ static void FUNC(predict_intra)(hevcd_t *d, int c_idx, int x0, int y0,
     const int n = 1 << log2_size;
     const int bd = c_idx ? d->sps->bit_depth_chroma : d->sps->bit_depth_luma;
     pixel r[4 * 64 + 1];
-    memset(r, 1 << (bd - 1), sizeof(r));
+    for (int i = 0; i < 4 * 64 + 1; i++) r[i] = 1 << (bd - 1);
 
     FUNC(references)(d, c_idx, x0, y0, n, r);
     FUNC(filter_edge)(d, mode, n, c_idx, r);
@@ -281,5 +284,5 @@ static void FUNC(predict_intra)(hevcd_t *d, int c_idx, int x0, int y0,
 
     if (mode == HEVCD_INTRA_PLANAR)      FUNC(planar)(r, n, log2_size, dst, stride);
     else if (mode == HEVCD_INTRA_DC)     FUNC(smoothed)(r, n, log2_size, c_idx, dst, stride);
-    else                                 FUNC(angular)(r, mode, n, c_idx, dst, stride, bd);
+    else                                 FUNC(angular)(r, mode, n, c_idx, dst, stride);
 }

@@ -32,6 +32,9 @@ typedef struct {
      * VK_IMAGE_LAYOUT_GENERAL after the first compute dispatch, where it stays
      * forever since nothing transitions the image back out of GENERAL. */
     VkImageLayout current_layout;
+    /* GPU_IMAGE_NV12 or GPU_IMAGE_P010: what the two planes hold, which
+     * the dma-buf export has to report and the uploads have to match. */
+    int format;
 } gpu_image_t;
 
 typedef struct {
@@ -312,6 +315,12 @@ typedef bc250_gpu_context_t gpu_context_t;
 int bc250_gpu_init(bc250_gpu_context_t *ctx);
 void bc250_gpu_destroy(bc250_gpu_context_t *ctx);
 
+/* What gpu_compute_create_image()'s `format` argument means. NV12 is
+ * zero, which is what every caller was already passing when the argument
+ * was ignored. */
+#define GPU_IMAGE_NV12 0
+#define GPU_IMAGE_P010 1
+
 int gpu_compute_init(gpu_context_t *ctx);
 void gpu_compute_terminate(gpu_context_t *ctx);
 
@@ -325,10 +334,28 @@ void gpu_compute_destroy_image(gpu_context_t *ctx, gpu_image_t image, gpu_memory
  * unbound. */
 int gpu_compute_get_nv12_layout(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory, gpu_nv12_layout_t *layout);
 
+/* ⚠️ Despite the name, these two move whatever the image holds: an
+ * image created as GPU_IMAGE_P010 moves sixteen-bit samples, byte for
+ * byte, with no shift in either direction. `width` is a sample count.
+ * gpu_compute_upload_p010() below is the other thing - it takes the
+ * decoder's 0..1023 and makes P010 out of them. */
 int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
                            const uint8_t *y_plane, int y_pitch,
                            const uint8_t *uv_plane, int uv_pitch,
                            int width, int height);
+
+/* The ten-bit twin of the upload above, for a GPU_IMAGE_P010 image.
+ *
+ * ⚠️ The pitches are in BYTES, like the eight-bit one, but the samples
+ * are sixteen-bit words. The decoder hands over values in 0..1023 and
+ * P010 wants them in the HIGH ten bits of each word, so the shift by six
+ * happens in here - the caller has no business knowing what a surface
+ * format is. */
+int gpu_compute_upload_p010(gpu_context_t *ctx, gpu_image_t *image,
+                            gpu_memory_t memory,
+                            const uint16_t *y_plane, int y_pitch,
+                            const uint16_t *uv_plane, int uv_pitch,
+                            int width, int height);
 
 void gpu_compute_copy_from_wc(void *dst, const void *src, size_t n);
 int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,

@@ -276,13 +276,26 @@ static void test_dynamic_qp_and_rate_control(void) {
     printf("[test_hevc_encode] Dynamic QP and rate control OK.\n");
 }
 
+/* ⚠️ What this can and cannot check.
+ *
+ * The governor only moves when there is a GPU to measure, and this suite
+ * runs without one on purpose. So all that is provable here is that an
+ * encoder with no GPU stays at tier 0 and encodes normally - which is
+ * worth checking, because it is the path a caller with no Vulkan context
+ * takes, but it is NOT a check that the governor is wired up.
+ *
+ * It used to be named as though it were, and it passed for the whole
+ * time nothing called dynamic_governor_update() from this encoder. The
+ * real check is on the board: encode with BC250_GOVERNOR_STATS set and
+ * look for [bc250-gov] lines, which only that function prints. */
 static void test_hevc_governor(void) {
-    printf("[test_hevc_encode] Testing dynamic governor integration...\n");
+    printf("[test_hevc_encode] Testing the governor's GPU-free path...\n");
     uint32_t width = 64, height = 64;
     hevc_encoder_t *enc = hevc_encoder_create(NULL, width, height, 30, 2000000);
     assert(enc);
 
-    /* Default governor tier must be Tier 0 (GPU Full) */
+    /* With no GPU there is nothing to measure, so the tier must stay at
+     * its default and must not move however many frames go through. */
     assert(hevc_encoder_get_governor_tier(enc) == 0);
 
     /* Raw frame encoding must work cleanly without governor regressions */
@@ -294,10 +307,11 @@ static void test_hevc_governor(void) {
 
     int w = hevc_encoder_encode_raw(enc, y_plane, (int)width, uv_plane, (int)width, out_buf, out_cap);
     assert(w > 0);
+    assert(hevc_encoder_get_governor_tier(enc) == 0);
 
     free(y_plane); free(uv_plane); free(out_buf);
     hevc_encoder_destroy(enc);
-    printf("[test_hevc_encode] Dynamic governor integration OK.\n");
+    printf("[test_hevc_encode] Governor's GPU-free path OK.\n");
 }
 
 int main(void) {

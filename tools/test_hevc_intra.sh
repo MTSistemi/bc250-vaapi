@@ -73,8 +73,8 @@ for ctu in 16 32 64; do
 done
 check "max TU 16" "$S1" "max-tu-size=16:qp=28"
 check "TU maximum 8" "$S1" "max-tu-size=8:qp=28"
-check "profondita' TU intra 1" "$S1" "tu-intra-depth=1:qp=28"
-check "profondita' TU intra 3" "$S1" "tu-intra-depth=3:qp=28"
+check "intra TU depth 1" "$S1" "tu-intra-depth=1:qp=28"
+check "intra TU depth 3" "$S1" "tu-intra-depth=3:qp=28"
 check "CTU 16 e TU 8" "$S1" "ctu=16:max-tu-size=8:qp=28"
 
 echo
@@ -89,9 +89,9 @@ check "cu-lossless" "$S1" "cu-lossless=1:qp=28"
 
 echo
 echo "qp che varies inside l'picture"
-check "aq forte" "$S2" "aq-mode=2:aq-strength=1.5:qp=28"
+check "strong aq" "$S2" "aq-mode=2:aq-strength=1.5:qp=28"
 check "crf instead of qp" "$S2" "crf=28"
-check "crf basso" "$S2" "crf=14"
+check "low crf" "$S2" "crf=14"
 
 echo
 echo "sizes"
@@ -102,7 +102,7 @@ check "1920x1080" "testsrc2=size=1920x1080:rate=25" "qp=30"
 check "picture tiny" "testsrc2=size=32x32:rate=25" "qp=28"
 
 echo
-echo "other contents"
+echo "other content"
 check "mandelbrot" "mandelbrot=size=320x240" "qp=24"
 check "noise" "testsrc2=size=176x144:rate=25" "qp=4"
 
