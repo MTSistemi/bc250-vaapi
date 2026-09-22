@@ -108,7 +108,7 @@ static void impulsi(int log2_size, bool usa_dst)
         memset(input, 0, sizeof(int16_t) * (size_t)n * n);
         input[k] = 256;
         memcpy(ours, input, sizeof(int16_t) * (size_t)n * n);
-        hevcd_transform(ours, log2_size, usa_dst);
+        hevcd_transform(ours, log2_size, usa_dst, 8);
         reference(input, expected, n, usa_dst);
         if (memcmp(ours, expected, sizeof(int16_t) * (size_t)n * n))
             differing++;
@@ -135,7 +135,7 @@ static void at_random(int log2_size, bool usa_dst)
     for (int pass_index = 0; pass_index < 64; pass_index++) {
         for (int i = 0; i < n * n; i++) input[i] = (int16_t)next_up(4000);
         memcpy(ours, input, sizeof(int16_t) * (size_t)n * n);
-        hevcd_transform(ours, log2_size, usa_dst);
+        hevcd_transform(ours, log2_size, usa_dst, 8);
         reference(input, expected, n, usa_dst);
         if (memcmp(ours, expected, sizeof(int16_t) * (size_t)n * n)) {
             compare(what, ours, expected, n * n);
