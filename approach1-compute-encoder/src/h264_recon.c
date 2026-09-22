@@ -32,14 +32,14 @@ static inline uint8_t clip_uint8(int v)
  * order swaps two of the three classes, which is a small enough error to
  * look like mild ringing rather than a broken picture.
  */
-static inline int classe4(int n)
+static inline int category4(int n)
 {
     return (n & 1) + ((n >> 2) & 1);        /* column parity + row parity */
 }
 
 /* The 8x8 classes repeat every four samples in both directions, so the class
  * of a raster position depends only on (row mod 4, column mod 4). */
-static inline int classe8(int n)
+static inline int category8(int n)
 {
     int row = (n >> 3) & 3;
     int column = n & 3;
@@ -56,10 +56,10 @@ void h264d_dequant_build(h264d_dequant_t *dq, int qp,
     const int q6 = qp % 6;
     for (int list_idx = 0; list_idx < 6; list_idx++) {
         for (int n = 0; n < 16; n++)
-            dq->d4[list_idx][n] = (int32_t)h264d_dequant4_init[q6][classe4(n)]
+            dq->d4[list_idx][n] = (int32_t)h264d_dequant4_init[q6][category4(n)]
                              * (int32_t)scaling4[list_idx][n];
         for (int n = 0; n < 64; n++)
-            dq->d8[list_idx][n] = (int32_t)h264d_dequant8_init[q6][classe8(n)]
+            dq->d8[list_idx][n] = (int32_t)h264d_dequant8_init[q6][category8(n)]
                              * (int32_t)scaling8[list_idx][n];
     }
     dq->qp = qp;

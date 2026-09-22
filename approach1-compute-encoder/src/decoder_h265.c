@@ -48,7 +48,7 @@ static hevcd_img_t *find_img(const hevcd_t *d, int poc)
 }
 
 /* Everything the reference picture set no longer names can go. */
-static void sfoltisci(hevcd_t *d, const hevc_slice_t *sl)
+static void unescape(hevcd_t *d, const hevc_slice_t *sl)
 {
     if (sl->nal_type == HEVC_NAL_IDR_W_RADL || sl->nal_type == HEVC_NAL_IDR_N_LP) {
         for (int i = 0; i < d->n_buf; i++) d->buf[i].is_valid = false;
@@ -484,7 +484,7 @@ const uint8_t *hevc_decoder_plane(const hevc_decoder_t *h, int plane,
 
 void hevc_decoder_unescape(hevc_decoder_t *h, const hevc_slice_t *sl)
 {
-    sfoltisci(&h->d, sl);
+    unescape(&h->d, sl);
 }
 
 void hevc_decoder_shift_entry_points(hevc_slice_t *s, const uint8_t *grezzo,

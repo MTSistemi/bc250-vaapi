@@ -39,7 +39,7 @@ static const uint8_t zscan[16] = {
 
 /* The 4x4 block to the left of raster block `b`, and the macroblock it is
  * in. Returns NULL when there is none. */
-static const h264d_mb_t *sinistra4(const h264_decoder_t *d, int b, int *out)
+static const h264d_mb_t *left4(const h264_decoder_t *d, int b, int *out)
 {
     *out = 0;                       /* set even when there is no neighbour */
     if (b & 3) { *out = b - 1; return &d->mbs[d->mb_idx]; }
@@ -49,7 +49,7 @@ static const h264d_mb_t *sinistra4(const h264_decoder_t *d, int b, int *out)
     return m;
 }
 
-static const h264d_mb_t *sopra4(const h264_decoder_t *d, int b, int *out)
+static const h264d_mb_t *above4(const h264_decoder_t *d, int b, int *out)
 {
     *out = 0;
     if (b >= 4) { *out = b - 4; return &d->mbs[d->mb_idx]; }
@@ -508,8 +508,8 @@ static int add_mvd(const h264_decoder_t *d, int list_idx, int blk, int comp)
 {
     int s = 0;
     int pa, pb;
-    const h264d_mb_t *a = sinistra4(d, blk, &pa);
-    const h264d_mb_t *b = sopra4(d, blk, &pb);
+    const h264d_mb_t *a = left4(d, blk, &pa);
+    const h264d_mb_t *b = above4(d, blk, &pb);
     if (a && !a->intra) s += abs(a->mvd[list_idx][pa][comp]);
     if (b && !b->intra) s += abs(b->mvd[list_idx][pb][comp]);
     return s;
@@ -760,8 +760,8 @@ static void read_residual_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
                 continue;
             }
             int pa, pb;
-            const h264d_mb_t *a = sinistra4(d, b, &pa);
-            const h264d_mb_t *bmb = sopra4(d, b, &pb);
+            const h264d_mb_t *a = left4(d, b, &pa);
+            const h264d_mb_t *bmb = above4(d, b, &pb);
             int inc = cbf_neighbour(d, a, pa, 0, false, intra)
                     + 2 * cbf_neighbour(d, bmb, pb, 0, false, intra);
             const int cat = i16 ? CAT_I16_AC : CAT_LUMA_4X4;
@@ -947,8 +947,8 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
                  * counts as DC unless constrained intra prediction says it
                  * is unavailable altogether. */
                 int pa, pb;
-                const h264d_mb_t *a = sinistra4(d, b, &pa);
-                const h264d_mb_t *bm = sopra4(d, b, &pb);
+                const h264d_mb_t *a = left4(d, b, &pa);
+                const h264d_mb_t *bm = above4(d, b, &pb);
                 int ma = (a && a->type == H264D_MB_I_NxN) ? a->ipred[pa]
                        : (a ? 2 : -1);
                 int mb2 = (bm && bm->type == H264D_MB_I_NxN) ? bm->ipred[pb]

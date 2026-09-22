@@ -618,7 +618,7 @@ static int block_qp(const hevcd_t *d, int c_idx)
  * this one's reconstructed samples, so a version that read all the
  * residuals first and reconstructed afterwards would predict from
  * whatever was in the picture before. */
-static void ricostruisci_tb(hevcd_t *d, int c_idx, int x, int y,
+static void reconstruct_tb(hevcd_t *d, int c_idx, int x, int y,
                             int log2_size, bool has_residual)
 {
     /* The luma mode is per prediction block; chroma has one per coding
@@ -670,23 +670,23 @@ static void read_tu(hevcd_t *d, int x0, int y0, int x_base, int y_base,
 
     if (cbf_luma)
         hevcd_read_residual(d, x0, y0, log2_size, 0);
-    ricostruisci_tb(d, 0, x0, y0, log2_size, cbf_luma);
+    reconstruct_tb(d, 0, x0, y0, log2_size, cbf_luma);
 
     if (log2_size > 2) {
         const int cx = x0 >> 1, cy = y0 >> 1;
         if (cbf_cb) hevcd_read_residual(d, x0, y0, log2_size - 1, 1);
-        ricostruisci_tb(d, 1, cx, cy, log2_size - 1, cbf_cb);
+        reconstruct_tb(d, 1, cx, cy, log2_size - 1, cbf_cb);
         if (cbf_cr) hevcd_read_residual(d, x0, y0, log2_size - 1, 2);
-        ricostruisci_tb(d, 2, cx, cy, log2_size - 1, cbf_cr);
+        reconstruct_tb(d, 2, cx, cy, log2_size - 1, cbf_cr);
     } else if (blk == 3) {
         /* ⚠️ At the smallest luma size the four 4x4 blocks share one 4x4
          * chroma block, which is read with the last of them and lives at
          * the parent's corner. */
         const int cx = x_base >> 1, cy = y_base >> 1;
         if (cbf_cb) hevcd_read_residual(d, x_base, y_base, 2, 1);
-        ricostruisci_tb(d, 1, cx, cy, 2, cbf_cb);
+        reconstruct_tb(d, 1, cx, cy, 2, cbf_cb);
         if (cbf_cr) hevcd_read_residual(d, x_base, y_base, 2, 2);
-        ricostruisci_tb(d, 2, cx, cy, 2, cbf_cr);
+        reconstruct_tb(d, 2, cx, cy, 2, cbf_cr);
     }
     (void)depth;
 }

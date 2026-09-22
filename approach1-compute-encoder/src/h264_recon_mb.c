@@ -57,7 +57,7 @@ static inline uint8_t sample_at(const uint8_t *plane, int stride, int x, int y)
 
 /* Reference samples for one 4x4 luma block, clause 8.3.1.2 with the
  * substitution of 8.3.1.2.1. */
-static void riferimenti4(const h264_decoder_t *d, const uint8_t *y, int sy,
+static void refs4(const h264_decoder_t *d, const uint8_t *y, int sy,
                          int b, uint8_t top[8], uint8_t left[4], uint8_t *corner,
                          bool *at, bool *al)
 {
@@ -116,7 +116,7 @@ static void riferimenti4(const h264_decoder_t *d, const uint8_t *y, int sy,
 }
 
 /* The same for an 8x8 luma block, clause 8.3.2.2. */
-static void riferimenti8(const h264_decoder_t *d, const uint8_t *y, int sy,
+static void refs8(const h264_decoder_t *d, const uint8_t *y, int sy,
                          int b8, uint8_t top[16], uint8_t left[8], uint8_t *corner,
                          bool *at, bool *al, bool *ac, bool *atr)
 {
@@ -168,7 +168,7 @@ static void riferimenti8(const h264_decoder_t *d, const uint8_t *y, int sy,
     *corner = *ac ? sample_at(y, sy, px - 1, py - 1) : 0;
 }
 
-static void riferimenti16(const h264_decoder_t *d, const uint8_t *plane, int s,
+static void refs16(const h264_decoder_t *d, const uint8_t *plane, int s,
                           int px, int py, int n,
                           uint8_t *top, uint8_t *left, uint8_t *corner,
                           bool *at, bool *al)
@@ -385,15 +385,15 @@ static void compensate_block(h264_decoder_t *d, int b, int w4, int h4,
 
 static void add_luma(h264_decoder_t *d, h264d_mb_t *m, uint8_t *y, int sy)
 {
-    const int lista4 = m->intra ? 0 : 3;     /* scaling list, Table 7-2 */
-    const int lista8 = m->intra ? 0 : 1;
+    const int list4 = m->intra ? 0 : 3;     /* scaling list, Table 7-2 */
+    const int list8 = m->intra ? 0 : 1;
     const h264d_dequant_t *dq = &d->dequant->per_rest[m->qpy % 6];
 
     if (m->transform8x8) {
         for (int b8 = 0; b8 < 4; b8++) {
             if (!((m->cbp >> b8) & 1)) continue;
             uint8_t *dst = y + (size_t)((b8 >> 1) * 8) * sy + (b8 & 1) * 8;
-            h264d_idct8_add(dst, sy, d->res->coeff8[b8], dq->d8[lista8], m->qpy);
+            h264d_idct8_add(dst, sy, d->res->coeff8[b8], dq->d8[list8], m->qpy);
         }
         return;
     }
@@ -409,7 +409,7 @@ static void add_luma(h264_decoder_t *d, h264d_mb_t *m, uint8_t *y, int sy)
          * separately and is not in that count, so it is tested on its own. */
         if (m->nnz[0][b] == 0 && (!i16 || d->res->luma[b][0] == 0))
             continue;
-        h264d_idct4_add(dst, sy, d->res->luma[b], dq->d4[lista4],
+        h264d_idct4_add(dst, sy, d->res->luma[b], dq->d4[list4],
                         m->qpy, i16);
     }
 }
@@ -432,7 +432,7 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
         if (m->type == H264D_MB_I_16x16) {
             uint8_t top[16], left[16], ang;
             bool at, al;
-            riferimenti16(d, f->y, sy, d->mb_x * 16, d->mb_y * 16, 16,
+            refs16(d, f->y, sy, d->mb_x * 16, d->mb_y * 16, 16,
                           top, left, &ang, &at, &al);
             h264d_pred16x16(y, sy, m->ipred[0], top, left, ang, at, al);
 
@@ -485,7 +485,7 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
             for (int b8 = 0; b8 < 4; b8++) {
                 uint8_t top[16], left[8], ang;
                 bool at, al, ac, atr;
-                riferimenti8(d, f->y, sy, b8, top, left, &ang, &at, &al, &ac, &atr);
+                refs8(d, f->y, sy, b8, top, left, &ang, &at, &al, &ac, &atr);
                 uint8_t *dst = y + (size_t)((b8 >> 1) * 8) * sy + (b8 & 1) * 8;
                 const int mode = m->ipred[(b8 >> 1) * 8 + (b8 & 1) * 2];
                 h264d_pred8x8_luma(dst, sy, mode, top, left, ang, at, al, ac, atr);
@@ -500,7 +500,7 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
                 const int b = zscan[k];
                 uint8_t top[8], left[4], ang;
                 bool at, al;
-                riferimenti4(d, f->y, sy, b, top, left, &ang, &at, &al);
+                refs4(d, f->y, sy, b, top, left, &ang, &at, &al);
                 uint8_t *dst = y + (size_t)((b >> 2) * 4) * sy + (b & 3) * 4;
                 h264d_pred4x4(dst, sy, m->ipred[b], top, left, ang, at, al);
 
@@ -549,10 +549,10 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
         /* Chroma, both planes. */
         uint8_t top[8], left[8], ang;
         bool at, al;
-        riferimenti16(d, f->cb, sc, d->mb_x * 8, d->mb_y * 8, 8,
+        refs16(d, f->cb, sc, d->mb_x * 8, d->mb_y * 8, 8,
                       top, left, &ang, &at, &al);
         h264d_pred_chroma(cb, sc, m->chroma_pred_mode, top, left, ang, at, al);
-        riferimenti16(d, f->cr, sc, d->mb_x * 8, d->mb_y * 8, 8,
+        refs16(d, f->cr, sc, d->mb_x * 8, d->mb_y * 8, 8,
                       top, left, &ang, &at, &al);
         h264d_pred_chroma(cr, sc, m->chroma_pred_mode, top, left, ang, at, al);
     } else {

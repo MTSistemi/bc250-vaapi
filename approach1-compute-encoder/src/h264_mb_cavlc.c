@@ -27,7 +27,7 @@ static const uint8_t zscan[16] = {
 
 /* ---------------------------------------------------------- neighbours */
 
-static const h264d_mb_t *sinistra4(const h264_decoder_t *d, int b, int *out)
+static const h264d_mb_t *left4(const h264_decoder_t *d, int b, int *out)
 {
     *out = 0;
     if (b & 3) { *out = b - 1; return &d->mbs[d->mb_idx]; }
@@ -37,7 +37,7 @@ static const h264d_mb_t *sinistra4(const h264_decoder_t *d, int b, int *out)
     return m;
 }
 
-static const h264d_mb_t *sopra4(const h264_decoder_t *d, int b, int *out)
+static const h264d_mb_t *above4(const h264_decoder_t *d, int b, int *out)
 {
     *out = 0;
     if (b >= 4) { *out = b - 4; return &d->mbs[d->mb_idx]; }
@@ -85,9 +85,9 @@ static int nc_di(const h264_decoder_t *d, int block, int plane, bool chroma)
 {
     int pa, pb;
     const h264d_mb_t *a = chroma ? left_chroma(d, block, &pa)
-                                : sinistra4(d, block, &pa);
+                                : left4(d, block, &pa);
     const h264d_mb_t *b = chroma ? above_chroma(d, block, &pb)
-                                : sopra4(d, block, &pb);
+                                : above4(d, block, &pb);
     const int na = n_neighbours(a, pa, plane);
     const int nb = n_neighbours(b, pb, plane);
 
@@ -449,8 +449,8 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d)
             for (int k = 0; k < 16; k += stride) {
                 const int b = zscan[k];
                 int pa, pb;
-                const h264d_mb_t *a = sinistra4(d, b, &pa);
-                const h264d_mb_t *bm = sopra4(d, b, &pb);
+                const h264d_mb_t *a = left4(d, b, &pa);
+                const h264d_mb_t *bm = above4(d, b, &pb);
                 const int ma = (a && a->type == H264D_MB_I_NxN) ? a->ipred[pa]
                              : (a ? 2 : -1);
                 const int mb2 = (bm && bm->type == H264D_MB_I_NxN) ? bm->ipred[pb]
