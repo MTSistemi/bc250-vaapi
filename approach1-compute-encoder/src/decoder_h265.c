@@ -21,7 +21,7 @@
 struct hevc_decoder {
     hevcd_t d;
     hevcd_img_t buffer[IMG_SLOTS];
-    uintptr_t nome[IMG_SLOTS];      /* what the caller calls each picture */
+    uintptr_t surface_id[IMG_SLOTS];  /* what the caller calls each picture */
     void *gpu;
     int width, height;
     hevc_sps_t sps;
@@ -447,7 +447,7 @@ void hevc_decoder_set_references(hevc_decoder_t *h, const uintptr_t *id,
         if (!h->buffer[i].is_valid) continue;
         bool serve = false;
         for (int k = 0; k < n && !serve; k++)
-            if (h->nome[i] == id[k] && h->buffer[i].poc == poc[k]) serve = true;
+            if (h->surface_id[i] == id[k] && h->buffer[i].poc == poc[k]) serve = true;
         if (!serve) h->buffer[i].is_valid = false;
     }
 }
@@ -459,7 +459,7 @@ int hevc_decoder_begin_picture(hevc_decoder_t *h, const hevc_sps_t *sps,
     h->pps = *pps;
     if (open_picture(&h->d, &h->sps, poc)) return -1;
     for (int i = 0; i < IMG_SLOTS; i++)
-        if (&h->buffer[i] == h->d.current) h->nome[i] = id;
+        if (&h->buffer[i] == h->d.current) h->surface_id[i] = id;
     h->is_open = true;
     return 0;
 }
@@ -511,8 +511,34 @@ int hevc_decoder_load(hevc_decoder_t *h, gpu_image_t out, gpu_memory_t mem)
     if (!g || !g->plane[0]) return -1;
 
     const int cw = h->width / 2, ch = h->height / 2;
-    uint8_t *uv = malloc((size_t)cw * 2 * ch);
+    const int ten_bit = h->sps.bit_depth_luma > 8;
+    const size_t sample = ten_bit ? 2 : 1;
+
+    uint8_t *uv = malloc((size_t)cw * 2 * ch * sample);
     if (!uv) return -1;
+
+    if (ten_bit) {
+        /* ⚠️ Every one of these is a sample count, so every offset is
+         * multiplied. The shift into P010's high bits is not here - it
+         * belongs to the upload, which is the part that knows what a
+         * surface format is. */
+        for (int r = 0; r < ch; r++) {
+            const uint16_t *a = (const uint16_t *)g->plane[1]
+                                + (size_t)r * g->stride[1];
+            const uint16_t *b = (const uint16_t *)g->plane[2]
+                                + (size_t)r * g->stride[2];
+            uint16_t *o = (uint16_t *)uv + (size_t)r * cw * 2;
+            for (int x = 0; x < cw; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
+        }
+        const int r = gpu_compute_upload_p010(h->gpu, &out, mem,
+                                              (const uint16_t *)g->plane[0],
+                                              g->stride[0] * 2,
+                                              (const uint16_t *)uv, cw * 4,
+                                              h->width, h->height);
+        free(uv);
+        return r;
+    }
+
     for (int r = 0; r < ch; r++) {
         const uint8_t *a = g->plane[1] + (size_t)r * g->stride[1];
         const uint8_t *b = g->plane[2] + (size_t)r * g->stride[2];

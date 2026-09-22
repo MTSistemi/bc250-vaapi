@@ -255,8 +255,14 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
 
     const VAPictureParameterBufferHEVC *pp = &c->hevc_dec_state.pic;
 
+    /* 4:2:0 at eight or ten bits, and the two depths equal. Everything
+     * below eight bits and everything above ten is a profile this
+     * decoder does not claim; luma and chroma differing is one the
+     * templates cannot serve, because every line that picks between the
+     * two builds reads the luma depth. */
     if (pp->pic_fields.bits.chroma_format_idc != 1
-        || pp->bit_depth_luma_minus8 || pp->bit_depth_chroma_minus8)
+        || (pp->bit_depth_luma_minus8 != 0 && pp->bit_depth_luma_minus8 != 2)
+        || pp->bit_depth_chroma_minus8 != pp->bit_depth_luma_minus8)
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     /* Tiles put the coding tree units in an order of the picture parameter
      * set's choosing, and nothing here understands that. Refused rather

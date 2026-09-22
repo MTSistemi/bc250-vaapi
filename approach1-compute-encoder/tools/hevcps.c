@@ -220,6 +220,22 @@ int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image,
     abort();
 }
 
+/* The same, for a ten-bit picture. */
+int gpu_compute_upload_p010(gpu_context_t *ctx, gpu_image_t *image,
+                            gpu_memory_t memory,
+                            const uint16_t *y, int ys,
+                            const uint16_t *uv, int uvs, int w, int h);
+int gpu_compute_upload_p010(gpu_context_t *ctx, gpu_image_t *image,
+                            gpu_memory_t memory,
+                            const uint16_t *y, int ys,
+                            const uint16_t *uv, int uvs, int w, int h)
+{
+    (void)ctx; (void)image; (void)memory;
+    (void)y; (void)ys; (void)uv; (void)uvs; (void)w; (void)h;
+    fprintf(stderr, "the harness has no GPU to hand the picture to\n");
+    abort();
+}
+
 int main(int argc, char **argv)
 {
     bool quiet = false, headers_only = false;
