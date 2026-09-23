@@ -337,6 +337,7 @@ struct hevc_encoder {
     int pps_init_qp;
     int qp_hint_applied;         /* Last QP explicitly handed to hevc_encoder_set_qp(), or -1 if never called yet */
     rate_control_t rc;
+    bool cbr_intent;
     uint32_t quality_level;      /* 1..7 (1 = Quality, 4 = Balanced, 7 = Speed) */
     uint32_t max_frame_bits;     /* Maximum frame size in bits (0 = unlimited) */
 
@@ -443,8 +444,12 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
      */
     rc_init(&enc->rc, qp_pinned ? RC_CQP : RC_LOW_LATENCY, bitrate,
             (double)enc->fps, width, height);
-    enc->rc.current_qp = enc->qp;
-    enc->rc.base_qp = enc->qp;
+    if (qp_pinned) {
+        enc->rc.current_qp = enc->qp;
+        enc->rc.base_qp = enc->qp;
+    }
+    enc->pps_init_qp = enc->qp;
+    enc->cbr_intent = false;
     enc->qp_hint_applied = -1; /* no explicit QP hint applied yet - see hevc_encoder_set_qp() */
     enc->quality_level = 4;
     enc->max_frame_bits = 0;
@@ -564,16 +569,19 @@ void hevc_encoder_set_qp(hevc_encoder_t *encoder, int qp)
     if (encoder) {
         if (qp < 0) qp = 0;
         if (qp > 51) qp = 51;
-        /* va_backend.c calls this for EVERY picture with pic_init_qp out of
-         * VAEncPictureParameterBufferHEVC. To prevent per-frame unchanged hints
-         * from stomping the rate controller's QP walk, only reset base_qp/current_qp
-         * when the hint genuinely changes. */
         if (qp != encoder->qp_hint_applied) {
             encoder->rc.base_qp = qp;
             encoder->rc.current_qp = qp;
             encoder->qp_hint_applied = qp;
         }
         encoder->qp = qp;
+    }
+}
+
+void hevc_encoder_set_cbr_intent(hevc_encoder_t *encoder, bool cbr_intent)
+{
+    if (encoder) {
+        encoder->cbr_intent = cbr_intent;
     }
 }
 
@@ -994,12 +1002,17 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             }
         }
 
-        /* Skip threshold scaled with QP and rate-distortion trade-off.
-         * Residuals smaller than the quantizer step size are rounded to zero by DCT/quant,
-         * so skipping them saves CABAC intra mode + coefficient bits without visual loss. */
-        uint32_t threshold = 128 * (2 + (enc->qp / 4));
-        if (enc->quality_level >= 5) {
-            threshold = threshold * 3 / 2;
+        /* Skip threshold scaled with QP and quality level.
+         * For quality levels 1..3 (high-quality archival / transcode), keep threshold strict
+         * so subtle textures, grain, and fine motion are preserved with full residual coding.
+         * Quality levels 4..5 use balanced skipping, and 6..7 use speed skipping. */
+        uint32_t threshold;
+        if (enc->quality_level <= 3) {
+            threshold = 48 * (1 + (enc->qp / 16));
+        } else if (enc->quality_level <= 5) {
+            threshold = 64 * (1 + (enc->qp / 12));
+        } else {
+            threshold = 96 * (1 + (enc->qp / 8));
         }
         static int s_skip_override = -2;
         if (s_skip_override == -2) {
@@ -1270,6 +1283,41 @@ static void deinterleava_uv(uint8_t *cb, uint8_t *cr, const uint8_t *uv, size_t 
     for (size_t i = 0; i < n; i++) { cb[i] = uv[2 * i]; cr[i] = uv[2 * i + 1]; }
 }
 
+static size_t maybe_append_filler_hevc(hevc_encoder_t *encoder, size_t total_written)
+{
+    if (!encoder->cbr_intent ||
+        (encoder->rc.mode != RC_CBR && encoder->rc.mode != RC_LOW_LATENCY)) {
+        return total_written;
+    }
+
+    uint32_t target_bytes = (encoder->rc.target_bits_per_frame + 7) / 8;
+    if (target_bytes <= total_written) {
+        return total_written;
+    }
+
+    size_t shortfall = (size_t)target_bytes - total_written;
+    if (shortfall < BS_HEVC_FILLER_MIN_NAL_SIZE) {
+        return total_written;
+    }
+
+    size_t ff_count = shortfall - BS_HEVC_FILLER_MIN_NAL_SIZE;
+    if (total_written + shortfall > encoder->scratch_out_cap) {
+        size_t new_cap = total_written + shortfall + 131072;
+        uint8_t *new_buf = realloc(encoder->scratch_out, new_cap);
+        if (new_buf) {
+            encoder->scratch_out = new_buf;
+            encoder->scratch_out_cap = new_cap;
+        } else {
+            return total_written;
+        }
+    }
+
+    size_t written = bs_write_filler_hevc(encoder->scratch_out + total_written,
+                                          encoder->scratch_out_cap - total_written,
+                                          ff_count);
+    return total_written + written;
+}
+
 static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t output_size)
 {
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
@@ -1440,11 +1488,14 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
         total += off + ebsp;
     }
 
+    size_t real_coded = total;
+    total = maybe_append_filler_hevc(encoder, total);
+
     if (total > output_size) return -1;
     memcpy(output_buf, encoder->scratch_out, total);
 
-    if (total > 0 && encoder->rc.mode != RC_CQP) {
-        rc_update_stats(&encoder->rc, (int)(total * 8));
+    if (real_coded > 0 && encoder->rc.mode != RC_CQP) {
+        rc_update_stats(&encoder->rc, (int)(real_coded * 8));
     }
 
     /* Update reference buffers for subsequent P-frames */

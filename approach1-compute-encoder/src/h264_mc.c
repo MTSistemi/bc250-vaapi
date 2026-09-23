@@ -345,7 +345,7 @@ void h264d_mc_luma(uint8_t *dst, int ds, const uint8_t *src, int ss,
 void h264d_mc_chroma(uint8_t *dst, int ds, const uint8_t *src, int ss,
                      int w, int h, int xfrac, int yfrac)
 {
-    /* âš ï¸ The three cases below are the general one with the zero weights
+    /* ⚠️ The three cases below are the general one with the zero weights
      * dropped, not approximations of it: (8-f)*8 and f*8 divided through by
      * eight give the same result with the same rounding, because the
      * rounding constant divides through too. */
@@ -355,7 +355,7 @@ void h264d_mc_chroma(uint8_t *dst, int ds, const uint8_t *src, int ss,
         return;
     }
 
-    /* âš ï¸ The weights sum to sixty-four and the samples reach 255, so the
+    /* ⚠️ The weights sum to sixty-four and the samples reach 255, so the
      * whole sum is at most 16320: it fits a signed sixteen-bit lane with
      * room to spare, and no thirty-two bit widening is needed anywhere in
      * this filter. */
@@ -467,7 +467,7 @@ void h264d_mc_average(uint8_t *dst, int ds, const uint8_t *a, int as,
         uint8_t *o = dst + (size_t)y * ds;
         int x = 0;
 #if BC250_H264_SSE2
-        /* âš ï¸ _mm_avg_epu8 is (a + b + 1) >> 1 on each byte, which is what
+        /* ⚠️ _mm_avg_epu8 is (a + b + 1) >> 1 on each byte, which is what
          * the clause says, not an approximation of it. */
         for (; x + 16 <= w; x += 16)
             _mm_storeu_si128((__m128i *)(o + x),
@@ -491,7 +491,7 @@ void h264d_mc_average(uint8_t *dst, int ds, const uint8_t *a, int as,
 void h264d_mc_weight(uint8_t *dst, int ds, const uint8_t *src, int ss,
                      int w, int h, int log2_denom, int weight, int offset)
 {
-    /* âš ï¸ Exactly a copy, not nearly one: with weight = 1 << denom and no
+    /* ⚠️ Exactly a copy, not nearly one: with weight = 1 << denom and no
      * offset, ((src << denom) + (1 << (denom - 1))) >> denom is src for
      * every src. x264's weightp leaves most references here. */
     if (weight == (1 << log2_denom) && offset == 0) {
@@ -552,7 +552,7 @@ void h264d_mc_weight_bi(uint8_t *dst, int ds,
      * no offset collapse to (a + b + 1) >> 1. Implicit bi-prediction lands
      * here whenever the two references sit symmetrically around this
      * picture, which in a regular B structure is most of the time. */
-    /* âš ï¸ log2_denom >= 1 is part of the condition, not a detail of it. At
+    /* ⚠️ log2_denom >= 1 is part of the condition, not a detail of it. At
      * zero the clause does not shift, so weights of one mean a + b clipped
      * and not the average of a and b. */
     if (log2_denom >= 1 && w0 == (1 << log2_denom) && w1 == w0
@@ -563,7 +563,7 @@ void h264d_mc_weight_bi(uint8_t *dst, int ds,
 
     const int off = (o0 + o1 + 1) >> 1;
 #if BC250_H264_SSE2
-    /* âš ï¸ Two weighted samples added together overflow a sixteen-bit lane
+    /* ⚠️ Two weighted samples added together overflow a sixteen-bit lane
      * (255 x 127 x 2), so the pair goes through _mm_madd_epi16, which
      * multiplies and accumulates into thirty-two bits in one step. The
      * samples are interleaved a,b,a,b so the coefficient vector is just
@@ -590,7 +590,7 @@ void h264d_mc_weight_bi(uint8_t *dst, int ds,
             __m128i hi = _mm_madd_epi16(_mm_unpackhi_epi8(mix, zero), vw);
             lo = _mm_srai_epi32(_mm_add_epi32(lo, vt), shift);
             hi = _mm_srai_epi32(_mm_add_epi32(hi, vt), shift);
-            /* âš ï¸ Saturating, not wrapping. At log2_denom zero nothing is
+            /* ⚠️ Saturating, not wrapping. At log2_denom zero nothing is
              * shifted, the sum can reach 64770, and packing it down clamps
              * it at 32767 - where a wrapping add of the offset would turn
              * the brightest sample into the darkest. */

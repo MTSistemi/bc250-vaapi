@@ -100,7 +100,7 @@ static inline void await_row(const atomic_int *p, int up_to)
 static void work_slice(struct h264d_pool *p, int io)
 {
     h264_decoder_t c = *p->d;
-    /* âš ï¸ No pool on the cursor: the workers are the slices, so this one
+    /* ⚠️ No pool on the cursor: the workers are the slices, so this one
      * reconstructs what it reads, itself, as it goes. */
     c.pool = NULL;
     c.rbsp = p->rbsp[io];

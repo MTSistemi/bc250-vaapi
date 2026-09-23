@@ -184,7 +184,7 @@ static void refs16(const h264_decoder_t *d, const uint8_t *plane, int s,
 }
 
 
-/* âš ï¸ Looked up once. These are asked per macroblock, and getenv walks the
+/* ⚠️ Looked up once. These are asked per macroblock, and getenv walks the
  * environment every time: at 1080p that was just under 1% of the decode. */
 static const char *env_of(const char *nome, int which)
 {
@@ -627,7 +627,7 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
 
     /* Chroma residual, the same for intra and inter: the DC coefficients of
      * each plane go through their own 2x2 transform, then each 4x4 block. */
-    /* âš ï¸ Nothing below may touch the residual when there is none: the slot
+    /* ⚠️ Nothing below may touch the residual when there is none: the slot
      * still holds whatever macroblock used it a band ago. coded_block_
      * pattern's upper bits are what say a chroma residual exists. */
     if ((m->cbp >> 4) == 0)

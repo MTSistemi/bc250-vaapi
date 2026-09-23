@@ -125,7 +125,7 @@ typedef struct {
      * Laid out per macroblock: [mb][list][8x8] and [mb][list][4x4][xy]. */
     int8_t  *col_ref;
     int16_t *col_mv;
-    /* âš ï¸ The POC of the picture each of those indices pointed at. Temporal
+    /* ⚠️ The POC of the picture each of those indices pointed at. Temporal
      * direct needs the picture, not the index: the index means something
      * only inside the list the co-located slice built. */
     int32_t *col_poc;

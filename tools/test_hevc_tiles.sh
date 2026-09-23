@@ -11,13 +11,15 @@
 # Debian has kvazaar; if it is missing this skips rather than fails, and
 # says so, because a suite that cannot run is not a suite that passed.
 #
-# ⚠️ Not covered: ten bits. The packaged kvazaar is built for eight, and
-# nothing else here writes tiles. The tile code is about scan order and
-# availability, both counted in units and coordinates and neither of them
-# aware of sample depth, so there is reason to expect it works - but
-# expecting is not testing, and this is the gap.
+# Ten bits need a kvazaar built for them, since the packaged one is built
+# for eight: point KVAZAAR10 at one (cmake -DCMAKE_C_FLAGS=-DKVZ_BIT_DEPTH=10
+# on kvazaar's own sources) and the ten-bit section runs too. Without it
+# that section says so and is skipped.
 set -u
 BIN="${1:-/tmp/hevcps}"
+KVZ=kvazaar
+PIX=yuv420p
+DEPTH_ARGS=""
 
 if ! command -v kvazaar >/dev/null 2>&1; then
     echo "kvazaar is not installed - tiles cannot be tested, skipping"
@@ -36,15 +38,18 @@ check() {
     local name="$1" wh="$2" count="$3"
     shift 3
 
+    rm -f "$T/s.265"
     ffmpeg -v error -y -f lavfi -i "testsrc2=size=$wh:rate=25" \
-           -frames:v "$count" -pix_fmt yuv420p -f rawvideo "$T/in.yuv" 2>/dev/null
-    kvazaar -i "$T/in.yuv" --input-res "$wh" "$@" -o "$T/s.265" >/dev/null 2>&1
+           -frames:v "$count" -pix_fmt "$PIX" -f rawvideo "$T/in.yuv" 2>/dev/null
+    # shellcheck disable=SC2086
+    "$KVZ" -i "$T/in.yuv" --input-res "$wh" $DEPTH_ARGS "$@" \
+           -o "$T/s.265" >/dev/null 2>&1
     if [ ! -s "$T/s.265" ]; then
         printf '  %-44s kvazaar produced no stream\n' "$name"
         failed=$((failed + 1)); return
     fi
 
-    ffmpeg -v error -y -i "$T/s.265" -f rawvideo -pix_fmt yuv420p \
+    ffmpeg -v error -y -i "$T/s.265" -f rawvideo -pix_fmt "$PIX" \
            "$T/ref.yuv" 2>/dev/null
     "$BIN" -q "$T/s.265" "$T/ours.yuv" >/dev/null 2>&1
     if [ ! -s "$T/ours.yuv" ]; then
@@ -98,6 +103,25 @@ check "176x144" 176x144 4 --tiles 2x2
 check "640x480" 640x480 4 --tiles 2x2
 check "1280x720" 1280x720 4 --tiles 3x2
 check "58x50, to be cropped" 58x50 4 --tiles 1x1
+
+echo
+echo "ten bits"
+if [ -n "${KVAZAAR10:-}" ] && [ -x "$KVAZAAR10" ]; then
+    KVZ="$KVAZAAR10"
+    PIX=yuv420p10le
+    DEPTH_ARGS="--input-bitdepth 10"
+    check "2x2" 320x240 4 --tiles 2x2
+    check "3x3" 320x240 4 --tiles 3x3
+    check "5x4, one unit each" 320x240 4 --tiles 5x4
+    check "split at 64 and 192" 320x240 4 --tiles-width-split 64,192
+    check "qp 10" 320x240 4 --tiles 2x2 --qp 10
+    check "qp 40" 320x240 4 --tiles 2x2 --qp 40
+    check "a GOP with B pictures" 320x240 8 --tiles 2x2 --gop 8
+    check "no deblocking" 320x240 4 --tiles 2x2 --no-deblock
+    check "1280x720" 1280x720 4 --tiles 3x2
+else
+    echo "  no ten-bit kvazaar (set KVAZAAR10) - skipped"
+fi
 
 echo
 printf 'identical %d, differing %d\n' "$passed" "$failed"

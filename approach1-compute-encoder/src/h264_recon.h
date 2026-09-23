@@ -25,7 +25,7 @@ typedef struct {
 
 /* All six at once, indexed by qp % 6.
  *
- * âš ï¸ The factors depend on the quantisation parameter only through qp % 6.
+ * ⚠️ The factors depend on the quantisation parameter only through qp % 6.
  * The rest of it is a shift, and the transforms apply that themselves from
  * the qp they are given. So this is rebuilt when the scaling lists change
  * and at no other time. */

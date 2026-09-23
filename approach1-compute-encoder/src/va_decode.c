@@ -11,7 +11,7 @@
  * it turns VA's structures into the decoder's own and maps surfaces onto
  * frame store slots.
  *
- * âš ï¸ The slices are held rather than decoded as they arrive. Decoding here
+ * ⚠️ The slices are held rather than decoded as they arrive. Decoding here
  * is CPU work measured in milliseconds, and vaRenderPicture runs with the
  * driver lock held; doing it there would serialise every other thread in
  * the application behind it. Everything is copied and the whole picture is
@@ -176,7 +176,7 @@ static void fill_pic(const bc250_context *c, h264d_pic_t *out)
     out->weighted_bipred_idc = p->pic_fields.bits.weighted_bipred_idc;
     out->pic_order_present = p->pic_fields.bits.pic_order_present_flag;
 
-    /* âš ï¸ num_ref_idx_lX_default is never used: every slice carries its own
+    /* ⚠️ num_ref_idx_lX_default is never used: every slice carries its own
      * active count and VA hands that over directly. It is filled in anyway
      * so nothing downstream can read a zero and think it means something. */
     out->num_ref_idx_l0 = 1;
@@ -224,7 +224,7 @@ static void weights_of(const VASliceParameterBufferH264 *p, h264d_slice_t *s)
     const int16_t one_c = (int16_t)(1 << p->chroma_log2_weight_denom);
 
     for (int i = 0; i < 32; i++) {
-        /* âš ï¸ A list whose flag is clear has no values in the buffer at all,
+        /* ⚠️ A list whose flag is clear has no values in the buffer at all,
          * so the neutral weight has to be put there by hand: the decoder
          * multiplies unconditionally. */
         s->luma_weight[0][i] = p->luma_weight_l0_flag ? p->luma_weight_l0[i] : one_l;
@@ -339,7 +339,7 @@ VAStatus bc250_dec_decode(bc250_context *c, gpu_image_t out, gpu_memory_t mem)
         h264_decoder_slices(dec, ready, n_ready);
     free(ready);
 
-    /* âš ï¸ Always finished, even when every slice was refused. A picture that
+    /* ⚠️ Always finished, even when every slice was refused. A picture that
      * is never ended leaves the frame store holding a slot that no later
      * picture can reuse, and the application still gets its surface back -
      * green rather than absent, which is what every other driver does after

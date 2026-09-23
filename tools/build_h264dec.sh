@@ -5,7 +5,11 @@
 # and only touches the GPU to upload the finished picture. The harness
 # stubs that upload out, so it builds and runs anywhere.
 set -eu
-D=~/comunita/bc250-encoding-decoding-fix/approach1-compute-encoder
+# ⚠️ The tree this script sits in, not a fixed path. With a fixed path a
+# copy of the repository - an older commit checked out elsewhere to
+# compare with, a throwaway tree with a diagnostic patch - silently built
+# the main checkout instead, and the comparison compared it with itself.
+D="$(cd "$(dirname "$0")/.." && pwd)/approach1-compute-encoder"
 OUT="${1:-/tmp/h264dec}"
 
 gcc -O2 -g -Wall -Wextra -std=gnu11 \

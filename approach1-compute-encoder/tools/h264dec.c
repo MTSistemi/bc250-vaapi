@@ -135,7 +135,7 @@ static const uint8_t def8_inter[64] = {
     27, 28, 28, 28, 28, 28, 30, 30, 30, 30, 32, 32, 32, 33, 33, 35
 };
 
-/* âš ï¸ Everything below stores a scaling list in RASTER order, because that
+/* ⚠️ Everything below stores a scaling list in RASTER order, because that
  * is how the dequantiser indexes it - and how VA-API hands it over. The
  * bitstream sends it in zig-zag, and so do the tables above. */
 static void da_zigzag(const uint8_t *src, uint8_t *dst, int n)
@@ -740,7 +740,7 @@ int main(int argc, char **argv)
             }
         }
 
-        /* âš ï¸ In the raw NAL's coordinates, because that is what the
+        /* ⚠️ In the raw NAL's coordinates, because that is what the
          * decoder is handed - the same thing VA-API's
          * slice_data_bit_offset counts. */
         const int bit_offset = (int)br_raw_offset(buf + start,

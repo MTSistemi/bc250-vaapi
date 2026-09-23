@@ -386,7 +386,7 @@ int h264d_direct_temporal(h264_decoder_t *d, h264d_mb_t *m, int mask)
                 l1y = l0y - mvy;
             }
 
-            /* âš ï¸ Without direct_8x8_inference_flag every 4x4 asks its own
+            /* ⚠️ Without direct_8x8_inference_flag every 4x4 asks its own
              * co-located block, and they may land on different references.
              * The motion field here keeps one reference index per 8x8, so
              * that case is refused rather than quietly flattened. Encoders

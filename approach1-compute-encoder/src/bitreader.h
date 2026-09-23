@@ -169,7 +169,7 @@ static inline size_t br_extract_rbsp(uint8_t *dst, size_t dst_cap,
 /* As br_extract_rbsp, and it also moves a bit offset counted in `src` into
  * the coordinates of `dst`.
  *
- * âš ï¸ An offset can only be moved if the bytes removed before it are
+ * ⚠️ An offset can only be moved if the bytes removed before it are
  * counted while they are removed. Doing it afterwards means scanning the
  * source twice and getting the straddling cases wrong; doing it here costs
  * one comparison per byte. */

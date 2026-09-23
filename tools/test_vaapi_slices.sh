@@ -10,9 +10,19 @@
 # survive between those calls.
 #
 # ⚠️ Needs kvazaar, like its harness twin, and for the same reason: x265
-# writes one slice per picture. Skips rather than fails when missing.
+# writes one slice per picture. Skips rather than fails when missing. Ten
+# bits need a kvazaar built for them, KVAZAAR10, as in test_hevc_tiles.sh.
+#
+# ⚠️ The pictures are taken as VA surfaces and downloaded explicitly. With
+# an ordinary output format ffmpeg falls back to its own software decoder
+# whenever the driver declines, and the suite then compares ffmpeg with
+# itself and passes.
 set -u
 DRI="${1:-/tmp/dri}"
+KVZ=kvazaar
+PIX=yuv420p
+HW=nv12
+DEPTH_ARGS=""
 
 if ! command -v kvazaar >/dev/null 2>&1; then
     echo "kvazaar is not installed - slices cannot be tested, skipping"
@@ -33,19 +43,23 @@ check() {
     local name="$1" wh="$2" count="$3"
     shift 3
 
+    rm -f "$T/s.265" "$T/hw.yuv"
     ffmpeg -v error -y -f lavfi -i "testsrc2=size=$wh:rate=25" \
-           -frames:v "$count" -pix_fmt yuv420p -f rawvideo "$T/in.yuv" 2>/dev/null
-    kvazaar -i "$T/in.yuv" --input-res "$wh" "$@" -o "$T/s.265" >/dev/null 2>&1
+           -frames:v "$count" -pix_fmt "$PIX" -f rawvideo "$T/in.yuv" 2>/dev/null
+    # shellcheck disable=SC2086
+    "$KVZ" -i "$T/in.yuv" --input-res "$wh" $DEPTH_ARGS "$@" \
+           -o "$T/s.265" >/dev/null 2>&1
     if [ ! -s "$T/s.265" ]; then
         printf '  %-40s kvazaar produced no stream\n' "$name"
         failed=$((failed + 1)); return
     fi
 
-    ffmpeg -v error -y -i "$T/s.265" -f rawvideo -pix_fmt yuv420p \
+    ffmpeg -v error -y -i "$T/s.265" -f rawvideo -pix_fmt "$PIX" \
            "$T/sw.yuv" 2>/dev/null
     ffmpeg -v error -y -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
-           -hwaccel_output_format nv12 -i "$T/s.265" \
-           -f rawvideo -pix_fmt yuv420p "$T/hw.yuv" 2>"$T/err"
+           -hwaccel_output_format vaapi -i "$T/s.265" \
+           -vf "hwdownload,format=$HW" \
+           -f rawvideo -pix_fmt "$PIX" "$T/hw.yuv" 2>"$T/err"
 
     if [ ! -s "$T/hw.yuv" ]; then
         printf '  %-40s nothing came out: %s\n' "$name" \
@@ -94,6 +108,22 @@ check "qp 40" 320x240 6 --wpp --slices wpp --qp 40
 check "640x480, eight rows" 640x480 6 --wpp --slices wpp
 check "1280x720, twelve rows" 1280x720 4 --wpp --slices wpp
 check "176x144, three rows" 176x144 6 --wpp --slices wpp
+
+echo
+echo "ten bits, on P010 surfaces"
+if [ -n "${KVAZAAR10:-}" ] && [ -x "$KVAZAAR10" ]; then
+    KVZ="$KVAZAAR10"
+    PIX=yuv420p10le
+    HW=p010
+    DEPTH_ARGS="--input-bitdepth 10"
+    check "2x2, four slices" 320x240 6 --tiles 2x2 --slices tiles
+    check "slices, with B pictures" 320x240 8 --tiles 2x2 --slices tiles --gop 8
+    check "segments, four rows" 320x240 6 --wpp --slices wpp
+    check "segments, with B pictures" 320x240 8 --wpp --slices wpp --gop 8
+    check "segments, 1280x720" 1280x720 4 --wpp --slices wpp
+else
+    echo "  no ten-bit kvazaar (set KVAZAAR10) - skipped"
+fi
 
 echo
 printf 'identical %d, differing %d\n' "$passed" "$failed"

@@ -173,7 +173,7 @@ struct bc250_context {
         VAIQMatrixBufferH264 iq;
         int has_pic;
         int has_iq;
-        /* âš ï¸ The slices are copied, not pointed at, because they are
+        /* ⚠️ The slices are copied, not pointed at, because they are
          * decoded from vaEndPicture with the driver lock dropped: by then
          * nothing guarantees the application's buffers are still where they
          * were. Copying a slice costs a memcpy; decoding one costs
@@ -267,7 +267,7 @@ typedef struct {
 void bc250_dec_reset(bc250_context *c);
 void bc250_dec_free(bc250_context *c);
 VAStatus bc250_dec_render(bc250_context *c, bc250_buffer *b);
-/* âš ï¸ Call with the driver lock DROPPED and the target surface pinned: this
+/* ⚠️ Call with the driver lock DROPPED and the target surface pinned: this
  * is where the picture is actually decoded, and it is all CPU. */
 VAStatus bc250_dec_decode(bc250_context *c, gpu_image_t out, gpu_memory_t mem);
 

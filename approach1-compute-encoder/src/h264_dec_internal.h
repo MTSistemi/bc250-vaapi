@@ -56,13 +56,13 @@ enum {
 /* One macroblock's residual, as the entropy decoder leaves it: coefficients
  * in raster order inside each block, ready for the inverse transforms.
  *
- * âš ï¸ coeff and coeff8 are alternatives - a macroblock uses the 4x4
+ * ⚠️ coeff and coeff8 are alternatives - a macroblock uses the 4x4
  * transform or the 8x8 one, never both - but they are kept side by side
  * rather than in a union, because the debug dumps read whichever one the
  * macroblock did not use and a union would make that undefined. */
 typedef struct {
     int16_t luma[16][16];         /* [block][coefficient], raster inside */
-    int16_t chroma[2][4][16];      /* âš ï¸ four blocks a plane at 4:2:0 */
+    int16_t chroma[2][4][16];      /* ⚠️ four blocks a plane at 4:2:0 */
     int16_t coeff8[4][64];        /* the 8x8 transform's luma blocks */
     int16_t dc_luma[16];
     int16_t dc_chroma[2][4];
@@ -85,10 +85,10 @@ struct h264_decoder {
     h264d_mb_t *mbs;
     uint8_t *slice_of_mb;
     h264d_deblock_params_t deblock[H264D_MAX_SLICES];
-    /* âš ï¸ Kept by slice number, not just in `slice`: reconstruction reads
+    /* ⚠️ Kept by slice number, not just in `slice`: reconstruction reads
      * the weights and the reference lists, and it runs after the entropy
      * decoder has moved on. */
-    /* âš ï¸ On the heap, not in the structure: a worker copies the decoder
+    /* ⚠️ On the heap, not in the structure: a worker copies the decoder
      * to use as a cursor, and 256 slices of parameters would be copied
      * with it. */
     h264d_slice_t *slices;

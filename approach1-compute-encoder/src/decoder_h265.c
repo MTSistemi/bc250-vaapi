@@ -15,6 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 
 #define IMG_SLOTS 20
 
@@ -28,6 +31,8 @@ struct hevc_decoder {
     hevc_pps_t pps;
     hevc_slice_t last_one;
     bool is_open;
+    uint8_t *uv_interleave;
+    size_t   uv_interleave_cap;
 };
 
 static void free_img(hevcd_img_t *g)
@@ -740,6 +745,7 @@ void hevc_decoder_destroy(hevc_decoder_t *h)
     free(d->qp_y_map); free(d->edges); free(d->no_filter);
     free(d->skip); free(d->cbf_map);
     hevcd_free_filters(d);
+    free(h->uv_interleave);
     free(h);
 }
 
@@ -921,9 +927,16 @@ int hevc_decoder_load(hevc_decoder_t *h, gpu_image_t out, gpu_memory_t mem)
     const int cw = h->width / 2, ch = h->height / 2;
     const int ten_bit = h->sps.bit_depth_luma > 8;
     const size_t sample = ten_bit ? 2 : 1;
+    const size_t needed = (size_t)cw * 2 * ch * sample;
 
-    uint8_t *uv = malloc((size_t)cw * 2 * ch * sample);
-    if (!uv) return -1;
+    if (h->uv_interleave_cap < needed) {
+        size_t new_cap = needed < 2097152 ? 2097152 : needed;
+        uint8_t *p = realloc(h->uv_interleave, new_cap);
+        if (!p) return -1;
+        h->uv_interleave = p;
+        h->uv_interleave_cap = new_cap;
+    }
+    uint8_t *uv = h->uv_interleave;
 
     if (ten_bit) {
         /* ⚠️ Every one of these is a sample count, so every offset is
@@ -938,26 +951,33 @@ int hevc_decoder_load(hevc_decoder_t *h, gpu_image_t out, gpu_memory_t mem)
             uint16_t *o = (uint16_t *)uv + (size_t)r * cw * 2;
             for (int x = 0; x < cw; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
         }
-        const int r = gpu_compute_upload_p010(h->gpu, &out, mem,
-                                              (const uint16_t *)g->plane[0],
-                                              g->stride[0] * 2,
-                                              (const uint16_t *)uv, cw * 4,
-                                              h->width, h->height);
-        free(uv);
-        return r;
+        return gpu_compute_upload_p010(h->gpu, &out, mem,
+                                      (const uint16_t *)g->plane[0],
+                                      g->stride[0] * 2,
+                                      (const uint16_t *)uv, cw * 4,
+                                      h->width, h->height);
     }
 
     for (int r = 0; r < ch; r++) {
         const uint8_t *a = g->plane[1] + (size_t)r * g->stride[1];
         const uint8_t *b = g->plane[2] + (size_t)r * g->stride[2];
         uint8_t *o = uv + (size_t)r * cw * 2;
-        for (int x = 0; x < cw; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
+        int x = 0;
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+        for (; x <= cw - 16; x += 16) {
+            __m128i va = _mm_loadu_si128((const __m128i *)(a + x));
+            __m128i vb = _mm_loadu_si128((const __m128i *)(b + x));
+            __m128i vlo = _mm_unpacklo_epi8(va, vb);
+            __m128i vhi = _mm_unpackhi_epi8(va, vb);
+            _mm_storeu_si128((__m128i *)(o + 2 * x), vlo);
+            _mm_storeu_si128((__m128i *)(o + 2 * x + 16), vhi);
+        }
+#endif
+        for (; x < cw; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
     }
-    const int r = gpu_compute_upload_nv12(h->gpu, &out, mem,
-                                          g->plane[0], g->stride[0],
-                                          uv, cw * 2, h->width, h->height);
-    free(uv);
-    return r;
+    return gpu_compute_upload_nv12(h->gpu, &out, mem,
+                                  g->plane[0], g->stride[0],
+                                  uv, cw * 2, h->width, h->height);
 }
 
 const char *hevc_decoder_reason(int e)

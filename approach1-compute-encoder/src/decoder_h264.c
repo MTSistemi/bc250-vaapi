@@ -237,7 +237,7 @@ static void trace_mb(const h264_decoder_t *d)
 /* Reconstruct the rows the entropy decoder has left behind, once a band of
  * them has piled up. Called at the start of every macroblock row.
  *
- * âš ï¸ This is what keeps the residual ring small enough to stay in cache,
+ * ⚠️ This is what keeps the residual ring small enough to stay in cache,
  * and it is also what bounds how far apart the wavefront's threads can
  * get. The two pull in opposite directions. */
 static inline void flush(h264_decoder_t *d, int number)
@@ -273,7 +273,7 @@ int h264d_decode_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
      * before the engine ever sees them. */
     d->cabac_mode = d->pic.entropy_coding_mode;
 
-    /* âš ï¸ The whole NAL is un-escaped, from its first byte, and the offset
+    /* ⚠️ The whole NAL is un-escaped, from its first byte, and the offset
      * travels with it. Un-escaping only the tail would miss a sequence that
      * straddles the boundary, and leaving the offset alone would put the
      * first macroblock in the wrong place as soon as a slice header
@@ -337,7 +337,7 @@ int h264d_decode_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
         /* Clause 7.3.4. A run of skipped macroblocks is counted, not
          * flagged, and more_rbsp_data() ends the slice.
          *
-         * âš ï¸ The run is read before every coded macroblock of a P or B
+         * ⚠️ The run is read before every coded macroblock of a P or B
          * slice, including when it is zero, and the standard only consults
          * more_rbsp_data() after a run that was not zero. Consulting it
          * unconditionally would be right in practice and wrong in

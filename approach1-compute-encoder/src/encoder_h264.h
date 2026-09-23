@@ -138,6 +138,7 @@ void h264_encoder_set_bitrate(h264_encoder_t *encoder, uint32_t bitrate_bps);
  * h264_encoder_set_rc_mode - Set rate control mode (RC_CBR, RC_VBR, RC_LOW_LATENCY, RC_CQP)
  */
 void h264_encoder_set_rc_mode(h264_encoder_t *encoder, rc_mode_t mode);
+rc_mode_t h264_encoder_get_rc_mode(const h264_encoder_t *encoder);
 
 /**
  * h264_encoder_set_gop_size - Configure keyframe (IDR) interval

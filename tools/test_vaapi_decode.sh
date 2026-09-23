@@ -12,7 +12,7 @@
 # weights, the quantisation matrices, slice_data_bit_offset - which the
 # harness cannot reach.
 #
-# âš ï¸ -hwaccel_output_format vaapi, then hwdownload. Asking for nv12 directly
+# ⚠️ -hwaccel_output_format vaapi, then hwdownload. Asking for nv12 directly
 # makes ffmpeg insert a scaler it cannot configure, and the run dies with
 # "Error reinitializing filters" long before the driver is involved.
 set -u

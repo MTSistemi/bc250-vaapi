@@ -42,6 +42,7 @@ uint32_t hevc_encoder_get_quality_level(const hevc_encoder_t *encoder);
 void hevc_encoder_set_max_frame_size(hevc_encoder_t *encoder, uint32_t max_frame_bits);
 uint32_t hevc_encoder_get_max_frame_size(const hevc_encoder_t *encoder);
 int hevc_encoder_get_governor_tier(const hevc_encoder_t *encoder);
+void hevc_encoder_set_cbr_intent(hevc_encoder_t *encoder, bool cbr_intent);
 
 /*
  * @input_memory: backing device memory of `input_surface`, needed for the

@@ -194,7 +194,7 @@ When encoding with FFmpeg's `h264_vaapi` or `hevc_vaapi` to MP4 containers, the 
 [h264_vaapi @ 0x560ddcc95dc0] No global header will be written: this may result in a stream which is not usable for some purposes (e.g. not muxable to some containers).
 ```
 
-### Resolution in v0.5.1+
+### Resolution in v0.5.0+
 * The driver advertises `VA_ENC_PACKED_HEADER_SEQUENCE` (`0x1`), allowing FFmpeg's MP4/MKV container muxers to cleanly extract sequence parameters for container global headers (`avcC` / `hvcC` atom) without warnings.
 * Full in-band AUD, SPS, PPS, and Slice NAL units are maintained in the bitstream for standard streaming and player compatibility.
 
@@ -255,7 +255,58 @@ When playing HEVC/H.265 files (such as *Big Buck Bunny* or MP4/MKV video streams
 1. **Container SPS RPS vs Slice Headers**: In standard HEVC MP4/MKV containers, sequence parameters and the short-term Reference Picture Set (RPS) table are stored globally in container headers (`hvcC` atom) rather than repeated in-band. In slice headers, `short_term_ref_pic_set_sps_flag` is set to `1` to reference SPS tables.
 2. **Missing In-Band Sets**: When VA-API is invoked, the application does not transmit the raw SPS RPS table. When the driver attempted to re-parse the slice header from raw bits without the SPS table, it failed to parse the RPS and could not synchronize the bitstream reader, leading to dropped slices and zero populated reference frames (`d->n_refs[0] = 0, d->n_refs[1] = 0`). As a result, motion compensation was skipped, leaving older pixels ghosting across the display.
 
-### Resolution in v0.5.1+
+### Resolution in v0.5.0+
 * **Direct VA-API RPL Derivation**: `va_decode_hevc.c` now derives reference picture lists (L0 and L1) and the temporal collocated picture directly from VA-API's pre-resolved `VASliceParameterBufferHEVC.RefPicList[2][15]`, eliminating the fragile dependency on in-band RPS bitstream re-parsing.
 * **Exact Slice Parameter Mapping**: Slice type, QP deltas, SAO, deblocking, and slice data byte offsets are mapped directly from VA-API buffers.
 * **Fault-Tolerant Concealment**: Added DPB closest-POC concealment fallback to smoothly hide any missing reference frames caused by seek operations or network packet drops.
+
+---
+
+## 12. Video Quality Loss, Texture Smearing, or Incorrect File Size (Encoder)
+
+### Symptoms
+* High-bitrate encodes (e.g. 15–20 Mbps) appear soft, blurry, or washed out compared to equivalent encodes from Intel/AMD hardware encoders.
+* Fine textures, grain, hair, or subtle camera motion get smoothed away into flat blocks.
+* Constant Bitrate (CBR) encodes significantly undershoot requested file size and target bitrate.
+
+### Root Cause
+1. **FFmpeg `pic_init_qp = 26` Stomping**: FFmpeg fills `pic_init_qp = 26` in `VAEncPictureParameterBuffer` on every picture. The driver was unconditionally resetting the rate controller's `base_qp` to 26 on every frame, wiping out the bitrate-derived QP estimate (`rc_estimate_base_qp`). As a result, the encoder remained pinned at QP 26–27 even when the user requested high bitrates.
+2. **Aggressive CU Skip Threshold**: In HEVC, the decision threshold for skipping residual coding in an 8x8 block was set to `128 * (2 + qp/4)` (~1024), treating an average per-pixel difference of up to 10.6 as identical background and skipping residual transforms.
+3. **Missing CBR Filler NALs**: HEVC lacked filler NAL padding, causing low-complexity scenes to output fewer bits than requested without reaching target bitrates.
+
+### Resolution in v0.5.0+
+* **Guarded `pic_init_qp`**: `pic_init_qp` is now only applied when explicitly encoding in Constant QP (CQP) mode (`-qp` or `BC250_CQP`). In VBR, CBR, and low-latency streaming modes, the rate controller has full authority to modulate QP between 12 and 51 based on target bitrate and frame complexity.
+* **Tuned CU Skip Threshold**: Skip thresholds are scaled based on quality levels: 48–64 for quality presets (`quality_level <= 4`), ensuring fine skin texture, hair, and film grain are preserved with full residual transforms.
+* **HEVC CBR Filler NALs**: Implemented `maybe_append_filler_hevc` so CBR streams accurately maintain constant target bitrates and file sizes.
+
+---
+
+## 13. Startup Stutter or A/V Desync Warning in mpv (`--video-sync=display-resample`)
+
+### Symptoms
+* Playing HEVC media in mpv with `--video-sync=display-resample` triggers noticeable stutter or frame drops near the beginning of playback:
+  ```text
+  [ao/pulse] The audio device is reporting an inaccurate playback position.
+  [playback] A/V desync: audio ahead of video, dropping video frames
+  ```
+* Without `--video-sync=display-resample`, video playback is smooth but an initial A/V desync warning might appear in terminal logs.
+
+### Root Cause
+1. **Container RPS Index Bit Misalignment**: In container-muxed files where `sps->num_st_rps == 0` in VA-API, re-reading the slice header previously failed to locate slice entry points. Without entry points, Wavefront Parallel Processing (WPP) multi-threading could not launch, causing the decoder to fall back to single-threaded CPU execution (~40 ms per frame).
+2. **Audio/Video Display Lock**: When `--video-sync=display-resample` is enabled, mpv forces video presentation to lockstep to the system audio clock. Because the first few frames took 40 ms each (exceeding the 16.6 ms 60fps frame budget), mpv dropped 20–30 frames in rapid succession to catch up to the PipeWire/PulseAudio clock.
+
+### Resolution in v0.5.0+
+* **Exact Bitstream Stepping via `st_rps_bits`**: `va_decode_hevc.c` now passes `num_short_term_ref_pic_sets` and `st_rps_bits` directly from VA-API, ensuring slice entry points and byte alignment are parsed bit-exact on frame 0.
+* **Multi-Threaded WPP on Frame Start**: Multi-threaded wavefront parallel processing launches immediately from the very first frame, keeping frame decode times well under 10 ms.
+* **Persistent Buffers & SSE2 Vectorization**: Eliminated 1 MB per-frame dynamic allocations and accelerated UV plane interleaving using SSE2 SIMD unpack instructions (`_mm_unpacklo_epi8` / `_mm_unpackhi_epi8`).
+
+---
+
+## 14. Official 147 JCT-VC HEVC Conformance Vectors & Long-Term Reference Frames
+
+### Enhancements in v0.5.0+
+* **146 of 147 Vectors Passing**: JCT-VC conformance increased from 111/147 to **146/147 (99.3%)** bit-exact across both standalone testing and hardware VA-API on the BC-250 (`tools/test_vaapi_conformance.sh`).
+* **Long-Term References & List Modification**: Implemented normative ITU-T H.265 sections 7.3.6.1 and 7.3.6.2. Motion vectors referencing long-term frames (`VA_PICTURE_HEVC_LONG_TERM_REFERENCE`) are correctly protected from scaling.
+* **Quantization Matrices**: Full scaling list support from `VAIQMatrixBufferHEVC` and Table 7-6 defaults.
+* **PCM Coding Units**: Supported and decoded bit-exact.
+* **16K Decode Resolution**: HEVC decoding supports up to 16384x16384 on a side.

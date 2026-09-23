@@ -118,7 +118,7 @@ static inline int block(int x4, int y4) { return y4 * 4 + x4; }
 /* Whether the block containing 4x4 position `b` of macroblock `m` carries
  * any coefficient, clause 8.7.2.1.
  *
- * âš ï¸ "The block" is the 8x8 one when the macroblock uses the 8x8
+ * ⚠️ "The block" is the 8x8 one when the macroblock uses the 8x8
  * transform, so all four of its 4x4 positions have to answer together. The
  * OR is done here rather than left to the entropy decoders, because the two
  * of them store different things: CABAC has no per-4x4 count for an 8x8

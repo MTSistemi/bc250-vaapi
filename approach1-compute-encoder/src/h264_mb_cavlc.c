@@ -514,7 +514,7 @@ int h264d_cavlc_skip(h264_decoder_t *d)
     m->type = (uint8_t)(bslice ? H264D_MB_B_SKIP : H264D_MB_P_SKIP);
     m->qpy = (int8_t)d->qpy;
 
-    /* âš ï¸ Nothing to zero: see h264d_reconstruct_mb. */
+    /* ⚠️ Nothing to zero: see h264d_reconstruct_mb. */
 
     if (bslice) {
         m->direct = 0xf;

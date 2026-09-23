@@ -872,7 +872,7 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
                 m->direct = 0xf;
                 if (h264d_direct(d, m, 0xf) != 0)
                     return 1;
-                /* âš ï¸ Nothing to zero: a macroblock with no coefficients
+                /* ⚠️ Nothing to zero: a macroblock with no coefficients
                  * has its coded_block_pattern at zero, and reconstruction
                  * reads that before it reads any residual. */
                 return 0;

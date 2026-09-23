@@ -284,6 +284,18 @@ size_t bs_rbsp_to_ebsp(uint8_t *dst, size_t dst_size,
  */
 size_t bs_write_filler(uint8_t *buf, size_t buf_size, size_t filler_ff_count);
 
+/**
+ * HEVC filler_data_rbsp() NAL: 4-byte start code + 2-byte HEVC NAL header (type 38)
+ * + 1-byte rbsp_trailing_bits (0x80) = 7 bytes minimum.
+ */
+#define BS_HEVC_FILLER_MIN_NAL_SIZE 7
+
+/**
+ * bs_write_filler_hevc - write one filler_data_rbsp() NAL unit (ITU-T H.265
+ * 7.3.2.7, nal_unit_type 38) directly into `buf`.
+ */
+size_t bs_write_filler_hevc(uint8_t *buf, size_t buf_size, size_t filler_ff_count);
+
 /* ===== H.264 parameter set serialization ===== */
 
 /** Write a complete SPS NAL unit. Returns bytes written. */

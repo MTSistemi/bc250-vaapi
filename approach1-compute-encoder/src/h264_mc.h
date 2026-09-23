@@ -28,7 +28,7 @@
  * both directions. Returns the integer-sample origin and writes the stride
  * to read it at into *out_stride.
  *
- * âš ï¸ The result may point into the plane itself rather than into `dst`.
+ * ⚠️ The result may point into the plane itself rather than into `dst`.
  * A block whose padded region is entirely inside the picture needs no copy
  * at all - the samples are already there - and at 1080p that is almost
  * every block. `dst` must still be (w + 6) * (h + 6), for the ones that

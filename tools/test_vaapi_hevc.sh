@@ -32,8 +32,12 @@ check() {
 
     ffmpeg -v error -y -i "$T/s.265" -f rawvideo -pix_fmt yuv420p \
            "$T/sw.yuv" 2>/dev/null
+    # ⚠️ As VA surfaces, downloaded explicitly: with an ordinary output
+    # format ffmpeg falls back to its software decoder whenever the driver
+    # declines, and this would compare ffmpeg with itself.
     ffmpeg -v error -y -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
-           -hwaccel_output_format nv12 -i "$T/s.265" \
+           -hwaccel_output_format vaapi -i "$T/s.265" \
+           -vf 'hwdownload,format=nv12' \
            -f rawvideo -pix_fmt yuv420p "$T/hw.yuv" 2>"$T/err"
 
     if [ ! -s "$T/hw.yuv" ]; then

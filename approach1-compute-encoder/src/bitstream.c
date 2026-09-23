@@ -280,6 +280,24 @@ size_t bs_write_filler(uint8_t *buf, size_t buf_size, size_t filler_ff_count) {
     return bs_bytes_written(&bs);
 }
 
+size_t bs_write_filler_hevc(uint8_t *buf, size_t buf_size, size_t filler_ff_count) {
+    if (!buf) return 0;
+
+    bitstream_t bs;
+    bs_init(&bs, buf, buf_size);
+
+    bs_write_nal_header_hevc(&bs, 38 /* NAL_UNIT_FILLER_DATA */);
+
+    for (size_t i = 0; i < filler_ff_count; i++) {
+        if (bs.overflow) break;
+        bs_write_u(&bs, 8, 0xFF);
+    }
+
+    bs_rbsp_trailing_bits(&bs);
+
+    return bs_bytes_written(&bs);
+}
+
 size_t bs_write_sps(uint8_t *buf, size_t buf_size, const h264_sps_t *sps) {
     if (!buf || !sps) return 0;
     uint8_t rbsp[1024];

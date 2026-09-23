@@ -339,7 +339,8 @@ if(BUILD_RC_BENCH)
         set(RC_BENCH_CORE
             src/gpu_compute.c src/bitstream.c src/cavlc.c src/cabac.c
             src/rate_control.c src/encoder_h264.c src/encoder_h265.c
-            src/hevc_cabac.c src/hevc_intra.c)
+            src/hevc_cabac.c src/hevc_intra.c
+            src/cpu_simd_me.c src/dynamic_governor.c)
         add_executable(rc_bench ${RC_BENCH_SRC} ${RC_BENCH_CORE})
         target_include_directories(rc_bench PRIVATE src ${Vulkan_INCLUDE_DIRS})
         target_link_libraries(rc_bench PRIVATE ${Vulkan_LIBRARIES} ${BC250_EXTRA_LIBS} m)

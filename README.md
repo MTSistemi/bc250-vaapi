@@ -29,22 +29,27 @@ This project solves this by delivering:
   * **Game Streaming Overhead**: Only **~4.5%** total GPU impact during active 60 FPS gaming with Sunshine/Moonlight.
 * **H.265 / HEVC (Multi-Slice Sliced Compute)**:
   * **1080p**: **111+ fps** (with default `BC250_HEVC_SLICES=4`, SIMD 4x4 transforms, and `MOVNTDQA` streaming readback).
+  * **Dynamic Base QP Rate Control**: Full dynamic QP targeting (12..51) matches requested bitrates and eliminates blurry over-quantization.
+  * **HEVC CBR Filler NALs**: Conforms bit-exact to target bitrates in CBR mode.
+  * **Fine Detail Preservation**: Tuned skip decision threshold preserves delicate textures, hair, grain, and high-frequency motion.
   * **Chroma Fidelity**: Bit-exact non-linear Table 8-10 QP mapping eliminates the standard chroma PSNR deficit.
 * **WiVRn VR Streaming**:
   * **Motion-to-Photon Latency**: **~36 ms** (down from 145 ms).
   * **Headset Download Throughput**: **~190 Mbits/s** (surpassing software encode).
   * **Host CPU Utilization**: **~350%** (slashed from 1300% lockup by enforcing passive OpenMP thread waiting).
 
-### 2. Decoding Benchmarks (`VAEntrypointVLD`)
+### 2. Decoding Benchmarks & JCT-VC Conformance (`VAEntrypointVLD`)
 
-Bit-exact conformance against the reference decoder across **all 302 test cases** covering intra/inter walks, B-pyramids, weighted prediction, CABAC/CAVLC, and SAO/deblocking filters:
+Bit-exact conformance against official ITU JCT-VC test streams and reference decoders across both standalone execution and hardware VA-API on the BC-250:
 
 | Codec | Resolution | Threads / Topology | Throughput (FPS) | Conformance Status |
 | :--- | :--- | :--- | :--- | :--- |
 | **H.264** | 1080p (CRF 23) | 1 thread | **68.4 fps** | 100% Bit-Exact (90/90 pass) |
 | **H.264** | 1080p (CRF 23) | 8 threads (multi-slice) | **156.2 – 181.5 fps** | 100% Bit-Exact (90/90 pass) |
-| **H.265 / HEVC** | 1080p | 1 thread | **66.3 fps** | 100% Bit-Exact (212/212 pass) |
-| **H.265 / HEVC** | 1080p | 6 threads (wavefront) | **97.6 fps** | 100% Bit-Exact (212/212 pass) |
+| **H.265 / HEVC** | 1080p | 1 thread | **66.3 fps** | **146 of 147 Bit-Exact (99.3%)** |
+| **H.265 / HEVC** | 1080p | 6 threads (wavefront) | **97.6 fps** | **146 of 147 Bit-Exact (99.3%)** |
+
+*(Note: The sole unmapped test vector, `TSUNEQBD_A_MAIN10`, specifies differing bit depths for luma and chroma, which FFmpeg itself does not support).*
 
 ---
 
@@ -57,8 +62,8 @@ Bit-exact conformance against the reference decoder across **all 302 test cases*
 | `VAProfileH264High` | `VAEntrypointEncSlice` | Vulkan Compute (40 CUs) + CABAC | 4096x2160 (4K) |
 | `VAProfileHEVCMain` | `VAEntrypointEncSlice` | Vulkan Compute ME + Host Slices | 4096x2160 (4K) |
 | `VAProfileH264*` | `VAEntrypointVLD` (Decode) | Multi-Threaded CPU Wavefront | 4096x2160 (4K) |
-| `VAProfileHEVCMain` | `VAEntrypointVLD` (Decode) | Multi-Threaded CPU Wavefront (WPP) | 4096x2160 (4K) |
-| `VAProfileHEVCMain10` | `VAEntrypointVLD` (Decode) | 10-Bit CPU Wavefront (P010) | 4096x2160 (4K) |
+| `VAProfileHEVCMain` | `VAEntrypointVLD` (Decode) | Multi-Threaded CPU Wavefront (WPP) | **16384x16384 (16K)** |
+| `VAProfileHEVCMain10` | `VAEntrypointVLD` (Decode) | 10-Bit CPU Wavefront (P010) | **16384x16384 (16K)** |
 | `VAProfileNone` | `VAEntrypointVideoProc` | Vulkan Compute Scaler & Cropping | 4096x2160 (4K) |
 
 ---
@@ -146,6 +151,14 @@ To configure WiVRn for ~36ms motion-to-photon latency and ~190 Mbps throughput:
 
    # Decode test (Hardware VA-API decode)
    ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 -i test_enc.mp4 -f null -
+   ```
+4. Run official JCT-VC HEVC conformance test suite (146 of 147 bitstreams):
+   ```bash
+   # Test all 147 vectors directly through the driver via VA-API:
+   ./tools/test_vaapi_conformance.sh
+
+   # Test standalone HEVC decoder:
+   ./tools/test_hevc_conformance.sh
    ```
 
 ---

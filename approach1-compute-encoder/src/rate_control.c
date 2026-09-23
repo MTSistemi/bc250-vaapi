@@ -140,7 +140,7 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
  * error unit here is already a per-frame buffer delta), similar in spirit
  * to the multi-second VBV windows real encoders use.
  */
-#define RC_INTEGRAL_WINDOW_FRAMES 150.0
+#define RC_INTEGRAL_WINDOW_FRAMES 30.0
 #define RC_INTEGRAL_QP_RANGE      40.0
 
 int rc_get_frame_qp(rate_control_t *rc, uint64_t est_sad) {
@@ -199,6 +199,8 @@ int rc_get_frame_qp(rate_control_t *rc, uint64_t est_sad) {
      * so rate control adapts promptly to high-motion scene bursts. */
     int max_step = (rc->mode == RC_LOW_LATENCY || rc->quality_level >= 5) ? 3 : 2;
     int delta = (rc->base_qp + qp_adjust) - rc->current_qp;
+    if (abs(delta) >= 8) max_step += 2;
+    else if (abs(delta) >= 4) max_step += 1;
     if (delta > max_step) delta = max_step;
     if (delta < -max_step) delta = -max_step;
 
