@@ -409,7 +409,10 @@ int main(int argc, char **argv)
             fine++;
         if (fine + 3 >= len) fine = len;
         i = fine;
-        if (start >= fine) continue;
+        /* An HEVC NAL header is two bytes, and the temporal id is read
+         * from the second: a shorter unit at the very end of the file
+         * would read past the buffer. */
+        if (fine - start < 2) continue;
 
         const int kind = (buf[start] >> 1) & 0x3f;
         const size_t n = br_extract_rbsp(rbsp, (size_t)len, buf + start,

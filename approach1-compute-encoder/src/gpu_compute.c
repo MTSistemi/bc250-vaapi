@@ -340,7 +340,7 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     VkDeviceSize quant_levels_size = num_mbs * 24 * 16 * sizeof(int16_t);
     VkDeviceSize nz_count_size = num_mbs * 24 * sizeof(uint32_t);
     VkDeviceSize pred_mode_size = num_mbs * sizeof(uint32_t);
-    VkDeviceSize entropy_size = width * height * 2; /* Generous */
+    VkDeviceSize entropy_size = (VkDeviceSize)width * height * 2; /* Generous */
 
     VkDeviceSize dc_coeff_size = num_mbs * 24 * sizeof(int);
 
