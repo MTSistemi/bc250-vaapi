@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <time.h>
 
 #ifdef __cplusplus
@@ -436,11 +437,18 @@ int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int 
  * like every other opportunistic capability check in this file. */
 int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory);
 
+/* Creates a diagnostic dump file safely - 0600, no symbolic links
+ * followed, in BC250_DUMP_DIR or else $XDG_RUNTIME_DIR/bc250_dump_frames.
+ * `what` names the switch that asked, for the messages. Every dump hook
+ * below goes through it. */
+FILE *bc250_debug_dump_open(const char *name, const char *what);
+
 /* Test-harness instrumentation (tools/quality_test.sh): dumps raw NV12
- * frame bytes to BC250_DUMP_DIR (default /tmp/bc250_dump_frames) when
- * BC250_DUMP_INPUT_FRAMES=1 is set in the environment; a no-op otherwise.
- * Shared by every known VA-API upload path so the harness catches whichever
- * one a given libva/ffmpeg build actually uses. See gpu_compute.c. */
+ * frame bytes to BC250_DUMP_DIR (default $XDG_RUNTIME_DIR/bc250_dump_frames)
+ * when BC250_DUMP_INPUT_FRAMES=1 is set in the environment; a no-op
+ * otherwise. Shared by every known VA-API upload path so the harness
+ * catches whichever one a given libva/ffmpeg build actually uses. See
+ * gpu_compute.c. */
 void bc250_debug_dump_nv12_frame(const uint8_t *y_plane, int y_pitch,
                                   const uint8_t *uv_plane, int uv_pitch,
                                   int width, int height);
@@ -538,7 +546,8 @@ void gpu_compute_debug_dump_recon(gpu_context_t *ctx, int width, int height);
  * before gpu_compute_dispatch_encode() so it sees exactly what the encoder
  * is about to encode, regardless of how the surface's contents got there.
  * No-op unless BC250_DUMP_REAL_INPUT=1 is set (BC250_DUMP_DIR for the
- * directory, default /tmp/bc250_dump_frames, same as the other dump hooks -
+ * directory, default $XDG_RUNTIME_DIR/bc250_dump_frames, same as the other
+ * dump hooks -
  * files are named real_NNNNN.nv12 to disambiguate from frame_/recon_). */
 void gpu_compute_debug_dump_real_input(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory, int width, int height);
 

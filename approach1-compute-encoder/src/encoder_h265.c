@@ -1528,7 +1528,10 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
      * (this dump looks right, but a real decoder's output doesn't). */
     if (getenv("BC250_HEVC_DEBUG_RECON")) {
         /* After the swap it is prev_recon_y that holds this frame. */
-        FILE *fy = fopen("bc250_hevc_debug_recon_y.raw", "wb");
+        /* ⚠️ Not the working directory: that is whatever process
+         * loaded the driver happened to be started in. */
+        FILE *fy = bc250_debug_dump_open("bc250_hevc_debug_recon_y.raw",
+                                         "BC250_HEVC_DEBUG_RECON");
         if (fy) { fwrite(encoder->prev_recon_y, 1, (size_t)encoder->coded_width * encoder->coded_height, fy); fclose(fy); }
     }
 
