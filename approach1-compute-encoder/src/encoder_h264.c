@@ -1656,6 +1656,15 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
         int s = atoi(slice_env);
         if (s >= 1 && s <= 16) encoder->num_slices = s;
     }
+#if defined(__linux__)
+    else if (program_invocation_short_name &&
+             (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+              strcmp(program_invocation_short_name, "wivrn") == 0)) {
+        /* WiVRn encodes high-res VR streams (typically >= 1800x1800 per eye).
+         * Multi-slice H.264 enables parallel entropy coding and drastically reduces VR latency. */
+        encoder->num_slices = 4;
+    }
+#endif
     encoder->quality_level = 4;
     encoder->max_frame_bits = 0;
 
@@ -2025,7 +2034,7 @@ int h264_encoder_submit_frame_ext(h264_encoder_t *encoder,
     int qp = rc_get_frame_qp(&encoder->rc, encoder->last_frame_sad);
     /* Must track rate_control.c's rc->qp_min - see the comment there for
      * why 12 is deliberate and what lowering it measured. */
-    if (qp < 12) qp = 12;
+    if (qp < encoder->rc.qp_min) qp = encoder->rc.qp_min;
     if (qp > 51) qp = 51;
     qp = apply_qp_override(qp);
 
@@ -2147,8 +2156,13 @@ static int get_default_slice_threads(int num_slices) {
         return 1;
     }
 #if defined(__linux__)
-    if (program_invocation_short_name && strcmp(program_invocation_short_name, "sunshine") == 0) {
-        return (num_slices < 2) ? 1 : 2;
+    if (program_invocation_short_name) {
+        if (strcmp(program_invocation_short_name, "sunshine") == 0) {
+            return (num_slices < 2) ? 1 : 2;
+        } else if (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+                   strcmp(program_invocation_short_name, "wivrn") == 0) {
+            return (num_slices < 4) ? num_slices : 4;
+        }
     }
 #endif
     return threads;
@@ -3199,7 +3213,7 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
     int qp = rc_get_frame_qp(&encoder->rc, encoder->last_frame_sad);
     /* Must track rate_control.c's rc->qp_min - see the comment there for
      * why 12 is deliberate and what lowering it measured. */
-    if (qp < 12) qp = 12;
+    if (qp < encoder->rc.qp_min) qp = encoder->rc.qp_min;
     if (qp > 51) qp = 51;
     qp = apply_qp_override(qp);
 

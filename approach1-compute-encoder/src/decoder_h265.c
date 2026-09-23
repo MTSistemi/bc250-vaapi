@@ -321,6 +321,12 @@ static int prepare_picture(hevcd_t *d, const hevc_sps_t *sps,
     memset(d->no_filter, 0, serve_cb);
     memset(d->skip, 0, serve_cb);
     memset(d->intra_mode, HEVCD_INTRA_DC, serve_pu);
+    /* ⚠️ A slice that switches SAO off for both planes sends no
+     * parameters at all, and read_sao() - which clears the entry it is
+     * about to fill - is never called for its coding tree units. Without
+     * this the previous picture's offsets stay in the map and 8.7.3
+     * applies them to a picture whose slice header said not to. */
+    memset(d->sao, 0, (size_t)sps->ctb_count * sizeof *d->sao);
 
     d->sps = sps;
     d->pps = pps;
@@ -388,11 +394,21 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
 
     d->min_pu_width = sps->width >> 2;
     d->min_pu_height = sps->height >> 2;
+    /* Does this segment begin a tile? Both 8.6.1 and 9.3.1 ask, and
+     * both let the answer outrank the dependent-segment rule. */
+    const int first_ts = d->rs_to_ts[sl->segment_address];
+    const bool starts_tile = pps->tiles_enabled
+        && (first_ts == 0
+            || d->tile_of_ts[first_ts - 1] != d->tile_of_ts[first_ts]);
+
     /* ⚠️ 8.6.1: a dependent segment continues the quantisation parameter
      * prediction of the segment before it. Only an independent one
-     * restarts from the slice's own parameter. */
+     * restarts from the slice's own parameter - or a segment that starts
+     * a tile, which restarts it whatever the segment is. A tile that is
+     * exactly one dependent segment carries no entry point, so the
+     * substream boundary further down never sees it. */
     const bool dependent = sl->dependent_slice_segment && d->have_segment_end;
-    if (!dependent) {
+    if (!dependent || starts_tile) {
         d->qp_y = sl->qp;
         d->qp_y_pred = sl->qp;
         d->qp_y_prev = sl->qp;
@@ -419,10 +435,6 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
      * --wpp --slices wpp, both apply and taking the second is wrong by
      * half a picture. */
     {
-        const int first_ts = d->rs_to_ts[sl->segment_address];
-        const bool starts_tile = pps->tiles_enabled
-            && (first_ts == 0
-                || d->tile_of_ts[first_ts - 1] != d->tile_of_ts[first_ts]);
         const bool starts_row = wpp
             && (sl->segment_address % sps->ctb_width) == 0;
 

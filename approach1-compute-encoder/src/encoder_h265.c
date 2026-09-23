@@ -1342,7 +1342,10 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
      * frame.
      */
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (ns > 1)
+    int max_t = omp_get_max_threads();
+    int slice_threads = (ns < max_t) ? ns : max_t;
+    if (slice_threads < 1) slice_threads = 1;
+#pragma omp parallel for schedule(static) num_threads(slice_threads) if (ns > 1 && slice_threads > 1)
 #endif
     for (int s = 0; s < ns; s++) {
         uint32_t r0 = (uint32_t)(((uint64_t)ctu_rows * (uint32_t)s) / (uint32_t)ns);

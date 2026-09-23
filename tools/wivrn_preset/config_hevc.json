@@ -1,0 +1,15 @@
+{
+  "scale": 1.0,
+  "bitrate": 200000000,
+  "codec": "hevc",
+  "encoders": [
+    {
+      "encoder": "vaapi",
+      "codec": "hevc"
+    }
+  ],
+  "foveation": {
+    "enable": true
+  },
+  "tcp_only": false
+}

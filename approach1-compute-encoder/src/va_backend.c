@@ -19,8 +19,8 @@
 #include <stdio.h>
 #include <errno.h>
 
-#define BC250_MAX_WIDTH 3840
-#define BC250_MAX_HEIGHT 2160
+#define BC250_MAX_WIDTH 4096
+#define BC250_MAX_HEIGHT 4096
 
 static bc250_driver_data* get_driver_data(VADriverContextP ctx) {
     return (bc250_driver_data*)ctx->pDriverData;
@@ -503,12 +503,21 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                                 unsigned int rc_attrib = data->configs[config_id].attribs[a].value;
                                 if (rc_attrib == VA_RC_CQP) {
                                     hevc_encoder_set_rc_mode(c->hevc_enc, RC_CQP);
-                                } else if (rc_attrib & VA_RC_VBR) {
-                                    hevc_encoder_set_rc_mode(c->hevc_enc, RC_VBR);
                                 } else if (rc_attrib & VA_RC_CBR) {
                                     hevc_encoder_set_rc_mode(c->hevc_enc, RC_LOW_LATENCY);
-                                } else if (rc_attrib & VA_RC_CQP) {
-                                    hevc_encoder_set_rc_mode(c->hevc_enc, RC_CQP);
+                                } else if (rc_attrib & VA_RC_VBR) {
+#if defined(__linux__)
+                                    if (program_invocation_short_name &&
+                                        (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+                                         strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+                                         strcmp(program_invocation_short_name, "wivrn") == 0)) {
+                                        hevc_encoder_set_rc_mode(c->hevc_enc, RC_LOW_LATENCY);
+                                    } else {
+                                        hevc_encoder_set_rc_mode(c->hevc_enc, RC_VBR);
+                                    }
+#else
+                                    hevc_encoder_set_rc_mode(c->hevc_enc, RC_VBR);
+#endif
                                 }
                                 break;
                             }
@@ -2057,8 +2066,13 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
         if (v > 0 && v <= 8) def_threads = v;
     }
 #if defined(__linux__)
-    else if (program_invocation_short_name && strcmp(program_invocation_short_name, "sunshine") == 0) {
-        def_threads = 2;
+    else if (program_invocation_short_name) {
+        if (strcmp(program_invocation_short_name, "sunshine") == 0) {
+            def_threads = 2;
+        } else if (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+                   strcmp(program_invocation_short_name, "wivrn") == 0) {
+            def_threads = 4;
+        }
     }
 #endif
     omp_set_num_threads(def_threads);
