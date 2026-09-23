@@ -1,8 +1,15 @@
-name: "CodeQL — security & quality"
+name: "CodeQL - security & quality"
 
 # Static analysis of the sources with the extended "security-and-quality"
 # query suite: security findings plus code quality. The same set-up as
-# MTSistemi/SkillFishOS.
+# MTSistemi/SkillFishOS, except that C is analysed from a real build.
+#
+# ⚠️ Why C is built and not read as it lies. With build-mode "none"
+# CodeQL sees neither the libva and Vulkan headers nor the macros the
+# per-bit-depth templates are compiled with, so it cannot type half the
+# expressions in the driver - and reported every call that touched one as
+# an argument "of type error". Some seventy alerts were that and nothing
+# else. Built, it analyses exactly what the compiler compiles.
 
 on:
   push:
@@ -21,14 +28,14 @@ permissions:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
           - language: c-cpp
-            build-mode: none
+            build-mode: manual
           - language: python
             build-mode: none
           - language: actions
@@ -37,12 +44,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Install build dependencies
+        if: matrix.language == 'c-cpp'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config \
+            libva-dev libdrm-dev libvulkan-dev glslang-tools \
+            "linux-headers-$(uname -r)"
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           queries: security-and-quality
+
+      # Everything that holds C: the driver and its tests, the off-board
+      # rate-control harness, the two decoder harnesses, and the audio
+      # kernel module. A file that is not compiled here is not analysed at
+      # all, so leaving one out would quietly close its alerts.
+      - name: Build
+        if: matrix.build-mode == 'manual'
+        run: |
+          cmake -S approach1-compute-encoder -B build \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_RC_BENCH=ON
+          cmake --build build --parallel "$(nproc)"
+          bash tools/build_hevcps.sh "$PWD/build/hevcps"
+          bash tools/build_h264dec.sh "$PWD/build/h264dec"
+          make -C "/lib/modules/$(uname -r)/build" M="$PWD/audio-fix" modules
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
