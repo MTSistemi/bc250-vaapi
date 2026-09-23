@@ -18,6 +18,7 @@
  * rqt_root_cbf is one without ever being coded. Reading those as zero
  * costs nothing at the time and desynchronises the slice later.
  */
+#include "bitreader.h"
 #include "hevc_dec_internal.h"
 
 #include <stdlib.h>
@@ -197,6 +198,70 @@ static void write_mode(hevcd_t *d, int x, int y, int side, int mode)
             if (px < d->min_pu_width && py < d->min_pu_height)
                 d->intra_mode[py * stride + px] = (uint8_t)mode;
         }
+}
+
+/* 7.3.8.7: a PCM coding unit. The samples are sent as they are, at
+ * their own bit depth, byte aligned, after the arithmetic codeword that
+ * carried pcm_flag - so they start where that codeword really ends, which
+ * is the same question the end of every wavefront substream asks, and
+ * h264d_cabac_byte_pos() already answers it. The arithmetic decoder then
+ * starts again on the first byte after them (9.3.2.5).
+ *
+ * ⚠️ Returns false when the samples would run past the end of the slice:
+ * the caller ends the slice there rather than reading garbage. */
+static bool read_pcm(hevcd_t *d, int x0, int y0, int log2_size)
+{
+    hevcd_cabac_t *c = &d->cabac;
+    const hevc_sps_t *sps = d->sps;
+    const int side = 1 << log2_size;
+    const int bl = sps->pcm_bit_depth_luma, bc = sps->pcm_bit_depth_chroma;
+    const int dl = sps->bit_depth_luma, dc = sps->bit_depth_chroma;
+
+    const uint8_t *p = c->start + h264d_cabac_byte_pos(c);
+    if (p > c->end) return false;
+    const size_t left = (size_t)(c->end - p);
+    const size_t bits = (size_t)side * side * bl
+                        + 2 * (size_t)(side / 2) * (side / 2) * bc;
+    const size_t bytes = (bits + 7) / 8;
+    if (bytes > left) return false;
+
+    br_t br;
+    br_init(&br, p, bytes);
+    for (int y = 0; y < side; y++)
+        for (int x = 0; x < side; x++) {
+            const int v = (int)br_read(&br, bl) << (dl - bl);
+            const size_t at = (size_t)(y0 + y) * d->stride[0] + x0 + x;
+            if (dl > 8) ((uint16_t *)d->plane[0])[at] = (uint16_t)v;
+            else d->plane[0][at] = (uint8_t)v;
+        }
+    for (int k = 1; k < 3; k++)
+        for (int y = 0; y < side / 2; y++)
+            for (int x = 0; x < side / 2; x++) {
+                const int v = (int)br_read(&br, bc) << (dc - bc);
+                const size_t at = (size_t)(y0 / 2 + y) * d->stride[k]
+                                  + x0 / 2 + x;
+                if (dc > 8) ((uint16_t *)d->plane[k])[at] = (uint16_t)v;
+                else d->plane[k][at] = (uint8_t)v;
+            }
+
+    h264d_cabac_init_engine(c, p + bytes, left - bytes);
+
+    /* 8.4.2: a neighbour that is PCM offers DC as its candidate mode. */
+    write_mode(d, x0, y0, side, HEVCD_INTRA_DC);
+
+    /* 8.7.2 and 8.7.3: with pcm_loop_filter_disabled_flag the samples
+     * stay exactly as sent, the same treatment as a lossless unit. */
+    if (sps->pcm_loop_filter_disabled && d->no_filter) {
+        const int n = side >> sps->log2_min_cb;
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < n; i++) {
+                const int px = (x0 >> sps->log2_min_cb) + i;
+                const int py = (y0 >> sps->log2_min_cb) + j;
+                if (px < sps->min_cb_width && py < sps->min_cb_height)
+                    d->no_filter[py * sps->min_cb_width + px] = 1;
+            }
+    }
+    return true;
 }
 
 /* Table 8-3: the chroma mode, from an index and the luma mode beside it. */
@@ -705,7 +770,23 @@ static void reconstruct_tb(hevcd_t *d, int c_idx, int x, int y,
         return;
     }
 
-    hevcd_dequantize(d->coeff, log2_size, block_qp(d, c_idx), bd);
+    /* 8.6.4.2: the matrix for the block's size, prediction mode and
+     * component. ⚠️ Not for a transform-skipped block above 4x4, as the
+     * later editions of the standard and every reference decoder have it.
+     * The 32x32 lists exist for luma only. */
+    const uint8_t *m = NULL;
+    if (d->scaling_on && !(d->transform_skip && log2_size > 2)) {
+        const int mat = (d->cu.pred_mode == HEVCD_MODE_INTRA ? 0 : 3)
+                        + (log2_size == 5 ? 0 : c_idx);
+        m = log2_size == 2 ? d->sf4[mat]
+          : log2_size == 3 ? d->sf8[mat]
+          : log2_size == 4 ? d->sf16[mat] : d->sf32[mat];
+    }
+    if (m)
+        hevcd_dequantize_scaled(d->coeff, log2_size, block_qp(d, c_idx),
+                                bd, m);
+    else
+        hevcd_dequantize(d->coeff, log2_size, block_qp(d, c_idx), bd);
     if (d->transform_skip)
         hevcd_skip_transform(d->coeff, log2_size, bd);
     else
@@ -887,11 +968,9 @@ static void read_cu(hevcd_t *d, int x0, int y0, int log2_size)
     if (sps->pcm_enabled && d->cu.part_mode == HEVCD_PART_2Nx2N
         && log2_size >= sps->log2_min_pcm_cb
         && log2_size <= sps->log2_max_pcm_cb) {
-        /* pcm_flag is coded as a terminating bin. Refused rather than
-         * decoded: the samples that follow are raw and byte aligned, and
-         * nothing here restarts the arithmetic decoder afterwards. */
+        /* pcm_flag, coded as a terminating bin. */
         if (hevcd_terminate(c)) {
-            d->slice_end = true;
+            if (!read_pcm(d, x0, y0, log2_size)) d->slice_end = true;
             return;
         }
     }

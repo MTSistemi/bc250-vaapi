@@ -35,6 +35,12 @@ void hevc_decoder_destroy(hevc_decoder_t *d);
 void hevc_decoder_set_references(hevc_decoder_t *d, const uintptr_t *id,
                                  const int *poc, int n);
 
+/* Find a reference image in the decoder DPB matching surface id and/or poc. */
+const void *hevc_decoder_find_ref(const hevc_decoder_t *d, uintptr_t id, int poc);
+
+/* Find the closest valid image in the decoder DPB by POC (for frame drop concealment). */
+const void *hevc_decoder_find_closest(const hevc_decoder_t *d, int poc);
+
 /* A new picture. Returns 0, or non-zero when the buffer is full. */
 int hevc_decoder_begin_picture(hevc_decoder_t *d, const hevc_sps_t *sps,
                                const hevc_pps_t *pps, uintptr_t id, int poc);
@@ -46,6 +52,11 @@ int hevc_decoder_slice(hevc_decoder_t *d, const hevc_slice_t *sl,
 
 /* Let go of everything the reference picture set no longer names. */
 void hevc_decoder_unescape(hevc_decoder_t *d, const hevc_slice_t *sl);
+
+/* Whether the picture a caller named `id` is still held as a reference.
+ * The output process needs it: a picture that has been output but is
+ * still referenced still takes a place in the buffer. */
+bool hevc_decoder_holds(const hevc_decoder_t *d, uintptr_t id);
 
 /* The loop filters, which are defined over the whole picture and so can
  * only run once every slice of it is in. */

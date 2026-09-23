@@ -994,9 +994,12 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             }
         }
 
-        uint32_t threshold = 96 * (1 + (enc->qp / 8));
-        if (enc->quality_level >= 4) {
-            threshold = threshold * 2;
+        /* Skip threshold scaled with QP and rate-distortion trade-off.
+         * Residuals smaller than the quantizer step size are rounded to zero by DCT/quant,
+         * so skipping them saves CABAC intra mode + coefficient bits without visual loss. */
+        uint32_t threshold = 128 * (2 + (enc->qp / 4));
+        if (enc->quality_level >= 5) {
+            threshold = threshold * 3 / 2;
         }
         static int s_skip_override = -2;
         if (s_skip_override == -2) {
@@ -1069,7 +1072,9 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
         int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
         uint8_t pred[16];
         int mode;
-        if (enc->quality_level >= 4) {
+        /* Quality levels 1..6 use full directional intra prediction (Planar, DC, Horizontal, Vertical)
+         * to preserve edges and textures. Level 7 (ultra-fast speed preset) uses DC fallback. */
+        if (enc->quality_level >= 7) {
             mode = HEVC_MODE_DC;
             hevc_predict_4x4(enc->recon_y, cw, cw, ch, px, py, mode, 1, y_min, pred);
         } else {

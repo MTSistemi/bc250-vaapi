@@ -194,6 +194,8 @@ struct bc250_context {
     struct {
         VAPictureParameterBufferHEVC pic;
         int has_pic;
+        VAIQMatrixBufferHEVC iq;      /* when the stream uses matrices */
+        int has_iq;
         struct bc250_hevc_dec_slice {
             VASliceParameterBufferHEVC p;
             size_t off;               /* into `data`; (size_t)-1 = no data yet */

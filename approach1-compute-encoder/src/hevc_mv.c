@@ -173,12 +173,18 @@ static bool take_col(const hevcd_t *d, const hevcd_mvf_t *col,
 
     if (r < 0 || r >= L->n_list[list_col]) return false;
 
+    /* ⚠️ A long-term reference on one side and a short-term one on the
+     * other is no candidate at all, and a long-term one is never scaled:
+     * its distance in picture order counts means nothing about motion. */
+    const bool lt_now = d->ref_is_lt[list_idx][ref_idx];
+    if ((L->is_lt[list_col][r] != 0) != lt_now) return false;
+
     const int diff_col = c->poc - L->poc_list[list_col][r];
     const int diff_ora = d->current->poc - d->ref_pic[list_idx][ref_idx]->poc;
 
     out[0] = col->mv[list_col][0];
     out[1] = col->mv[list_col][1];
-    if (diff_col != diff_ora && diff_col)
+    if (!lt_now && diff_col != diff_ora && diff_col)
         scale_of(out, diff_col, diff_ora);
     return true;
 }
@@ -419,12 +425,17 @@ static bool scaled(const hevcd_t *d, int x, int y, int l, int list_idx, int ref,
 {
     const hevcd_mvf_t *m = field(d, x, y);
     if (!(m->pred_flag & (1 << l))) return false;
+    /* ⚠️ 8.5.3.2.7: the neighbour counts only if its reference and
+     * ours are both long-term or both short-term, and only two short-term
+     * ones are scaled. */
+    const bool lt_self = d->ref_is_lt[list_idx][ref];
+    if (d->ref_is_lt[l][m->ref_idx[l]] != lt_self) return false;
     out[0] = m->mv[l][0];
     out[1] = m->mv[l][1];
 
     const int poc_neighbour = d->ref_pic[l][m->ref_idx[l]]->poc;
     const int poc_self = d->ref_pic[list_idx][ref]->poc;
-    if (poc_neighbour != poc_self) {
+    if (!lt_self && poc_neighbour != poc_self) {
         int diff = d->current->poc - poc_neighbour;
         if (!diff) diff = 1;
         scale_of(out, diff, d->current->poc - poc_self);

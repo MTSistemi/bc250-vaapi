@@ -36,6 +36,17 @@ fi
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
+# ⚠️ The archive's own digest, as a fallback and only as a fallback. A
+# mismatch there proves nothing (see above), but an exact match of the
+# whole output can only mean the same bytes - and it is what lets a
+# stream ffmpeg itself cannot take be checked at all. VPSSPSPPS_A sends a
+# PPS before the SPS it names, which is legal, and ffmpeg rejects the PPS.
+published_md5_matches() {
+    local sum
+    sum=$(md5sum "$2" | cut -d' ' -f1)
+    grep -rqsi --include='*md5*' "$sum" "$1"
+}
+
 ok=0
 refused=0
 wrong=0
@@ -75,6 +86,10 @@ for z in "$ZIPS"/*.zip; do
 
     if cmp -s "$T/ref.yuv" "$T/ours.yuv"; then
         printf '  %-34s identical\n' "$name"
+        ok=$((ok + 1))
+    elif published_md5_matches "$T/x" "$T/ours.yuv"; then
+        printf '  %-34s identical to the published digest; ffmpeg is not\n' \
+               "$name"
         ok=$((ok + 1))
     else
         detail=$(python3 - "$T/ref.yuv" "$T/ours.yuv" <<'PY'

@@ -50,22 +50,77 @@ static int read_ptl(br_t *br, int max_sub_layers_minus1)
 
 /* ------------------------------------------------------------ scaling lists */
 
-/* Clause 7.3.4. Read to be consumed, not kept: a stream that carries its
- * own quantisation matrices is refused by the caller, and reading them
- * here is what lets the caller see the rest of the parameter set before it
- * does so. */
-static int skip_scaling_list(br_t *br)
+/* Table 7-6: the default 8x8 lists, in the order they are sent. Intra
+ * and inter differ because an inter residual is noisier at the high
+ * frequencies and can afford to lose more of them. The 4x4 default is
+ * flat, and the 16x16 and 32x32 ones are these, upsampled. */
+static const uint8_t default_intra[64] = {
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 16, 17, 16, 17, 18,
+    17, 18, 18, 17, 18, 21, 19, 20, 21, 20, 19, 21, 24, 22, 22, 24,
+    24, 22, 22, 24, 25, 25, 27, 30, 27, 25, 25, 29, 31, 35, 35, 31,
+    29, 36, 41, 44, 41, 36, 47, 54, 54, 47, 65, 70, 65, 88, 88, 115,
+};
+static const uint8_t default_inter[64] = {
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18,
+    18, 18, 18, 18, 18, 20, 20, 20, 20, 20, 20, 20, 24, 24, 24, 24,
+    24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 28, 28, 28, 28, 28,
+    28, 33, 33, 33, 33, 33, 41, 41, 41, 41, 54, 54, 54, 71, 71, 91,
+};
+
+static void default_list(hevc_scaling_t *s, int size, int mat)
 {
+    if (size == 0)
+        memset(s->list[0][mat], 16, 64);
+    else
+        memcpy(s->list[size][mat], mat < 3 ? default_intra : default_inter, 64);
+    s->dc[size][mat] = 16;
+}
+
+void hevc_scaling_defaults(hevc_scaling_t *s)
+{
+    for (int size = 0; size < 4; size++)
+        for (int mat = 0; mat < 6; mat++)
+            default_list(s, size, mat);
+}
+
+/* Clause 7.3.4. Each list is sent outright, or copied from an earlier one
+ * of the same size - where a distance of zero means the default.
+ *
+ * ⚠️ At 32x32 there are only two lists and the distance counts in steps
+ * of three, because they sit at matrixId 0 and 3. The DC value is copied
+ * along with the list, 7.4.5. */
+static int read_scaling_list(br_t *br, hevc_scaling_t *s)
+{
+    hevc_scaling_defaults(s);
     for (int size = 0; size < 4; size++) {
-        for (int mat = 0; mat < 6; mat += (size == 3) ? 3 : 1) {
-            if (!br_read1(br)) {
-                br_read_ue(br);           /* pred_matrix_id_delta */
+        const int step = (size == 3) ? 3 : 1;
+        const int count = (size == 0) ? 16 : 64;
+        for (int mat = 0; mat < 6; mat += step) {
+            if (!br_read1(br)) {                 /* pred_mode_flag */
+                const int delta = (int)br_read_ue(br);
+                const int ref = mat - delta * step;
+                if (ref < 0) return PS_NONSENSE;
+                if (!delta) {
+                    default_list(s, size, mat);
+                } else {
+                    memcpy(s->list[size][mat], s->list[size][ref], 64);
+                    s->dc[size][mat] = s->dc[size][ref];
+                }
                 continue;
             }
-            const int count = (size == 0) ? 16 : 64;
-            if (size > 1) br_read_se(br); /* dc_coef_minus8 */
-            for (int i = 0; i < count; i++)
-                br_read_se(br);           /* delta_coef */
+            int next = 8;
+            if (size > 1) {
+                const int dc = br_read_se(br) + 8;
+                if (dc < 1 || dc > 255) return PS_NONSENSE;
+                s->dc[size][mat] = (uint8_t)dc;
+                next = dc;
+            }
+            for (int i = 0; i < count; i++) {
+                next = (next + br_read_se(br) + 256) % 256;
+                if (!next) return PS_NONSENSE;   /* 7.4.5: greater than 0 */
+                s->list[size][mat][i] = (uint8_t)next;
+            }
+            if (size < 2) s->dc[size][mat] = s->list[size][mat][0];
         }
     }
     return br_overrun(br) ? PS_TRUNCATED : PS_OK;
@@ -239,7 +294,7 @@ int hevc_ps_read_sps(hevc_sps_t *out, const uint8_t *rbsp, size_t n)
     for (int i = per_sub_layer ? 0 : max_sub; i <= max_sub; i++) {
         s.max_dec_pic_buffering = (int)br_read_ue(&br) + 1;
         s.num_reorder_pics = (int)br_read_ue(&br);
-        br_read_ue(&br);                    /* max_latency_increase_plus1 */
+        s.max_latency_increase_plus1 = (int)br_read_ue(&br);
     }
 
     s.log2_min_cb = 3 + (int)br_read_ue(&br);
@@ -254,9 +309,12 @@ int hevc_ps_read_sps(hevc_sps_t *out, const uint8_t *rbsp, size_t n)
 
     s.scaling_list_enabled = br_read1(&br) != 0;
     if (s.scaling_list_enabled) {
+        /* ⚠️ Enabled and not sent means the DEFAULTS, which are not
+         * flat above 4x4. */
+        hevc_scaling_defaults(&s.scaling);
         s.sps_scaling_list_present = br_read1(&br) != 0;
         if (s.sps_scaling_list_present) {
-            const int e = skip_scaling_list(&br);
+            const int e = read_scaling_list(&br, &s.scaling);
             if (e) return e;
         }
     }
@@ -283,9 +341,11 @@ int hevc_ps_read_sps(hevc_sps_t *out, const uint8_t *rbsp, size_t n)
     s.long_term_ref_pics_present = br_read1(&br) != 0;
     if (s.long_term_ref_pics_present) {
         s.num_long_term_sps = (int)br_read_ue(&br);
+        if (s.num_long_term_sps > 32) return PS_NONSENSE;
         for (int i = 0; i < s.num_long_term_sps; i++) {
-            br_skip(&br, s.log2_max_poc_lsb);   /* lt_ref_pic_poc_lsb_sps */
-            br_read1(&br);                      /* used_by_curr_pic_lt_sps */
+            s.lt_ref_pic_poc_lsb_sps[i] =
+                (int)br_read(&br, s.log2_max_poc_lsb);
+            s.used_by_curr_pic_lt_sps[i] = br_read1(&br) != 0;
         }
     }
 
@@ -386,7 +446,7 @@ int hevc_ps_read_pps(hevc_pps_t *out, const uint8_t *rbsp, size_t n)
 
     p.pps_scaling_list_present = br_read1(&br) != 0;
     if (p.pps_scaling_list_present) {
-        const int e = skip_scaling_list(&br);
+        const int e = read_scaling_list(&br, &p.scaling);
         if (e) return e;
     }
 
@@ -513,11 +573,19 @@ int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
 
     if (!hevc_nal_e_idr(nal_type)) {
         s.poc_lsb = (int)br_read(&br, sps->log2_max_poc_lsb);
+        s.log2_max_poc_lsb = sps->log2_max_poc_lsb;
         s.short_term_ref_pic_set_sps_flag = br_read1(&br) != 0;
         if (!s.short_term_ref_pic_set_sps_flag) {
-            const int e = read_st_rps(&br, &s.st_rps, sps->st_rps,
-                                       sps->num_st_rps, sps->num_st_rps);
-            if (e) return e;
+            if (sps->st_rps_bits > 0) {
+                /* ⚠️ Stepped over, not read: an inline set may predict
+                 * from the SPS's own sets, which this caller could not
+                 * provide - and it does not need the contents. */
+                br_skip(&br, sps->st_rps_bits);
+            } else {
+                const int e = read_st_rps(&br, &s.st_rps, sps->st_rps,
+                                           sps->num_st_rps, sps->num_st_rps);
+                if (e) return e;
+            }
         } else if (sps->num_st_rps > 1) {
             int bit = 0;
             while ((1 << bit) < sps->num_st_rps) bit++;
@@ -529,8 +597,40 @@ int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
             s.st_rps = sps->st_rps[0];
         }
 
-        if (sps->long_term_ref_pics_present)
-            return PS_UNSUPPORTED;   /* long-term references */
+        /* ⚠️ HM sets long_term_ref_pics_present_flag in the SPS even
+         * for streams that never name a long-term picture. Declining on
+         * the flag declined every one of them. */
+        if (sps->long_term_ref_pics_present) {
+            int n_sps = 0;
+            if (sps->num_long_term_sps > 0)
+                n_sps = (int)br_read_ue(&br);
+            const int n_pics = (int)br_read_ue(&br);
+            if (n_sps > sps->num_long_term_sps || n_sps + n_pics > 32)
+                return PS_NONSENSE;
+            s.num_lt = n_sps + n_pics;
+            int bits = 0;
+            while ((1 << bits) < sps->num_long_term_sps) bits++;
+            int cycle = 0;
+            for (int i = 0; i < s.num_lt; i++) {
+                if (i < n_sps) {
+                    const int idx = bits ? (int)br_read(&br, bits) : 0;
+                    if (idx >= sps->num_long_term_sps) return PS_NONSENSE;
+                    s.lt_poc_lsb[i] = sps->lt_ref_pic_poc_lsb_sps[idx];
+                    s.lt_used[i] = sps->used_by_curr_pic_lt_sps[idx];
+                } else {
+                    s.lt_poc_lsb[i] = (int)br_read(&br, sps->log2_max_poc_lsb);
+                    s.lt_used[i] = br_read1(&br) != 0;
+                }
+                s.lt_msb_present[i] = br_read1(&br) != 0;
+                const int delta = s.lt_msb_present[i]
+                                  ? (int)br_read_ue(&br) : 0;
+                /* 7-52: the cycles accumulate, except at the first entry
+                 * and at the first one sent in the header rather than
+                 * taken from the SPS - each group starts over. */
+                cycle = (i == 0 || i == n_sps) ? delta : delta + cycle;
+                s.lt_msb_cycle[i] = cycle;
+            }
+        }
 
         if (sps->temporal_mvp_enabled)
             s.temporal_mvp_enabled = br_read1(&br) != 0;
@@ -562,8 +662,24 @@ int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
             int count = 0;
             for (int i = 0; i < s.st_rps.num_negative + s.st_rps.num_positive; i++)
                 if (s.st_rps.used[i]) count++;
-            if (count > 1)
-                return PS_UNSUPPORTED;    /* reference list modification */
+            for (int i = 0; i < s.num_lt; i++)
+                if (s.lt_used[i]) count++;
+            if (pps->num_pic_total_curr > 0)
+                count = pps->num_pic_total_curr;
+            if (count > 1) {
+                /* 7.3.6.2: list one only for a B slice, and each entry
+                 * Ceil(Log2(NumPicTotalCurr)) bits wide. */
+                int bits = 0;
+                while ((1 << bits) < count) bits++;
+                for (int l = 0; l < (s.type == 0 ? 2 : 1); l++) {
+                    s.list_mod[l] = br_read1(&br) != 0;
+                    if (!s.list_mod[l]) continue;
+                    for (int i = 0; i < s.num_ref_idx[l]; i++) {
+                        s.list_entry[l][i] = (int)br_read(&br, bits);
+                        if (s.list_entry[l][i] >= count) return PS_NONSENSE;
+                    }
+                }
+            }
         }
 
         if (s.type == 0)

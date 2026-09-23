@@ -84,6 +84,9 @@ typedef struct {
     struct hevcd_img_lists {
         int poc_list[2][16];
         int n_list[2];
+        /* 8.5.3.2.8 asks whether the collocated block's reference was
+         * long-term when THAT picture was decoded. */
+        uint8_t is_lt[2][16];
     } *lists;
     size_t n_lists;
     int32_t *slice_of_ctb;      /* a copy, taken when the picture ends */
@@ -248,8 +251,16 @@ typedef struct {
     int n_buf;
     hevcd_img_t *current;
     hevcd_mvf_t *mvf;
+    /* 7.4.5: the quantisation matrices of the current picture, expanded
+     * to one factor per position in each block's raster order, by
+     * [matrixId]: intra 0-2 and inter 3-5, one per colour component.
+     * scaling_on is scaling_list_enabled_flag. */
+    bool scaling_on;
+    uint8_t sf4[6][16], sf8[6][64], sf16[6][256], sf32[6][1024];
+
     const hevcd_img_t *ref_pic[2][16];
     int n_refs[2];
+    bool ref_is_lt[2][16];          /* taken from the long-term set */
     const hevcd_img_t *col;         /* the collocated picture, or NULL */
 
     int ctb_addr;                   /* in the picture's raster order */
@@ -298,6 +309,8 @@ void hevcd_predict_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
 
 /* 8.6.2 to 8.6.4: the coefficients into a residual, and onto the picture. */
 void hevcd_dequantize(int16_t *coeff, int log2_size, int qp, int bd);
+void hevcd_dequantize_scaled(int16_t *coeff, int log2_size, int qp, int bd,
+                             const uint8_t *m);
 void hevcd_transform(int16_t *coeff, int log2_size, bool dst, int bd);
 void hevcd_skip_transform(int16_t *coeff, int log2_size, int bd);
 void hevcd_add(uint8_t *plane, int stride, int x, int y,

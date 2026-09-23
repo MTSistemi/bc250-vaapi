@@ -107,28 +107,133 @@ static bool check_group(const int *poc, int count)
 
 
 
-/* Pictures wait here until the stream ends, because the order they come
- * out in is not the order they were decoded in. */
+/* The decoded picture buffer as the output process sees it, C.5.2.
+ *
+ * ⚠️ Not "sort everything by picture order count at the end". Which
+ * pictures come out at all depends on WHEN they come out: an IRAP that
+ * says no_output_of_prior_pics throws away whatever is still waiting, so
+ * the output has to happen at the moments the standard names - the
+ * smallest count is bumped out whenever more are waiting than the
+ * sequence allows, or the buffer is full. */
 typedef struct {
-    long order;
+    uintptr_t id;          /* the decoder's name for it */
+    int poc;
+    bool needed;           /* "needed for output" */
+    int latency;           /* PicLatencyCount */
     uint8_t *data;
     size_t n;
 } frame_t;
 
-static frame_t *output_order;
-static int n_output, cap_output;
+#define DPB_OUT 64
+static frame_t dpb_out[DPB_OUT];
+static int n_dpb;
 
-static int compare_order(const void *a, const void *b)
+static int count_needed(void)
 {
-    const long x = ((const frame_t *)a)->order;
-    const long y = ((const frame_t *)b)->order;
-    return x < y ? -1 : (x > y ? 1 : 0);
+    int n = 0;
+    for (int i = 0; i < n_dpb; i++) n += dpb_out[i].needed;
+    return n;
+}
+
+/* C.5.2.4: out goes the waiting picture with the smallest count. */
+static void bump(FILE *f)
+{
+    int k = -1;
+    for (int i = 0; i < n_dpb; i++)
+        if (dpb_out[i].needed && (k < 0 || dpb_out[i].poc < dpb_out[k].poc))
+            k = i;
+    if (k < 0) return;
+    if (f) fwrite(dpb_out[k].data, 1, dpb_out[k].n, f);
+    dpb_out[k].needed = false;
+}
+
+/* What is neither waiting to come out nor still a reference is gone. */
+static void prune(const hevc_decoder_t *dc)
+{
+    int j = 0;
+    for (int i = 0; i < n_dpb; i++) {
+        if (!dpb_out[i].needed && !hevc_decoder_holds(dc, dpb_out[i].id)) {
+            free(dpb_out[i].data);
+            continue;
+        }
+        dpb_out[j++] = dpb_out[i];
+    }
+    n_dpb = j;
+}
+
+static void empty_dpb(void)
+{
+    for (int i = 0; i < n_dpb; i++) free(dpb_out[i].data);
+    n_dpb = 0;
+}
+
+/* SpsMaxLatencyPictures, when the sequence sets one. */
+static bool too_late(const hevc_sps_t *sps)
+{
+    if (!sps->max_latency_increase_plus1) return false;
+    const int limit = sps->num_reorder_pics
+                      + sps->max_latency_increase_plus1 - 1;
+    for (int i = 0; i < n_dpb; i++)
+        if (dpb_out[i].needed && dpb_out[i].latency >= limit) return true;
+    return false;
+}
+
+/* C.5.2.2, before a picture is decoded and after its reference picture
+ * set has been applied.
+ *
+ * ⚠️ An IRAP that restarts the sequence ends the old one here: every
+ * picture still waiting comes out first, unless NoOutputOfPriorPicsFlag
+ * says to drop them - and for a CRA it always says so, whatever the
+ * slice header carries. */
+static void before_picture(FILE *f, const hevc_decoder_t *dc,
+                           const hevc_sps_t *sps, bool restart,
+                           bool no_output_prior)
+{
+    if (restart) {
+        if (!no_output_prior)
+            while (count_needed()) bump(f);
+        empty_dpb();
+        return;
+    }
+    prune(dc);
+    while (count_needed() > 0
+           && (count_needed() > sps->num_reorder_pics || too_late(sps)
+               || n_dpb >= sps->max_dec_pic_buffering)) {
+        bump(f);
+        prune(dc);
+    }
+}
+
+/* C.5.2.3, once the picture is decoded: into the buffer, and out again
+ * whatever that pushes past the reorder limit. */
+static void after_picture(FILE *f, const hevc_sps_t *sps, uintptr_t id,
+                          int poc, bool output, uint8_t *data, size_t n)
+{
+    for (int i = 0; i < n_dpb; i++)
+        if (dpb_out[i].needed) dpb_out[i].latency++;
+    /* A conforming stream never holds more than sixteen; this is only so
+     * that one that does cannot write past the array. */
+    if (n_dpb >= DPB_OUT) {
+        fprintf(stderr, "output buffer full, picture %d dropped\n", poc);
+        free(data);
+    } else {
+        dpb_out[n_dpb].id = id;
+        dpb_out[n_dpb].poc = poc;
+        dpb_out[n_dpb].needed = output;
+        dpb_out[n_dpb].latency = 0;
+        dpb_out[n_dpb].data = data;
+        dpb_out[n_dpb].n = n;
+        n_dpb++;
+    }
+    while (count_needed() > sps->num_reorder_pics || too_late(sps))
+        bump(f);
 }
 
 /* Cropped on the way out: the coded picture is a whole number of smallest
  * coding blocks and the visible one is not. */
 static void write_picture(FILE *f, hevc_decoder_t *dc,
-                            const hevc_sps_t *sps, long order)
+                            const hevc_sps_t *sps, uintptr_t id, int poc,
+                            bool output)
 {
     int stride[3];
     const uint8_t *plane[3];
@@ -150,13 +255,6 @@ static void write_picture(FILE *f, hevc_decoder_t *dc,
     const size_t bytes = sps->bit_depth_luma > 8 ? 2 : 1;
     const size_t n = ((size_t)w * h + 2 * (size_t)(w / 2) * (h / 2)) * bytes;
 
-    if (n_output == cap_output) {
-        const int new_one = cap_output ? cap_output * 2 : 32;
-        frame_t *p = realloc(output_order, (size_t)new_one * sizeof *p);
-        if (!p) return;
-        output_order = p;
-        cap_output = new_one;
-    }
     uint8_t *data = malloc(n);
     if (!data) return;
 
@@ -176,26 +274,14 @@ static void write_picture(FILE *f, hevc_decoder_t *dc,
             o += (size_t)(w / 2) * bytes;
         }
 
-    output_order[n_output].order = order;
-    output_order[n_output].data = data;
-    output_order[n_output].n = n;
-    n_output++;
+    after_picture(f, sps, id, poc, output, data, n);
 }
 
-/* Display order at last: sorted by picture order count, and by which
- * instantaneous refresh they belong to, since the count restarts at every
- * one of those. */
+/* The end of the stream is one more place everything comes out. */
 static void drain_output(FILE *f)
 {
-    if (output_order) qsort(output_order, (size_t)n_output,
-                             sizeof *output_order, compare_order);
-    for (int i = 0; i < n_output; i++) {
-        if (f) fwrite(output_order[i].data, 1, output_order[i].n, f);
-        free(output_order[i].data);
-    }
-    free(output_order);
-    output_order = NULL;
-    n_output = cap_output = 0;
+    while (count_needed()) bump(f);
+    empty_dpb();
 }
 
 
@@ -268,9 +354,21 @@ int main(int argc, char **argv)
     hevc_pps_t *pps = calloc(64, sizeof(hevc_pps_t));
     if (!sps || !pps) return 2;
 
-    /* Clause 8.3.1, the picture order count: only its low bits are sent. */
+    /* Clause 8.3.1, the picture order count: only its low bits are sent,
+     * and the high ones come from prevTid0Pic.
+     *
+     * ⚠️ prevTid0Pic is the previous picture of temporal layer zero that
+     * is not a leading picture and not a sub-layer non-reference one - NOT
+     * simply the picture before. A stream whose layers climb and fall
+     * across a wrap of the low bits gets a different count otherwise. */
     int prev_poc_lsb = 0, prev_poc_msb = 0;
     int pictures = 0, total_slices = 0, refused = 0;
+    /* 8.1.3: whether the IRAP most recently seen restarts the sequence,
+     * which is what decides whether its skipped leading pictures (RASL)
+     * are decoded at all. The first picture of the stream and the first
+     * after an end of sequence do; so does every IDR and BLA. */
+    bool after_eos = false, no_rasl = false;
+    int rasl_dropped = 0;
     int slices_of_this = 0;
 
     /* The picture order counts seen since the last IDR. They must come out
@@ -286,7 +384,14 @@ int main(int argc, char **argv)
     FILE *fo = output ? fopen(output, "wb") : NULL;
     if (output && !fo) { perror(output); return 2; }
     bool picture_open = false;
-    long base_order = 0, next_order = 0, current_order = 0;
+    /* The picture being decoded, as the output process will want it.
+     * ⚠️ Its OWN parameter set, copied: the next picture may bring a new
+     * SPS under the same id with another size or cropping window, and
+     * this one still has to be written out with the old one. */
+    static hevc_sps_t cur_sps;
+    uintptr_t cur_id = 0;
+    int cur_poc = 0;
+    bool cur_output = true;
 
     for (long i = 0; i + 3 < len; ) {
         /* Find the start code, then the next one. */
@@ -353,6 +458,9 @@ int main(int argc, char **argv)
                        p.deblocking_filter_disabled ? "no" : "si",
                        p.num_ref_idx_default[0], p.num_ref_idx_default[1],
                        p.log2_parallel_merge_level);
+        } else if (kind == HEVC_NAL_EOS) {
+            /* The picture after an end of sequence restarts it, 8.1.3. */
+            after_eos = true;
         } else if (hevc_nal_e_slice(kind)) {
             hevc_slice_t s;
             const int r = hevc_ps_read_slice(&s, rbsp, n, kind, sps, pps);
@@ -361,20 +469,50 @@ int main(int argc, char **argv)
                 refused++;
                 continue;
             }
+            const int tid = (buf[start + 1] & 7) - 1;
+            const bool irap = hevc_nal_e_irap(kind);
+            const bool rasl = kind == HEVC_NAL_RASL_N || kind == HEVC_NAL_RASL_R;
+            const bool radl = kind == HEVC_NAL_RADL_N || kind == HEVC_NAL_RADL_R;
+            /* Sub-layer non-reference: the even types below the IRAPs. */
+            const bool slnr = kind <= 14 && !(kind & 1);
+
+            /* 8.1.3, once per picture. */
+            if (s.first_slice_in_pic && irap) {
+                no_rasl = hevc_nal_e_idr(kind)
+                          || (kind >= HEVC_NAL_BLA_W_LP
+                              && kind <= HEVC_NAL_BLA_N_LP)
+                          || pictures == 0 || after_eos;
+            }
+            /* ⚠️ The leading pictures of an IRAP that restarts the sequence
+             * reference pictures that were never decoded - before the start
+             * of the stream, or before the splice. They are not decoded and
+             * not output; decoding them anyway reads whatever is in the
+             * buffer and writes garbage out. */
+            if (rasl && no_rasl) {
+                if (s.first_slice_in_pic) rasl_dropped++;
+                continue;
+            }
+            s.no_rasl_output_flag = irap && no_rasl;
+
             if (s.first_slice_in_pic) {
                 if (pictures && !quiet)
                     printf("     (%d slice)\n", slices_of_this);
                 slices_of_this = 0;
                 pictures++;
 
-                /* 8.3.1. An IRAP that starts the sequence resets it. */
-                if (hevc_nal_e_idr(kind)) {
-                    /* An IDR ends one group and starts the next. */
-                    if (!check_group(poc_seen, n_seen)) broken_groups++;
-                    n_seen = 0;
-                    s.poc = 0;
-                    prev_poc_lsb = 0;
-                    prev_poc_msb = 0;
+                /* 8.3.1. An IRAP that restarts the sequence keeps only
+                 * the low bits it sent: the high ones are zero. */
+                if (irap && no_rasl) {
+                    if (hevc_nal_e_idr(kind)) {
+                        /* An IDR ends one group and starts the next. */
+                        if (!check_group(poc_seen, n_seen)) broken_groups++;
+                        n_seen = 0;
+                    }
+                    s.poc = s.poc_lsb;           /* zero for an IDR */
+                    if (tid == 0) {
+                        prev_poc_lsb = s.poc_lsb;
+                        prev_poc_msb = 0;
+                    }
                 } else {
                     const hevc_sps_t *sp = &sps[pps[s.pps_id].sps_id];
                     const int max = 1 << sp->log2_max_poc_lsb;
@@ -388,9 +526,12 @@ int main(int argc, char **argv)
                     else
                         msb = prev_poc_msb;
                     s.poc = msb + s.poc_lsb;
-                    prev_poc_lsb = s.poc_lsb;
-                    prev_poc_msb = msb;
+                    if (tid == 0 && !rasl && !radl && !slnr) {
+                        prev_poc_lsb = s.poc_lsb;
+                        prev_poc_msb = msb;
+                    }
                 }
+                after_eos = false;
 
                 if (n_seen < 4096) poc_seen[n_seen++] = s.poc;
 
@@ -420,28 +561,34 @@ int main(int argc, char **argv)
                     s.data_bit_offset >> 3);
                 if (s.first_slice_in_pic) {
                     if (picture_open) {
-                        write_picture(fo, dec, sp, current_order);
+                        write_picture(fo, dec, &cur_sps, cur_id, cur_poc,
+                                      cur_output);
                         picture_open = false;
                     }
-                    if (s.nal_type == HEVC_NAL_IDR_W_RADL
-                        || s.nal_type == HEVC_NAL_IDR_N_LP)
-                        base_order = next_order;
                     hevc_decoder_unescape(dec, &s);
+                    /* C.5.2.2. For a CRA NoOutputOfPriorPicsFlag is one
+                     * whatever the header says. */
+                    before_picture(fo, dec, sp, s.no_rasl_output_flag,
+                                   kind == HEVC_NAL_CRA
+                                   || s.no_output_of_prior_pics);
                     if (hevc_decoder_begin_picture(dec, sp, &pps[s.pps_id],
                                                    (uintptr_t)pictures, s.poc)) {
                         slices_lost++;
                         continue;
                     }
-                    current_order = base_order + s.poc;
-                    if (current_order >= next_order)
-                        next_order = current_order + 1;
+                    cur_sps = *sp;
+                    cur_id = (uintptr_t)pictures;
+                    cur_poc = s.poc;
+                    cur_output = s.pic_output_flag;
                 }
                 const int e = hevc_decoder_slice(dec, &s, rbsp, n);
                 if (e == 4) {
                     slices_skipped++;
                     if (picture_open)
-                        write_picture(fo, dec, sp, current_order);
+                        write_picture(fo, dec, &cur_sps, cur_id, cur_poc,
+                                      cur_output);
                     picture_open = false;
+                    drain_output(fo);
                     if (fo) { fclose(fo); fo = NULL; }
                 } else if (e) {
                     slices_lost++;
@@ -457,11 +604,8 @@ int main(int argc, char **argv)
     if (pictures && !quiet)
         printf("     (%d slice)\n", slices_of_this);
 
-    if (picture_open) {
-        const hevc_sps_t *sp = NULL;
-        for (int k = 0; k < 16; k++) if (sps[k].valid) { sp = &sps[k]; break; }
-        if (sp) write_picture(fo, dec, sp, current_order);
-    }
+    if (picture_open)
+        write_picture(fo, dec, &cur_sps, cur_id, cur_poc, cur_output);
     drain_output(fo);
     if (fo) fclose(fo);
     if (!check_group(poc_seen, n_seen)) broken_groups++;
@@ -470,6 +614,9 @@ int main(int argc, char **argv)
            "%d walked, %d skipped, %d lost\n",
            pictures, total_slices, refused, broken_groups,
            slices_read, slices_skipped, slices_lost);
+    if (rasl_dropped)
+        printf("%d leading pictures not decoded: their IRAP restarts the "
+               "sequence\n", rasl_dropped);
     free(buf); free(rbsp); free(sps); free(pps); free(poc_seen);
     hevc_decoder_destroy(dec);
     return (refused || broken_groups || slices_lost) ? 1 : 0;

@@ -59,6 +59,16 @@ typedef struct {
     bool used[HEVC_MAX_RPS * 2];
 } hevc_st_rps_t;
 
+/* Quantisation matrices, 7.3.4, as they are sent: coefficient i of each
+ * list in up-right diagonal order, plus the separate DC value of the
+ * 16x16 and 32x32 ones. Indexed [sizeId][matrixId]; the 32x32 lists live
+ * at matrixId 0 and 3, as the later editions of the standard number them.
+ * VA-API hands them over in exactly this order too. */
+typedef struct {
+    uint8_t list[4][6][64];
+    uint8_t dc[4][6];
+} hevc_scaling_t;
+
 /* Only what the decoder or the harness actually reads. profile_tier_level
  * is parsed to get past it, not to act on it. */
 typedef struct {
@@ -71,12 +81,14 @@ typedef struct {
     int bit_depth_luma, bit_depth_chroma;
     int log2_max_poc_lsb;
     int max_dec_pic_buffering, num_reorder_pics;
+    int max_latency_increase_plus1;     /* all three for the top layer */
 
     int log2_min_cb, log2_ctb;          /* coding block, smallest and largest */
     int log2_min_tb, log2_max_tb;
     int max_transform_hierarchy_depth_inter, max_transform_hierarchy_depth_intra;
 
     bool scaling_list_enabled, sps_scaling_list_present;
+    hevc_scaling_t scaling;             /* the defaults unless sent */
     bool amp_enabled, sao_enabled;
     bool pcm_enabled;
     int pcm_bit_depth_luma, pcm_bit_depth_chroma;
@@ -85,8 +97,14 @@ typedef struct {
 
     int num_st_rps;
     hevc_st_rps_t st_rps[65];
+    /* Set only by a caller that knows it and cannot provide the sets
+     * themselves - VA-API: the length in bits of a slice header's inline
+     * short-term set, so the parser can step over it. Zero means parse. */
+    int st_rps_bits;
     bool long_term_ref_pics_present;
     int num_long_term_sps;
+    int lt_ref_pic_poc_lsb_sps[33];
+    bool used_by_curr_pic_lt_sps[33];
 
     bool temporal_mvp_enabled, strong_intra_smoothing;
 
@@ -120,9 +138,14 @@ typedef struct {
     bool deblocking_filter_disabled;
     int beta_offset, tc_offset;          /* already doubled */
     bool pps_scaling_list_present;
+    hevc_scaling_t scaling;             /* replaces the SPS's when present */
     bool lists_modification_present;
     int log2_parallel_merge_level;
     bool slice_segment_header_extension_present;
+    /* NumPicTotalCurr when a caller knows it and the parser could not work
+     * it out - the VA-API path, which does not see the SPS's long-term
+     * flags. Zero means derive it from the slice header. */
+    int num_pic_total_curr;
 } hevc_pps_t;
 
 /* What one slice segment header says. */
@@ -138,15 +161,34 @@ typedef struct {
     bool pic_output_flag;
     int poc_lsb;
     int poc;                             /* derived by the caller */
+    /* 8.1.3, also the caller's: whether this IRAP restarts the sequence,
+     * which depends on what came before it in the stream - an end of
+     * sequence, or nothing at all. */
+    bool no_rasl_output_flag;
 
     bool short_term_ref_pic_set_sps_flag;
     int short_term_ref_pic_set_idx;
     hevc_st_rps_t st_rps;                /* the one this slice uses */
 
+    /* Long-term references, 7.4.7.1. The count is only the least
+     * significant bits unless msb_present says a cycle count goes with
+     * it; either way the whole count is resolved against the picture's,
+     * which the parser does not know - see find_lt() in decoder_h265.c. */
+    int log2_max_poc_lsb;
+    int num_lt;
+    int lt_poc_lsb[32];
+    bool lt_used[32];
+    bool lt_msb_present[32];
+    int lt_msb_cycle[32];                /* DeltaPocMsbCycleLt, accumulated */
+
     bool temporal_mvp_enabled;
     bool sao_luma, sao_chroma;
 
     int num_ref_idx[2];
+    /* Reference list modification, 7.3.6.2: when set, entry i of list l
+     * is picked from the temporary list rather than taken in order. */
+    bool list_mod[2];
+    int list_entry[2][16];
     bool mvd_l1_zero, cabac_init_flag;
     bool collocated_from_l0;
     int collocated_ref_idx;
@@ -169,7 +211,17 @@ typedef struct {
      * that works on the un-escaped payload has to take them out again. */
     uint32_t entry_point[600];
     size_t data_bit_offset;              /* where slice_segment_data starts */
+
+    /* Explicit reference picture lists, when provided by the caller (VA-API) */
+    bool has_explicit_rpl;
+    const void *explicit_ref_pic[2][16];
+    int explicit_n_refs[2];
+    bool explicit_lt[2][16];             /* which entries are long-term */
+    const void *explicit_col;
 } hevc_slice_t;
+
+/* Table 7-6, for a caller that is handed the lists some other way. */
+void hevc_scaling_defaults(hevc_scaling_t *s);
 
 /* Returns 0, or a negative code naming what was refused. */
 int hevc_ps_read_sps(hevc_sps_t *out, const uint8_t *rbsp, size_t n);

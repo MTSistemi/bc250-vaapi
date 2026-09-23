@@ -52,6 +52,25 @@ void hevcd_dequantize(int16_t *coeff, int log2_size, int qp, int bd)
     }
 }
 
+/* The same with a quantisation matrix: m holds the factor of every
+ * position, in the block's raster order. A matrix of sixteens is the flat
+ * case above, sample for sample. */
+void hevcd_dequantize_scaled(int16_t *coeff, int log2_size, int qp, int bd,
+                             const uint8_t *m)
+{
+    const int shift = bd + log2_size - 5;
+    const int add = 1 << (shift - 1);
+    const int64_t scale_of = (int64_t)hevcd_level_scale[qp % 6] << (qp / 6);
+    const int count = 1 << (2 * log2_size);
+
+    for (int i = 0; i < count; i++) {
+        if (!coeff[i]) continue;
+        const int64_t v = ((int64_t)coeff[i] * scale_of * m[i] + add) >> shift;
+        coeff[i] = (int16_t)clip16((int)(v < -32768 ? -32768
+                                             : (v > 32767 ? 32767 : v)));
+    }
+}
+
 /* 8.6.4.3: one line of the transform, over `n` points.
  *
  * ⚠️ The matrix row used is k * (32 / n), which is what "the even rows of

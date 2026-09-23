@@ -43,7 +43,17 @@ static bool FUNC(already_decoded)(const hevcd_t *d, int x, int y, int x_cur, int
                                     + (x >> sps->log2_min_tb)];
     const int b = d->min_tb_addr_zs[(y_cur >> sps->log2_min_tb) * stride
                                     + (x_cur >> sps->log2_min_tb)];
-    return a < b;
+    if (a >= b) return false;
+    /* ⚠️ 8.4.4.2.2: under constrained intra prediction a sample from a
+     * block that was not intra coded does not exist either, as far as
+     * intra prediction is concerned. The substitution below fills it from
+     * the intra samples around it, exactly as it fills the picture's
+     * edge. The motion field is cleared for every picture, so an intra
+     * block reads as no prediction flag at all. */
+    if (d->pps->constrained_intra_pred
+        && d->mvf[(y >> 2) * d->min_pu_width + (x >> 2)].pred_flag)
+        return false;
+    return true;
 }
 
 /* 8.4.4.2.2: gather, then substitute. */
