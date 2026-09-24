@@ -382,6 +382,14 @@ struct hevc_encoder {
     bool cu16;
     /* 8x8 transforms for inter CUs: on unless BC250_HEVC_TU8=0. */
     int tu8;
+    /* The quantizer's dead zone: on unless BC250_HEVC_DEADZONE=0, which
+     * rounds every level to nearest. The offsets, in twelfths of a step
+     * (hevc_intra.h), are set per picture by encode_core(). */
+    bool deadzone;
+    int quant_round_inter, quant_round_intra;
+    /* A CU whose merge residual quantizes to nothing is a skip, decided
+     * there: on unless BC250_HEVC_EARLY_SKIP=0. */
+    bool early_skip;
     int16_t *mv_x_map;
     int16_t *mv_y_map;
     uint32_t last_frame_sad;
@@ -567,6 +575,10 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
         enc->cu16 = !(e && strcmp(e, "0") == 0);
         e = getenv("BC250_HEVC_TU8");
         enc->tu8 = !(e && strcmp(e, "0") == 0);
+        e = getenv("BC250_HEVC_DEADZONE");
+        enc->deadzone = !(e && strcmp(e, "0") == 0);
+        e = getenv("BC250_HEVC_EARLY_SKIP");
+        enc->early_skip = !(e && strcmp(e, "0") == 0);
     }
     enc->mv_x_map = calloc(num_cus, sizeof(int16_t));
     enc->mv_y_map = calloc(num_cus, sizeof(int16_t));
@@ -1269,6 +1281,11 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     encoder->last_frame_sad = 0;
     encoder->lambda_sse_q8 = lambda_sse_q8(encoder->qp);
     encoder->lambda_sad_q8 = lambda_sad_q8(encoder->qp);
+    /* Rounding to nearest cost a fifth more bits for the same picture than
+     * the dead zone does. */
+    encoder->quant_round_inter = encoder->deadzone ? HEVC_QUANT_ROUND_INTER : HEVC_QUANT_ROUND_NEAREST;
+    encoder->quant_round_intra = !encoder->deadzone ? HEVC_QUANT_ROUND_NEAREST
+                               : is_idr ? HEVC_QUANT_ROUND_INTRA_I : HEVC_QUANT_ROUND_INTRA_P;
 
     const bool ten_bit = encoder->bit_depth > 8;
     if (ten_bit) load_source_10(encoder);
