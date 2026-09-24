@@ -128,6 +128,32 @@ void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
 void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
                                   int16_t residual_out[16]);
 
+/* Ten bits.
+ *
+ * The prediction and the mode decision above take sixteen-bit samples here
+ * and otherwise behave the same. The transform pair differs in its shifts,
+ * and its `qp` is the PRIMED value, Qp' = QpY + 12 for luma and QpC + 12
+ * for chroma (7.4.3.2.1's QpBdOffset): 0..63 instead of 0..51. See the
+ * comment above their definitions in hevc_intra.c. */
+void hevc_predict_4x4_10(const uint16_t *recon_plane, int stride, int width, int height,
+                         int x0, int y0, int mode, int is_luma, int y_min,
+                         uint16_t pred_out[16]);
+int hevc_choose_luma_mode_10(int y_min, const uint16_t *src_y, const uint16_t *recon_y,
+                             int stride, int width, int height, int x0, int y0,
+                             uint16_t pred_out[16]);
+void hevc_transform_quant_4x4_10(const int16_t residual[16], int qp, int use_dst,
+                                  int16_t coeff_out[16]);
+void hevc_dequant_itransform_4x4_10(const int16_t coeff[16], int qp, int use_dst,
+                                     int16_t residual_out[16]);
+
+/* So that code compiled once per bit depth can name either set with the
+ * decoder's FUNC(): FUNC(hevc_predict_4x4) is this at eight bits and the
+ * _10 function at ten. */
+#define hevc_predict_4x4_8             hevc_predict_4x4
+#define hevc_choose_luma_mode_8        hevc_choose_luma_mode
+#define hevc_transform_quant_4x4_8     hevc_transform_quant_4x4
+#define hevc_dequant_itransform_4x4_8  hevc_dequant_itransform_4x4
+
 #ifdef __cplusplus
 }
 #endif

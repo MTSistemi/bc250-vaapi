@@ -66,7 +66,7 @@ VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list
     profile_list[i++] = VAProfileH264Main;
     profile_list[i++] = VAProfileH264High;
     profile_list[i++] = VAProfileHEVCMain;
-    /* Decode only: the encoder here is eight bit. */
+    /* Decoded, and encoded from P010 surfaces. */
     profile_list[i++] = VAProfileHEVCMain10;
     /* Post-processing hangs off no codec at all. */
     profile_list[i++] = VAProfileNone;
@@ -96,9 +96,9 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
 
-    /* H.264 and H.265 can be both encoded and decoded. Main 10 can only
-     * be decoded: the encoder writes eight-bit streams and says so in its
-     * own sequence parameter set. */
+    /* H.264 and H.265 can be both encoded and decoded, Main 10 included:
+     * the HEVC encoder has a ten-bit path that reads P010 surfaces and
+     * writes a Main 10 stream. */
     /* VAProfileNone is post-processing and nothing else. */
     if (profile == VAProfileNone) {
         if (!entrypoint_list) {
@@ -116,7 +116,7 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
                             profile == VAProfileH264High ||
                             profile == VAProfileHEVCMain ||
                             profile == VAProfileHEVCMain10);
-    const int can_encode = (profile != VAProfileHEVCMain10);
+    const int can_encode = 1;
     const int count = (can_decode ? 1 : 0) + (can_encode ? 1 : 0);
 
     if (!entrypoint_list) {
@@ -558,8 +558,9 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
             VAEntrypoint entry = data->configs[config_id].entrypoint;
 
             if (entry == VAEntrypointEncSlice) {
-                if (prof == VAProfileHEVCMain) {
-                    c->hevc_enc = hevc_encoder_create(&data->gpu, picture_width, picture_height, 30, 4000000);
+                if (prof == VAProfileHEVCMain || prof == VAProfileHEVCMain10) {
+                    c->hevc_enc = hevc_encoder_create_depth(&data->gpu, picture_width, picture_height, 30, 4000000,
+                                                            prof == VAProfileHEVCMain10 ? 10 : 8);
                     if (c->hevc_enc) {
                         for (int a = 0; a < data->configs[config_id].num_attribs; a++) {
                             if (data->configs[config_id].attribs[a].type == VAConfigAttribRateControl) {

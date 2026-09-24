@@ -25,6 +25,15 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
                                     uint32_t width, uint32_t height,
                                     uint32_t fps, uint32_t bitrate);
 
+/* The same at a chosen bit depth: 8 writes Main, 10 writes Main 10 and
+ * reads P010. Anything else returns NULL. hevc_encoder_create() is this
+ * with 8. */
+hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
+                                          uint32_t width, uint32_t height,
+                                          uint32_t fps, uint32_t bitrate,
+                                          int bit_depth);
+int hevc_encoder_get_bit_depth(const hevc_encoder_t *encoder);
+
 void hevc_encoder_set_force_idr(hevc_encoder_t *encoder);
 void hevc_encoder_set_gop_size(hevc_encoder_t *encoder, uint32_t gop_size);
 uint32_t hevc_encoder_get_gop_size(const hevc_encoder_t *encoder);
@@ -69,6 +78,9 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
  * that pixel data off an already-uploaded VA-API surface - so this
  * entry point is the same core encode logic with that one GPU readback
  * step skipped.
+ *
+ * A ten-bit encoder takes P010 here: two bytes a sample, the sample in the
+ * top ten bits. The pitches are in bytes at either depth.
  */
 int hevc_encoder_encode_raw(hevc_encoder_t *encoder,
                             const uint8_t *y_plane, int y_pitch,

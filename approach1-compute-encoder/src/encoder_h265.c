@@ -97,8 +97,6 @@
 #define HEVC_CU_SIZE   8
 #define HEVC_PU_SIZE   4
 
-static inline uint8_t clip8i(int v) { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
-
 /* ============================================================================
  * Level selection (Annex A.3 MaxLumaPs table, picture-size-only heuristic -
  * a real encoder would also check bitrate/CPB constraints; this project's
@@ -133,12 +131,15 @@ static int hevc_pick_level_idc(uint32_t width, uint32_t height) {
  * VPS / SPS / PPS
  * ==========================================================================*/
 
-static void write_profile_tier_level(bitstream_t *bs, int level_idc) {
+/* Main (1) at eight bits, Main 10 (2) at ten - Annex A.3.2/A.3.3. A Main 10
+ * stream claims only Main 10: its samples do not fit a Main decoder. */
+static void write_profile_tier_level(bitstream_t *bs, int level_idc, int bit_depth) {
+    const int profile_idc = bit_depth > 8 ? 2 : 1;
     bs_write_u(bs, 2, 0);   /* general_profile_space */
     bs_write1(bs, 0);       /* general_tier_flag (Main tier) */
-    bs_write_u(bs, 5, 1);   /* general_profile_idc = 1 (Main) */
+    bs_write_u(bs, 5, profile_idc); /* general_profile_idc */
     for (int i = 0; i < 32; i++)
-        bs_write1(bs, i == 1 ? 1 : 0); /* general_profile_compatibility_flag[1] = Main */
+        bs_write1(bs, i == profile_idc ? 1 : 0); /* general_profile_compatibility_flag[] */
     bs_write1(bs, 1); /* general_progressive_source_flag */
     bs_write1(bs, 0); /* general_interlaced_source_flag */
     bs_write1(bs, 0); /* general_non_packed_constraint_flag */
@@ -165,7 +166,7 @@ static size_t write_aud_hevc(uint8_t *buf, size_t buf_size, bool is_idr) {
     return off + bs_rbsp_to_ebsp(buf + off, buf_size - off, rbsp, bs_bytes_written(&bs));
 }
 
-static size_t write_vps(uint8_t *buf, size_t buf_size) {
+static size_t write_vps(uint8_t *buf, size_t buf_size, int bit_depth) {
     uint8_t rbsp[128];
     bitstream_t bs;
     bs_init(&bs, rbsp, sizeof(rbsp));
@@ -177,7 +178,7 @@ static size_t write_vps(uint8_t *buf, size_t buf_size) {
     bs_write1(&bs, 1);       /* vps_temporal_id_nesting_flag */
     bs_write_u(&bs, 16, 0xffff);
 
-    write_profile_tier_level(&bs, 30); /* level is irrelevant here; SPS carries the real one */
+    write_profile_tier_level(&bs, 30, bit_depth); /* level is irrelevant here; SPS carries the real one */
 
     bs_write1(&bs, 1); /* vps_sub_layer_ordering_info_present_flag */
     bs_write_ue(&bs, 1); /* vps_max_dec_pic_buffering_minus1 = 1 (1 ref + 1 current pic) */
@@ -200,7 +201,7 @@ static size_t write_vps(uint8_t *buf, size_t buf_size) {
 }
 
 static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_t coded_h,
-                         uint32_t real_w, uint32_t real_h, int level_idc) {
+                         uint32_t real_w, uint32_t real_h, int level_idc, int bit_depth) {
     uint8_t rbsp[256];
     bitstream_t bs;
     bs_init(&bs, rbsp, sizeof(rbsp));
@@ -209,7 +210,7 @@ static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_
     bs_write_u(&bs, 3, 0);  /* sps_max_sub_layers_minus1 */
     bs_write1(&bs, 1);      /* sps_temporal_id_nesting_flag */
 
-    write_profile_tier_level(&bs, level_idc);
+    write_profile_tier_level(&bs, level_idc, bit_depth);
 
     bs_write_ue(&bs, 0); /* sps_seq_parameter_set_id */
     bs_write_ue(&bs, 1); /* chroma_format_idc = 1 (4:2:0) */
@@ -226,8 +227,8 @@ static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_
         bs_write_ue(&bs, (coded_h - real_h) / 2);
     }
 
-    bs_write_ue(&bs, 0); /* bit_depth_luma_minus8 */
-    bs_write_ue(&bs, 0); /* bit_depth_chroma_minus8 */
+    bs_write_ue(&bs, bit_depth - 8); /* bit_depth_luma_minus8 */
+    bs_write_ue(&bs, bit_depth - 8); /* bit_depth_chroma_minus8 */
     bs_write_ue(&bs, 4); /* log2_max_pic_order_cnt_lsb_minus4 = 4 -> log2=8 (0..255) */
 
     bs_write1(&bs, 1); /* sps_sub_layer_ordering_info_present_flag */
@@ -324,7 +325,8 @@ static size_t write_pps(uint8_t *buf, size_t buf_size, int init_qp) {
 
 struct hevc_encoder {
     bc250_gpu_context_t *gpu;
-    uint32_t width, height;               /* real (as requested by libva) */
+    uint32_t width, height;               /* real: the picture being coded */
+    uint32_t ctx_width, ctx_height;       /* what the context was opened for */
     uint32_t coded_width, coded_height;   /* rounded up to a 16px CTU multiple */
     uint32_t width_ctu, height_ctu;
     uint32_t fps, bitrate;
@@ -341,12 +343,19 @@ struct hevc_encoder {
     uint32_t quality_level;      /* 1..7 (1 = Quality, 4 = Balanced, 7 = Speed) */
     uint32_t max_frame_bits;     /* Maximum frame size in bits (0 = unlimited) */
 
+    /* 8 or 10. It decides what a sample is in the planes below, the
+     * profile the stream declares, and which copy of hevc_enc_template.c
+     * encodes it. */
+    int bit_depth;
+
     /* Source (post-download, padded/replicated to coded dimensions) and
      * reconstructed planes. Luma at coded_w x coded_h; chroma at
-     * coded_w/2 x coded_h/2 (4:2:0). */
-    uint8_t *src_y, *src_cb, *src_cr;
-    uint8_t *recon_y, *recon_cb, *recon_cr;
-    uint8_t *prev_recon_y, *prev_recon_cb, *prev_recon_cr;
+     * coded_w/2 x coded_h/2 (4:2:0). A sample is a uint8_t at eight bits
+     * and a uint16_t at ten, which is why these are void: only the
+     * template, which knows which, reads them. */
+    void *src_y, *src_cb, *src_cr;
+    void *recon_y, *recon_cb, *recon_cr;
+    void *prev_recon_y, *prev_recon_cb, *prev_recon_cr;
 
     /* Per-CU skip tracking for current frame (for condL/condA context derivation).
      * Size: (width_ctu * 2) * (height_ctu * 2). */
@@ -370,7 +379,12 @@ struct hevc_encoder {
     int8_t *luma_mode_map;
     uint32_t mode_map_stride;
 
-    /* Raw NV12 download scratch, real width x height. */
+    /* BC250_HEVC_SKIP_THRESHOLD, read once when the encoder is made:
+     * -1 when unset. */
+    int skip_override;
+
+    /* Raw NV12 download scratch, real width x height - P010 at ten bits,
+     * so two bytes a sample. */
     uint8_t *dl_y;
     uint8_t *dl_uv;
 
@@ -405,11 +419,27 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
                                     uint32_t width, uint32_t height,
                                     uint32_t fps, uint32_t bitrate)
 {
+    return hevc_encoder_create_depth(gpu_ctx, width, height, fps, bitrate, 8);
+}
+
+hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
+                                          uint32_t width, uint32_t height,
+                                          uint32_t fps, uint32_t bitrate,
+                                          int bit_depth)
+{
     if (width == 0 || height == 0) return NULL;
+    if (bit_depth != 8 && bit_depth != 10) return NULL;
     hevc_encoder_t *enc = calloc(1, sizeof(hevc_encoder_t));
     if (!enc) return NULL;
 
     enc->gpu = gpu_ctx;
+    enc->ctx_width = width;
+    enc->ctx_height = height;
+    enc->bit_depth = bit_depth;
+    {
+        const char *env = getenv("BC250_HEVC_SKIP_THRESHOLD");
+        enc->skip_override = env ? atoi(env) : -1;
+    }
     enc->width = width;
     enc->height = height;
     enc->fps = fps ? fps : 30;
@@ -471,8 +501,13 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     enc->width_ctu = enc->coded_width / HEVC_CTU_SIZE;
     enc->height_ctu = enc->coded_height / HEVC_CTU_SIZE;
 
+    /* Bytes, not samples: every buffer below that holds samples is sized
+     * with this. */
+    const size_t bps = bit_depth > 8 ? 2 : 1;
     size_t luma_size = (size_t)enc->coded_width * enc->coded_height;
     size_t chroma_size = (size_t)(enc->coded_width / 2) * (enc->coded_height / 2);
+    luma_size *= bps;
+    chroma_size *= bps;
 
     enc->src_y = malloc(luma_size);
     enc->src_cb = malloc(chroma_size);
@@ -493,8 +528,8 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     enc->mode_map_stride = enc->coded_width / HEVC_PU_SIZE;
     enc->luma_mode_map = malloc((size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
 
-    enc->dl_y = malloc((size_t)width * height);
-    enc->dl_uv = malloc((size_t)(width / 2) * (height / 2) * 2);
+    enc->dl_y = malloc((size_t)width * height * bps);
+    enc->dl_uv = malloc((size_t)(width / 2) * (height / 2) * 2 * bps);
 
     enc->slice_rbsp_cap = luma_size + 65536;
     enc->slice_rbsp = malloc(enc->slice_rbsp_cap);
@@ -671,6 +706,11 @@ uint32_t hevc_encoder_get_max_frame_size(const hevc_encoder_t *encoder)
     return encoder ? encoder->max_frame_bits : 0;
 }
 
+int hevc_encoder_get_bit_depth(const hevc_encoder_t *encoder)
+{
+    return encoder ? encoder->bit_depth : 8;
+}
+
 int hevc_encoder_get_governor_tier(const hevc_encoder_t *encoder)
 {
     return encoder ? (int)dynamic_governor_get_tier(&encoder->governor) : 0;
@@ -695,22 +735,6 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     free(encoder);
 }
 
-/* Replicate-pad a downloaded plane (real w x h) into a coded_w x coded_h
- * working buffer - only the bottom/right margin (if any) needs padding,
- * since coded dims are always >= real dims by construction. */
-static void pad_replicate(uint8_t *dst, uint32_t dst_w, uint32_t dst_h,
-                           const uint8_t *src, uint32_t src_stride, uint32_t src_w, uint32_t src_h) {
-    for (uint32_t y = 0; y < dst_h; y++) {
-        uint32_t sy = y < src_h ? y : src_h - 1;
-        const uint8_t *srow = src + (size_t)sy * src_stride;
-        uint8_t *drow = dst + (size_t)y * dst_w;
-        for (uint32_t x = 0; x < dst_w; x++) {
-            uint32_t sx = x < src_w ? x : src_w - 1;
-            drow[x] = srow[sx];
-        }
-    }
-}
-
 /* ============================================================================
  * Per-CU encoding
  * ==========================================================================*/
@@ -727,86 +751,6 @@ typedef struct {
     int16_t x;
     int16_t y;
 } hevc_mv_t;
-
-static inline uint32_t compute_sad_8x8_luma(const uint8_t *src_y,
-                                            const uint8_t *ref_y,
-                                            uint32_t stride,
-                                            int cu_x, int cu_y,
-                                            int dx, int dy)
-{
-    const uint8_t *s = &src_y[cu_y * stride + cu_x];
-    const uint8_t *r = &ref_y[(cu_y + dy) * stride + (cu_x + dx)];
-#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
-    __m128i acc = _mm_setzero_si128();
-    for (int y = 0; y < 8; y++) {
-        __m128i s_row = _mm_loadl_epi64((const __m128i *)s);
-        __m128i r_row = _mm_loadl_epi64((const __m128i *)r);
-        acc = _mm_add_epi32(acc, _mm_sad_epu8(s_row, r_row));
-        s += stride;
-        r += stride;
-    }
-    return (uint32_t)_mm_cvtsi128_si32(acc);
-#else
-    uint32_t sad = 0;
-    for (int y = 0; y < 8; y++) {
-        for (int x = 0; x < 8; x++) {
-            int diff = (int)s[x] - (int)r[x];
-            sad += (diff < 0) ? -diff : diff;
-        }
-        s += stride;
-        r += stride;
-    }
-    return sad;
-#endif
-}
-
-static inline uint32_t compute_sad_4x4_chroma(const uint8_t *src_cb,
-                                              const uint8_t *src_cr,
-                                              const uint8_t *ref_cb,
-                                              const uint8_t *ref_cr,
-                                              uint32_t cstride,
-                                              int cx, int cy,
-                                              int cdx, int cdy)
-{
-    const uint8_t *scb = &src_cb[cy * cstride + cx];
-    const uint8_t *scr = &src_cr[cy * cstride + cx];
-    const uint8_t *rcb = &ref_cb[(cy + cdy) * cstride + (cx + cdx)];
-    const uint8_t *rcr = &ref_cr[(cy + cdy) * cstride + (cx + cdx)];
-#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
-    __m128i acc = _mm_setzero_si128();
-    for (int y = 0; y < 4; y++) {
-        uint32_t scb_4, scr_4, rcb_4, rcr_4;
-        memcpy(&scb_4, scb, 4);
-        memcpy(&scr_4, scr, 4);
-        memcpy(&rcb_4, rcb, 4);
-        memcpy(&rcr_4, rcr, 4);
-        uint64_t s_both = ((uint64_t)scr_4 << 32) | scb_4;
-        uint64_t r_both = ((uint64_t)rcr_4 << 32) | rcb_4;
-        __m128i s_vec = _mm_loadl_epi64((const __m128i *)&s_both);
-        __m128i r_vec = _mm_loadl_epi64((const __m128i *)&r_both);
-        acc = _mm_add_epi32(acc, _mm_sad_epu8(s_vec, r_vec));
-        scb += cstride;
-        scr += cstride;
-        rcb += cstride;
-        rcr += cstride;
-    }
-    return (uint32_t)_mm_cvtsi128_si32(acc);
-#else
-    uint32_t sad = 0;
-    for (int y = 0; y < 4; y++) {
-        for (int x = 0; x < 4; x++) {
-            int dcb = (int)scb[x] - (int)rcb[x];
-            int dcr = (int)scr[x] - (int)rcr[x];
-            sad += (dcb < 0 ? -dcb : dcb) + (dcr < 0 ? -dcr : dcr);
-        }
-        scb += cstride;
-        scr += cstride;
-        rcb += cstride;
-        rcr += cstride;
-    }
-    return sad;
-#endif
-}
 
 static inline uint32_t hevc_cu_rank(uint32_t width_ctu, int cux, int cuy) {
     uint32_t ctu_col = (uint32_t)cux / 2;
@@ -932,308 +876,6 @@ static int derive_merge_candidates(int cuy_min, const hevc_encoder_t *enc,
     return num_cand;
 }
 
-static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y, bool is_idr, int y_min, uint32_t *sad_out) {
-    int qp = enc->qp;
-    uint32_t cw = enc->coded_width, ch = enc->coded_height;
-    uint32_t ccw = cw / 2, cch = ch / 2;
-    int cux = cu_x / HEVC_CU_SIZE;
-    int cuy = cu_y / HEVC_CU_SIZE;
-    uint32_t cu_stride = enc->width_ctu * 2;
-    uint32_t cu_idx = (uint32_t)cuy * cu_stride + (uint32_t)cux;
-
-    int cond_l = (cux > 0 && enc->cu_skip_map[cu_idx - 1]) ? 1 : 0;
-    int cond_a = (cu_y > y_min && enc->cu_skip_map[cu_idx - cu_stride]) ? 1 : 0;
-    int skip_ctx_inc = cond_l + cond_a;
-
-    bool is_skip = false;
-    int chosen_merge_idx = 0;
-    int chosen_dx = 0, chosen_dy = 0;
-
-    if (!is_idr && enc->has_ref) {
-        hevc_mv_t cand_mvs[5];
-        derive_merge_candidates(y_min / HEVC_CU_SIZE, enc, cux, cuy, cand_mvs);
-
-        int best_cand_idx = -1;
-        uint32_t best_cand_sad = UINT32_MAX;
-        int cx = cu_x / 2, cy = cu_y / 2;
-
-        /* GPU Motion Vector guidance: if GPU confirmed low-distortion stationary block, fast-track candidate (0,0) */
-        uint32_t ctu_idx = ((uint32_t)cuy / 2) * enc->width_ctu + ((uint32_t)cux / 2);
-        bool gpu_says_static = false;
-        if (enc->num_gpu_mvs > 0 && ctu_idx < enc->num_gpu_mvs) {
-            const gpu_mv_t *gm = &enc->gpu_mvs[ctu_idx];
-            if (gm->mvx == 0 && gm->mvy == 0 && gm->sad <= 384) {
-                gpu_says_static = true;
-            }
-        }
-
-        /* Evaluate ITU-T standard merge candidates in order */
-        for (int i = 0; i < 5; i++) {
-            int c_dx = cand_mvs[i].x / 4;
-            int c_dy = cand_mvs[i].y / 4;
-
-            /* Check frame bounds */
-            if (cu_x + c_dx < 0 || cu_x + c_dx + 8 > (int)cw ||
-                cu_y + c_dy < 0 || cu_y + c_dy + 8 > (int)ch) continue;
-
-            /* Skip redundant evaluations */
-            bool dup = false;
-            for (int p = 0; p < i; p++) {
-                if (cand_mvs[p].x == cand_mvs[i].x && cand_mvs[p].y == cand_mvs[i].y) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (dup) continue;
-
-            int cdx = (c_dx >= 0) ? (c_dx >> 1) : ((c_dx - 1) >> 1);
-            int cdy = (c_dy >= 0) ? (c_dy >> 1) : ((c_dy - 1) >> 1);
-            uint32_t c_sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, c_dx, c_dy) +
-                             compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                    enc->prev_recon_cb, enc->prev_recon_cr,
-                                                    ccw, cx, cy, cdx, cdy);
-            if (c_sad < best_cand_sad) {
-                best_cand_sad = c_sad;
-                best_cand_idx = i;
-                /* Fast path: stationary (0,0) or perfect match exits immediately */
-                if (c_dx == 0 && c_dy == 0 && (best_cand_sad <= 32 || (gpu_says_static && best_cand_sad <= 96))) {
-                    break;
-                }
-            }
-        }
-
-        /* Skip threshold scaled with QP and quality level.
-         * For quality levels 1..3 (high-quality archival / transcode), keep threshold strict
-         * so subtle textures, grain, and fine motion are preserved with full residual coding.
-         * Quality levels 4..5 use balanced skipping, and 6..7 use speed skipping. */
-        uint32_t threshold;
-        if (enc->quality_level <= 3) {
-            threshold = 48 * (1 + (enc->qp / 16));
-        } else if (enc->quality_level <= 5) {
-            threshold = 64 * (1 + (enc->qp / 12));
-        } else {
-            threshold = 96 * (1 + (enc->qp / 8));
-        }
-        static int s_skip_override = -2;
-        if (s_skip_override == -2) {
-            const char *env = getenv("BC250_HEVC_SKIP_THRESHOLD");
-            s_skip_override = env ? atoi(env) : -1;
-        }
-        if (s_skip_override >= 0) {
-            threshold = (uint32_t)s_skip_override;
-        }
-
-        if (best_cand_idx >= 0 && best_cand_sad <= threshold) {
-            is_skip = true;
-            chosen_merge_idx = best_cand_idx;
-            chosen_dx = cand_mvs[best_cand_idx].x / 4;
-            chosen_dy = cand_mvs[best_cand_idx].y / 4;
-            *sad_out += best_cand_sad;
-        } else {
-            *sad_out += (best_cand_sad != UINT32_MAX ? best_cand_sad : (threshold * 2));
-        }
-    }
-
-    if (is_skip) {
-        enc->cu_skip_map[cu_idx] = 1;
-        enc->cu_is_inter[cu_idx] = 1;
-        enc->mv_x_map[cu_idx] = (int16_t)(chosen_dx * 4);
-        enc->mv_y_map[cu_idx] = (int16_t)(chosen_dy * 4);
-        hevc_cabac_code_cu_skip_flag(cab, 1, skip_ctx_inc);
-        hevc_cabac_code_merge_idx(cab, chosen_merge_idx);
-
-        for (int y = 0; y < HEVC_CU_SIZE; y++) {
-            memcpy(&enc->recon_y[(cu_y + y) * cw + cu_x],
-                   &enc->prev_recon_y[(cu_y + chosen_dy + y) * cw + (cu_x + chosen_dx)],
-                   HEVC_CU_SIZE);
-        }
-        int cx = cu_x / 2, cy = cu_y / 2;
-        int cdx = (chosen_dx >= 0) ? (chosen_dx >> 1) : ((chosen_dx - 1) >> 1);
-        int cdy = (chosen_dy >= 0) ? (chosen_dy >> 1) : ((chosen_dy - 1) >> 1);
-        for (int y = 0; y < HEVC_PU_SIZE; y++) {
-            memcpy(&enc->recon_cb[(cy + y) * ccw + cx],
-                   &enc->prev_recon_cb[(cy + cdy + y) * ccw + (cx + cdx)],
-                   HEVC_PU_SIZE);
-            memcpy(&enc->recon_cr[(cy + y) * ccw + cx],
-                   &enc->prev_recon_cr[(cy + cdy + y) * ccw + (cx + cdx)],
-                   HEVC_PU_SIZE);
-        }
-        for (int pu = 0; pu < 4; pu++) {
-            int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-            enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = HEVC_MODE_DC;
-        }
-        return;
-    }
-
-    enc->cu_skip_map[cu_idx] = 0;
-    enc->cu_is_inter[cu_idx] = 0;
-    enc->mv_x_map[cu_idx] = 0;
-    enc->mv_y_map[cu_idx] = 0;
-    if (!is_idr) {
-        hevc_cabac_code_cu_skip_flag(cab, 0, skip_ctx_inc);
-        hevc_cabac_code_pred_mode_flag(cab, 1 /* MODE_INTRA */);
-    }
-
-    hevc_cabac_code_part_mode_intra(cab, 0 /* PART_NxN */);
-
-    int pu_modes[4];
-    int16_t luma_coeff[4][16];
-    int cbf_luma[4];
-
-    /* Step 1: decide + reconstruct all 4 luma PUs in z-order */
-    for (int pu = 0; pu < 4; pu++) {
-        int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-        uint8_t pred[16];
-        int mode;
-        /* Quality levels 1..6 use full directional intra prediction (Planar, DC, Horizontal, Vertical)
-         * to preserve edges and textures. Level 7 (ultra-fast speed preset) uses DC fallback. */
-        if (enc->quality_level >= 7) {
-            mode = HEVC_MODE_DC;
-            hevc_predict_4x4(enc->recon_y, cw, cw, ch, px, py, mode, 1, y_min, pred);
-        } else {
-            mode = hevc_choose_luma_mode(y_min, enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch, px, py, pred);
-        }
-        pu_modes[pu] = mode;
-
-        int16_t residual[16];
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                residual[y * 4 + x] = (int16_t)(enc->src_y[(py + y) * cw + (px + x)] - pred[y * 4 + x]);
-
-        int16_t coeff[16];
-        hevc_transform_quant_4x4(residual, qp, 1 /* DST for 4x4 luma intra */, coeff);
-        memcpy(luma_coeff[pu], coeff, sizeof(coeff));
-        cbf_luma[pu] = any_nonzero16(coeff);
-
-        if (cbf_luma[pu]) {
-            int16_t recon_residual[16];
-            hevc_dequant_itransform_4x4(coeff, qp, 1, recon_residual);
-            for (int y = 0; y < 4; y++)
-                for (int x = 0; x < 4; x++)
-                    enc->recon_y[(py + y) * cw + (px + x)] = clip8i(pred[y * 4 + x] + recon_residual[y * 4 + x]);
-        } else {
-            for (int y = 0; y < 4; y++)
-                memcpy(&enc->recon_y[(py + y) * cw + px], &pred[y * 4], 4);
-        }
-
-        enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = (int8_t)mode;
-    }
-
-    /* Chroma: one 4x4 Cb + one 4x4 Cr per CU, DC prediction only */
-    int cx = cu_x / 2, cy = cu_y / 2;
-    uint8_t pred_cb[16], pred_cr[16];
-    hevc_predict_4x4(enc->recon_cb, ccw, ccw, cch, cx, cy, HEVC_MODE_DC, 0, y_min / 2, pred_cb);
-    hevc_predict_4x4(enc->recon_cr, ccw, ccw, cch, cx, cy, HEVC_MODE_DC, 0, y_min / 2, pred_cr);
-
-    int16_t res_cb[16], res_cr[16];
-    for (int y = 0; y < 4; y++)
-        for (int x = 0; x < 4; x++) {
-            res_cb[y * 4 + x] = (int16_t)(enc->src_cb[(cy + y) * ccw + (cx + x)] - pred_cb[y * 4 + x]);
-            res_cr[y * 4 + x] = (int16_t)(enc->src_cr[(cy + y) * ccw + (cx + x)] - pred_cr[y * 4 + x]);
-        }
-
-    /* Chroma quantizes at QpC, not QpY - Rec. ITU-T H.265 Table 8-10.
-     * Passing luma QP directly causes divergence from the standard when QP >= 30. */
-    int cqp = hevc_chroma_qp_from_luma(qp);
-
-    int16_t coeff_cb[16], coeff_cr[16];
-    hevc_transform_quant_4x4(res_cb, cqp, 0, coeff_cb);
-    hevc_transform_quant_4x4(res_cr, cqp, 0, coeff_cr);
-    int cbf_cb = any_nonzero16(coeff_cb);
-    int cbf_cr = any_nonzero16(coeff_cr);
-
-    if (cbf_cb) {
-        int16_t rres_cb[16];
-        hevc_dequant_itransform_4x4(coeff_cb, cqp, 0, rres_cb);
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                enc->recon_cb[(cy + y) * ccw + (cx + x)] = clip8i(pred_cb[y * 4 + x] + rres_cb[y * 4 + x]);
-    } else {
-        for (int y = 0; y < 4; y++)
-            memcpy(&enc->recon_cb[(cy + y) * ccw + cx], &pred_cb[y * 4], 4);
-    }
-
-    if (cbf_cr) {
-        int16_t rres_cr[16];
-        hevc_dequant_itransform_4x4(coeff_cr, cqp, 0, rres_cr);
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                enc->recon_cr[(cy + y) * ccw + (cx + x)] = clip8i(pred_cr[y * 4 + x] + rres_cr[y * 4 + x]);
-    } else {
-        for (int y = 0; y < 4; y++)
-            memcpy(&enc->recon_cr[(cy + y) * ccw + cx], &pred_cr[y * 4], 4);
-    }
-
-    /* Step 2: emit the 4 PUs' real intra_luma_pred_mode syntax. ITU-T
-     * H.265 7.3.8.5's coding_unit() codes this as TWO separate passes over
-     * all 4 PUs - every prev_intra_luma_pred_flag first, THEN every
-     * mpm_idx/rem_intra_luma_pred_mode - not interleaved per PU (see
-     * hevc_cabac_code_intra_luma_flag()/_data()'s comment; getting this
-     * order wrong was this encoder's first real bug, caught by comparing
-     * this encoder's own reconstruction - which matched the source fine -
-     * against ffmpeg's actual decode of the resulting bitstream, which
-     * didn't: a CABAC bit-order mistake still produces a structurally
-     * valid, crash-free bitstream, just one that decodes to noise from
-     * that point on). */
-    int mpm[4][3];
-    int pred_idx[4];
-    for (int pu = 0; pu < 4; pu++) {
-        int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-        int mx = px / 4, my = py / 4;
-        int left_avail = px > 0;
-        /* Per ITU-T H.265 8.4.2, candIntraPredModeB is forced to INTRA_DC
-         * whenever yCb-1 crosses into the CTU row above the current one.
-         * Marking above_avail false across CTU boundaries ensures bit-exact
-         * MPM candidate list synchronization with all standard decoders. */
-        int above_avail = (py > 0) && ((py % HEVC_CTU_SIZE) != 0);
-        int left_mode = left_avail ? enc->luma_mode_map[my * enc->mode_map_stride + (mx - 1)] : 0;
-        int above_mode = above_avail ? enc->luma_mode_map[(my - 1) * enc->mode_map_stride + mx] : 0;
-        hevc_derive_mpm(left_mode, left_avail, above_mode, above_avail, mpm[pu]);
-        pred_idx[pu] = hevc_cabac_code_intra_luma_flag(cab, pu_modes[pu], mpm[pu]);
-    }
-    for (int pu = 0; pu < 4; pu++)
-        hevc_cabac_code_intra_luma_data(cab, pu_modes[pu], pred_idx[pu], mpm[pu]);
-
-    /* Step 3: chroma mode (always DC; luma_mode_pu0 decides whether that's
-     * signaled as index-3-of-candidate-list or as the derived/DM mode -
-     * see hevc_cabac_code_intra_chroma_pred_mode()'s comment). */
-    hevc_cabac_code_intra_chroma_pred_mode(cab, pu_modes[0]);
-
-    /* Step 4: transform_tree - chroma cbf BITS first (trafoDepth=0, this
-     * CU's root), then the 4 luma leaves' cbf+residual, then finally the
-     * chroma RESIDUAL DATA (coded once per CU, after all 4 luma leaves -
-     * this specific ordering, bits-before-luma but data-after-luma, is
-     * exactly what ITU-T H.265's transform_tree()/transform_unit()
-     * recursion produces for a CU whose chroma has already hit the 4x4
-     * floor - see this file's top comment and x265's own
-     * Entropy::encodeTransform(), which this encoder's fixed two-level
-     * structure is a manually-unrolled special case of). */
-    hevc_cabac_code_cbf_chroma(cab, cbf_cb, 0);
-    hevc_cabac_code_cbf_chroma(cab, cbf_cr, 0);
-
-    for (int pu = 0; pu < 4; pu++) {
-        hevc_cabac_code_cbf_luma(cab, cbf_luma[pu], 1);
-        if (cbf_luma[pu]) {
-            int scan_idx = hevc_scan_idx_for_mode(pu_modes[pu]);
-            hevc_cabac_code_residual_4x4(cab, luma_coeff[pu], 1, scan_idx);
-        }
-    }
-    if (cbf_cb) hevc_cabac_code_residual_4x4(cab, coeff_cb, 0, 0 /* chroma always diagonal in 4:2:0 */);
-    if (cbf_cr) hevc_cabac_code_residual_4x4(cab, coeff_cr, 0, 0);
-}
-
-static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int ctu_row, bool is_idr, int y_min, uint32_t *sad_out) {
-    int ctu_x = ctu_col * HEVC_CTU_SIZE, ctu_y = ctu_row * HEVC_CTU_SIZE;
-    int cond_l = ctu_col > 0 ? 1 : 0;
-    int cond_a = (ctu_row * HEVC_CTU_SIZE > y_min) ? 1 : 0;
-    hevc_cabac_code_split_cu_flag(cab, 1, cond_l + cond_a);
-
-    static const int cu_off_x[4] = { 0, 8, 0, 8 };
-    static const int cu_off_y[4] = { 0, 0, 8, 8 };
-    for (int i = 0; i < 4; i++)
-        encode_cu(enc, cab, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i], is_idr, y_min, sad_out);
-}
-
 /* ============================================================================
  * Frame entry point
  * ==========================================================================*/
@@ -1282,6 +924,17 @@ static void deinterleava_uv(uint8_t *cb, uint8_t *cr, const uint8_t *uv, size_t 
 #endif
     for (size_t i = 0; i < n; i++) { cb[i] = uv[2 * i]; cr[i] = uv[2 * i + 1]; }
 }
+
+/* Everything that touches samples, once per bit depth. */
+#define BIT_DEPTH 8
+#include "hevc_pixel.h"
+#include "hevc_enc_template.c"
+#undef BIT_DEPTH
+
+#define BIT_DEPTH 10
+#include "hevc_pixel.h"
+#include "hevc_enc_template.c"
+#undef BIT_DEPTH
 
 static size_t maybe_append_filler_hevc(hevc_encoder_t *encoder, size_t total_written)
 {
@@ -1335,18 +988,9 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     }
     encoder->last_frame_sad = 0;
 
-    pad_replicate(encoder->src_y, encoder->coded_width, encoder->coded_height,
-                  encoder->dl_y, encoder->width, encoder->width, encoder->height);
-
-    uint32_t cw2 = encoder->width / 2, ch2 = encoder->height / 2;
-    uint32_t ccw = encoder->coded_width / 2, cch = encoder->coded_height / 2;
-    for (uint32_t y = 0; y < ch2; y++) {
-        const uint8_t *uvrow = encoder->dl_uv + (size_t)y * encoder->width;
-        deinterleava_uv(&encoder->src_cb[y * ccw], &encoder->src_cr[y * ccw],
-                        uvrow, cw2);
-    }
-    pad_replicate(encoder->src_cb, ccw, cch, encoder->src_cb, ccw, cw2, ch2);
-    pad_replicate(encoder->src_cr, ccw, cch, encoder->src_cr, ccw, cw2, ch2);
+    const bool ten_bit = encoder->bit_depth > 8;
+    if (ten_bit) load_source_10(encoder);
+    else         load_source_8(encoder);
 
     size_t num_cus = (size_t)(encoder->width_ctu * 2) * (encoder->height_ctu * 2);
     memset(encoder->luma_mode_map, 0, (size_t)encoder->mode_map_stride * (encoder->coded_height / HEVC_PU_SIZE));
@@ -1441,7 +1085,8 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
         uint32_t k = 0;
         for (uint32_t row = r0; row < r1; row++) {
             for (uint32_t col = 0; col < encoder->width_ctu; col++) {
-                encode_ctu(encoder, &cab, (int)col, (int)row, is_idr, y_min, &sad);
+                if (ten_bit) encode_ctu_10(encoder, &cab, (int)col, (int)row, is_idr, y_min, &sad);
+                else         encode_ctu_8(encoder, &cab, (int)col, (int)row, is_idr, y_min, &sad);
                 k++;
                 /* end_of_slice_segment_flag: the last CTU of THIS slice */
                 hevc_cabac_encode_terminate(&cab, k == ctus_slice ? 1 : 0);
@@ -1459,11 +1104,13 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     size_t total = 0;
     total += write_aud_hevc(encoder->scratch_out + total, encoder->scratch_out_cap - total, is_idr);
     if (write_param_sets) {
-        total += write_vps(encoder->scratch_out + total, encoder->scratch_out_cap - total);
+        total += write_vps(encoder->scratch_out + total, encoder->scratch_out_cap - total,
+                           encoder->bit_depth);
         total += write_sps(encoder->scratch_out + total, encoder->scratch_out_cap - total,
                             encoder->coded_width, encoder->coded_height,
                             encoder->width, encoder->height,
-                            hevc_pick_level_idc(encoder->coded_width, encoder->coded_height));
+                            hevc_pick_level_idc(encoder->coded_width, encoder->coded_height),
+                            encoder->bit_depth);
         total += write_pps(encoder->scratch_out + total, encoder->scratch_out_cap - total, encoder->qp);
     }
 
@@ -1511,7 +1158,7 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
      * so nothing changes for hevc_encoder_destroy().
      */
     {
-        uint8_t *t;
+        void *t;
         t = encoder->prev_recon_y;  encoder->prev_recon_y  = encoder->recon_y;  encoder->recon_y  = t;
         t = encoder->prev_recon_cb; encoder->prev_recon_cb = encoder->recon_cb; encoder->recon_cb = t;
         t = encoder->prev_recon_cr; encoder->prev_recon_cr = encoder->recon_cr; encoder->recon_cr = t;
@@ -1532,11 +1179,44 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
          * loaded the driver happened to be started in. */
         FILE *fy = bc250_debug_dump_open("bc250_hevc_debug_recon_y.raw",
                                          "BC250_HEVC_DEBUG_RECON");
-        if (fy) { fwrite(encoder->prev_recon_y, 1, (size_t)encoder->coded_width * encoder->coded_height, fy); fclose(fy); }
+        if (fy) {
+            fwrite(encoder->prev_recon_y, ten_bit ? 2 : 1,
+                   (size_t)encoder->coded_width * encoder->coded_height, fy);
+            fclose(fy);
+        }
     }
 
     encoder->frame_count++;
     return (int)total;
+}
+
+/* The picture is as big as the surface it arrives in, not as big as the
+ * context was opened for.
+ *
+ * ⚠️ They differ, and not by accident: ffmpeg opens a Main 10 context at
+ * 1920x1088, the height rounded up to a whole CTB, and then hands it
+ * 1920x1080 surfaces. Taking the context's word for it, this encoder read
+ * 1088 rows out of a 1080-row surface - past the end of its memory at two
+ * bytes a sample, which crashed. At one byte a sample the same mistake
+ * reads whatever follows the plane instead, and codes it, with no cropping
+ * window to hide it. So each frame is the smaller of the two in each
+ * direction.
+ *
+ * The buffers and the maps are sized for the context's CTB grid, so a size
+ * that needs another grid is refused. One that fits it is taken on, with an
+ * IDR, whose SPS carries the new conformance window. */
+static int fit_to_surface(hevc_encoder_t *encoder, uint32_t surface_w, uint32_t surface_h)
+{
+    if (!surface_w || !surface_h) return 0;
+    uint32_t w = surface_w < encoder->ctx_width ? surface_w : encoder->ctx_width;
+    uint32_t h = surface_h < encoder->ctx_height ? surface_h : encoder->ctx_height;
+    if (w == encoder->width && h == encoder->height) return 0;
+    if (round_up16(w) != encoder->coded_width || round_up16(h) != encoder->coded_height)
+        return -1;
+    encoder->width = w;
+    encoder->height = h;
+    encoder->force_idr = true;
+    return 0;
 }
 
 int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
@@ -1549,8 +1229,14 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
 
     encoder->num_gpu_mvs = 0;
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
+    const bool ten_bit = encoder->bit_depth > 8;
 
     if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
+        /* An eight-bit encoder reading a P010 surface, or the reverse,
+         * would encode half a picture of garbage without a complaint. */
+        if ((input_surface.format == GPU_IMAGE_P010) != ten_bit) return -1;
+        if (fit_to_surface(encoder, input_surface.width, input_surface.height) != 0) return -1;
+
         /* ⚠️ The governor's tiers mean something narrower here than in the
          * H.264 encoder. The GPU's only job in this one is the motion
          * search, so there is no reduced-search dispatch to fall back on:
@@ -1561,13 +1247,19 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
         const governor_tier_t tier = dynamic_governor_get_tier(&encoder->governor);
         bool use_gpu_me = (tier < GOV_TIER_2_CPU_OFFLOAD);
 
+        /* ⚠️ Not at ten bits. The motion search shader reads eight-bit
+         * luma, and all this encoder takes from it is the hint that a block
+         * has not moved; the CPU makes that decision on its own without it,
+         * which is what every I frame does anyway. */
+        if (ten_bit) use_gpu_me = false;
+
         /* ⚠️ And that search is also the only thing that measures the GPU.
          * Skipping it leaves the governor with no new latency, so the
          * moving average never decays and the encoder would stay on the
          * CPU for the rest of the stream. One frame in every
          * step_down_hysteresis goes to the GPU anyway, purely to bring
          * back a reading. */
-        if (!use_gpu_me) {
+        if (!use_gpu_me && !ten_bit) {
             const uint32_t every = encoder->governor.step_down_hysteresis;
             encoder->governor_skips++;
             use_gpu_me = every && (encoder->governor_skips % every == 0);
@@ -1597,10 +1289,18 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
             dynamic_governor_notify_failover_handled(&encoder->governor);
         }
 
+        /* The pitches are in bytes, and a P010 row is two bytes a sample. */
+        const int pitch = (int)encoder->width * (ten_bit ? 2 : 1);
         gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
-                                   encoder->dl_y, (int)encoder->width,
-                                   encoder->dl_uv, (int)encoder->width,
+                                   encoder->dl_y, pitch,
+                                   encoder->dl_uv, pitch,
                                    (int)encoder->width, (int)encoder->height);
+    } else if (ten_bit) {
+        /* Mid-grey, as P010 carries it: 512 in the top ten bits. */
+        const size_t n = (size_t)encoder->width * encoder->height;
+        uint16_t *y = (uint16_t *)encoder->dl_y, *uv = (uint16_t *)encoder->dl_uv;
+        for (size_t i = 0; i < n; i++) y[i] = 512 << 6;
+        for (size_t i = 0; i < n / 2; i++) uv[i] = 512 << 6;
     } else {
         memset(encoder->dl_y, 128, (size_t)encoder->width * encoder->height);
         memset(encoder->dl_uv, 128, (size_t)(encoder->width / 2) * (encoder->height / 2) * 2);
@@ -1618,10 +1318,12 @@ int hevc_encoder_encode_raw(hevc_encoder_t *encoder,
 
     encoder->num_gpu_mvs = 0;
 
+    /* A row is `width` samples; at ten bits a sample is two bytes. */
+    const size_t row = (size_t)encoder->width * (encoder->bit_depth > 8 ? 2 : 1);
     for (uint32_t y = 0; y < encoder->height; y++)
-        memcpy(encoder->dl_y + (size_t)y * encoder->width, y_plane + (size_t)y * y_pitch, encoder->width);
+        memcpy(encoder->dl_y + (size_t)y * row, y_plane + (size_t)y * y_pitch, row);
     for (uint32_t y = 0; y < encoder->height / 2; y++)
-        memcpy(encoder->dl_uv + (size_t)y * encoder->width, uv_plane + (size_t)y * uv_pitch, encoder->width);
+        memcpy(encoder->dl_uv + (size_t)y * row, uv_plane + (size_t)y * uv_pitch, row);
 
     return encode_core(encoder, output_buf, output_size);
 }

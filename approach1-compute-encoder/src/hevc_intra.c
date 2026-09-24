@@ -59,7 +59,6 @@ void hevc_derive_mpm(int left_mode, int left_avail, int above_mode, int above_av
 
 /* ===================== neighbor gathering (8.4.4.2.2) ===================== */
 
-static inline uint8_t clip8(int v) { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
 
 /*
  * Rec. ITU-T H.265 6.4.1's "z-scan order block availability" is NOT the
@@ -130,189 +129,17 @@ static int zorder_available(int nx, int ny, int width, int height, int is_luma,
     return zorder_rank(nx, ny, width, is_luma) < cur_rank;
 }
 
-/* Gathers left[0..4] (p[-1][0..4]), top[0..4] (p[0..4][-1]) and the corner
- * (p[-1][-1]), applying the spec's neighbor-substitution scan. Bottom-left
- * (p[-1][5..7], not needed since this encoder only supports Planar/DC/H/V,
- * none of which read past left[4]/top[4]) and positions beyond top[4] are
- * never referenced, so the scan below only covers what those four modes
- * actually need. "Below" and "below-left" are always z-scan-unavailable
- * in this encoder's coding order (nothing below the current row, at any
- * CTU/CU/PU nesting level, is ever decoded first), so those still don't
- * need a rank check - only left/top/corner/top-right do, since those CAN
- * be positionally-plausible but z-scan-unavailable (see zorder_rank()'s
- * comment above). */
-static void gather_neighbors(const uint8_t *plane, int stride, int width, int height,
-                              int x0, int y0, int is_luma, int y_min,
-                              uint8_t left[5], uint8_t top[5], uint8_t *corner,
-                              int *avail_left_out, int *avail_top_out) {
-    long long cur_rank = zorder_rank(x0, y0, width, is_luma);
-    int avail_left = zorder_available(x0 - 1, y0, width, height, is_luma, y_min, cur_rank);
-    int avail_top = zorder_available(x0, y0 - 1, width, height, is_luma, y_min, cur_rank);
-    int avail_corner = zorder_available(x0 - 1, y0 - 1, width, height, is_luma, y_min, cur_rank);
-    int avail_top_right = zorder_available(x0 + 4, y0 - 1, width, height, is_luma, y_min, cur_rank);
+/* The prediction and the mode decision, once per bit depth. See
+ * hevc_intra_template.c. */
+#define BIT_DEPTH 8
+#include "hevc_pixel.h"
+#include "hevc_intra_template.c"
+#undef BIT_DEPTH
 
-    if (avail_left_out) *avail_left_out = avail_left;
-    if (avail_top_out) *avail_top_out = avail_top;
-
-    uint8_t sv[10];
-    uint8_t sa[10];
-
-    sa[0] = sa[1] = sa[2] = sa[3] = (uint8_t)avail_left;
-    if (avail_left) {
-        sv[0] = plane[(y0 + 3) * stride + (x0 - 1)];
-        sv[1] = plane[(y0 + 2) * stride + (x0 - 1)];
-        sv[2] = plane[(y0 + 1) * stride + (x0 - 1)];
-        sv[3] = plane[(y0 + 0) * stride + (x0 - 1)];
-    }
-    sa[4] = (uint8_t)avail_corner;
-    if (avail_corner) sv[4] = plane[(y0 - 1) * stride + (x0 - 1)];
-
-    sa[5] = sa[6] = sa[7] = sa[8] = (uint8_t)avail_top;
-    if (avail_top) {
-        sv[5] = plane[(y0 - 1) * stride + (x0 + 0)];
-        sv[6] = plane[(y0 - 1) * stride + (x0 + 1)];
-        sv[7] = plane[(y0 - 1) * stride + (x0 + 2)];
-        sv[8] = plane[(y0 - 1) * stride + (x0 + 3)];
-    }
-    sa[9] = (uint8_t)avail_top_right;
-    if (avail_top_right) sv[9] = plane[(y0 - 1) * stride + (x0 + 4)];
-
-    int first = -1;
-    for (int i = 0; i < 10; i++) { if (sa[i]) { first = i; break; } }
-
-    if (first < 0) {
-        for (int i = 0; i < 10; i++) sv[i] = 128;
-    } else {
-        for (int i = 0; i < first; i++) sv[i] = sv[first];
-        for (int i = first + 1; i < 10; i++) if (!sa[i]) sv[i] = sv[i - 1];
-    }
-
-    left[3] = sv[0]; left[2] = sv[1]; left[1] = sv[2]; left[0] = sv[3];
-    *corner = sv[4];
-    top[0] = sv[5]; top[1] = sv[6]; top[2] = sv[7]; top[3] = sv[8];
-    top[4] = sv[9];
-    /* p[-1][4] (bottom-left, one below left[3]): always z-scan-unavailable
-     * in this encoder's coding order (see zorder_rank()'s comment) -
-     * nearest previously-scanned available sample is left[3] itself
-     * (which already carries its own correct substituted value). This
-     * line was accidentally dropped in an earlier edit that reworked this
-     * function for z-scan availability, leaving left[4] reading
-     * uninitialized stack memory for every Planar-mode prediction (the
-     * only one of this encoder's 4 modes that reads it) - found by
-     * dumping this function's actual output for a block ffmpeg decoded
-     * differently from this encoder's own (internally-consistent, since
-     * it used the same garbage value on both the predict and later
-     * reconstruct call for a given block, but NOT consistent with a real
-     * decoder, which correctly derives left[4]=left[3]) reconstruction. */
-    left[4] = left[3];
-}
-
-/* ===================== prediction (8.4.4.2.5-8.4.4.2.7) ===================== */
-
-static inline void predict_from_refs(const uint8_t left[5], const uint8_t top[5], uint8_t corner,
-                                     int mode, int is_luma, uint8_t pred_out[16]) {
-    switch (mode) {
-    case HEVC_MODE_PLANAR:
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++) {
-                int v = (3 - x) * left[y] + (x + 1) * top[4] +
-                        (3 - y) * top[x] + (y + 1) * left[4] + 4;
-                pred_out[y * 4 + x] = (uint8_t)(v >> 3);
-            }
-        break;
-
-    case HEVC_MODE_DC: {
-        int dc = (left[0] + left[1] + left[2] + left[3] +
-                  top[0] + top[1] + top[2] + top[3] + 4) >> 3;
-        for (int i = 0; i < 16; i++) pred_out[i] = (uint8_t)dc;
-        if (is_luma) {
-            pred_out[0] = (uint8_t)((left[0] + 2 * dc + top[0] + 2) >> 2);
-            for (int x = 1; x < 4; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
-            for (int y = 1; y < 4; y++) pred_out[y * 4] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
-        }
-        break;
-    }
-
-    case HEVC_MODE_HORIZONTAL:
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                pred_out[y * 4 + x] = left[y];
-        if (is_luma) {
-            for (int x = 0; x < 4; x++)
-                pred_out[x] = clip8(left[0] + ((top[x] - corner) >> 1));
-        }
-        break;
-
-    case HEVC_MODE_VERTICAL:
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                pred_out[y * 4 + x] = top[x];
-        if (is_luma) {
-            for (int y = 0; y < 4; y++)
-                pred_out[y * 4] = clip8(top[0] + ((left[y] - corner) >> 1));
-        }
-        break;
-
-    default:
-        for (int i = 0; i < 16; i++) pred_out[i] = 128;
-        break;
-    }
-}
-
-void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
-                      int x0, int y0, int mode, int is_luma, int y_min,
-                      uint8_t pred_out[16]) {
-    uint8_t left[5], top[5], corner;
-    int avail_left = 0, avail_top = 0;
-    gather_neighbors(recon_plane, stride, width, height, x0, y0, is_luma, y_min, left, top, &corner, &avail_left, &avail_top);
-    predict_from_refs(left, top, corner, mode, is_luma, pred_out);
-}
-
-static inline int sad_4x4(const uint8_t a[16], const uint8_t b[16]) {
-    int sad = 0;
-    for (int i = 0; i < 16; i++) {
-        int d = (int)a[i] - (int)b[i];
-        sad += d < 0 ? -d : d;
-    }
-    return sad;
-}
-
-int hevc_choose_luma_mode(int y_min, const uint8_t *src_y, const uint8_t *recon_y, int stride,
-                           int width, int height, int x0, int y0, uint8_t pred_out[16]) {
-    /* Gather ONCE for all candidates instead of 4 separate calls */
-    uint8_t left[5], top[5], corner;
-    gather_neighbors(recon_y, stride, width, height, x0, y0, 1, y_min, left, top, &corner, NULL, NULL);
-
-    /* Hoist 4x4 source block into contiguous 16 bytes for vectorized SAD */
-    uint8_t src16[16];
-    const uint8_t *srow = src_y + (size_t)y0 * (size_t)stride + (size_t)x0;
-    memcpy(src16 + 0,  srow,                      4);
-    memcpy(src16 + 4,  srow + stride,             4);
-    memcpy(src16 + 8,  srow + 2 * (size_t)stride, 4);
-    memcpy(src16 + 12, srow + 3 * (size_t)stride, 4);
-
-    predict_from_refs(left, top, corner, HEVC_MODE_PLANAR, 1, pred_out);
-    int best_mode = HEVC_MODE_PLANAR;
-    int best_sad = sad_4x4(src16, pred_out);
-
-#define HEVC_TRY_MODE(M) do {                                              \
-        uint8_t pred_[16];                                                 \
-        predict_from_refs(left, top, corner, (M), 1, pred_);               \
-        int sad_ = sad_4x4(src16, pred_);                                  \
-        if (sad_ < best_sad) {                                             \
-            best_sad = sad_;                                               \
-            best_mode = (M);                                               \
-            memcpy(pred_out, pred_, 16);                                   \
-        }                                                                  \
-    } while (0)
-
-    HEVC_TRY_MODE(HEVC_MODE_DC);
-    HEVC_TRY_MODE(HEVC_MODE_HORIZONTAL);
-    HEVC_TRY_MODE(HEVC_MODE_VERTICAL);
-#undef HEVC_TRY_MODE
-
-    return best_mode;
-}
+#define BIT_DEPTH 10
+#include "hevc_pixel.h"
+#include "hevc_intra_template.c"
+#undef BIT_DEPTH
 
 /* ===================== transform (8.6.4) ===================== */
 
@@ -671,4 +498,111 @@ void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
         dq[i] = (int16_t)clip_coeff((int32_t)val);
     }
     inverse_transform_4x4(dq, use_dst ? DST4 : DCT4, residual_out);
+}
+
+/* ===================== ten bits ===================== */
+
+/* The same transforms and quantizer at ten bits.
+ *
+ * Three numbers move with the bit depth, and nothing else does:
+ *
+ *   - the inverse transform's second stage shifts by 20 - BitDepth, so 10
+ *     instead of 12 (8.6.4.2);
+ *   - the dequantizer's bdShift is BitDepth + Log2(nTbS) - 5, so 7 instead
+ *     of 5 (8.6.2 and 8.6.3);
+ *   - the QP the scaling uses is Qp'Y = QpY + QpBdOffsetY, twelve more at
+ *     ten bits, and the same for chroma. The caller adds that: `qp` here is
+ *     the primed value, 0..63.
+ *
+ * The forward transform is ours to choose, and its first stage shifts by two
+ * more than at eight bits so that a ten-bit residual, four times the
+ * eight-bit one, comes out of it at the same scale. With the dequantizer's
+ * two extra bits and QpBdOffset's factor of four, a given QP then produces
+ * the same levels at either depth - which is what makes the rate control and
+ * the QP the caller asked for mean the same thing at ten bits.
+ *
+ * Plain C: the eight-bit vector code has its shifts built in, and this path
+ * has to be right before it is fast.
+ */
+#define HEVC_BDSHIFT_10 7
+
+static void forward_transform_4x4_10(const int16_t residual[16], const int16_t M[4][4],
+                                     int32_t out[16]) {
+    int32_t tmp[4][4];
+    for (int c = 0; c < 4; c++) {
+        for (int i = 0; i < 4; i++) {
+            int32_t sum = 0;
+            for (int r = 0; r < 4; r++) sum += (int32_t)M[i][r] * residual[r * 4 + c];
+            tmp[i][c] = (sum + 4) >> 3;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            int32_t sum = 0;
+            for (int c = 0; c < 4; c++) sum += (int32_t)M[j][c] * tmp[i][c];
+            out[i * 4 + j] = (sum + 128) >> 8;
+        }
+    }
+}
+
+static void inverse_transform_4x4_10(const int16_t coeff[16], const int16_t M[4][4],
+                                     int16_t out[16]) {
+    int32_t tmp[4][4];
+    for (int c = 0; c < 4; c++) {
+        for (int r = 0; r < 4; r++) {
+            int32_t sum = 0;
+            for (int k = 0; k < 4; k++) sum += (int32_t)M[k][r] * coeff[k * 4 + c];
+            tmp[r][c] = clip_coeff((sum + 64) >> 7);
+        }
+    }
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            int32_t sum = 0;
+            for (int k = 0; k < 4; k++) sum += (int32_t)M[k][c] * tmp[r][k];
+            out[r * 4 + c] = (int16_t)clip_coeff((sum + 512) >> 10);
+        }
+    }
+}
+
+void hevc_transform_quant_4x4_10(const int16_t residual[16], int qp, int use_dst,
+                                  int16_t coeff_out[16]) {
+    const uint64_t *r64 = (const uint64_t *)residual;
+    if ((r64[0] | r64[1] | r64[2] | r64[3]) == 0ULL) {
+        memset(coeff_out, 0, 16 * sizeof(int16_t));
+        return;
+    }
+
+    int32_t raw[16];
+    forward_transform_4x4_10(residual, use_dst ? DST4 : DCT4, raw);
+
+    const int q = qp < 0 ? 0 : (qp > 63 ? 63 : qp);
+    /* The algebraic inverse of the dequantizer below, rounded to nearest -
+     * the eight-bit path's reciprocal table does the same division. */
+    const uint64_t denom = (uint64_t)(HEVC_FLAT_M * levelScale[q % 6]) << (q / 6);
+    for (int i = 0; i < 16; i++) {
+        const int32_t v = raw[i];
+        const uint64_t mag = (uint64_t)(v < 0 ? -(int64_t)v : v);
+        int64_t level = (int64_t)(((mag << HEVC_BDSHIFT_10) + denom / 2) / denom);
+        if (level > 32767) level = 32767;
+        coeff_out[i] = (int16_t)(v < 0 ? -level : level);
+    }
+}
+
+void hevc_dequant_itransform_4x4_10(const int16_t coeff[16], int qp, int use_dst,
+                                     int16_t residual_out[16]) {
+    const uint64_t *c64 = (const uint64_t *)coeff;
+    if ((c64[0] | c64[1] | c64[2] | c64[3]) == 0ULL) {
+        memset(residual_out, 0, 16 * sizeof(int16_t));
+        return;
+    }
+
+    const int q = qp < 0 ? 0 : (qp > 63 ? 63 : qp);
+    const int64_t scale = ((int64_t)HEVC_FLAT_M * levelScale[q % 6]) << (q / 6);
+    int16_t dq[16];
+    for (int i = 0; i < 16; i++) {
+        int64_t val = (int64_t)coeff[i] * scale;
+        val = (val + (1 << (HEVC_BDSHIFT_10 - 1))) >> HEVC_BDSHIFT_10;
+        dq[i] = (int16_t)(val > 32767 ? 32767 : (val < -32768 ? -32768 : val));
+    }
+    inverse_transform_4x4_10(dq, use_dst ? DST4 : DCT4, residual_out);
 }
