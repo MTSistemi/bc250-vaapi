@@ -177,7 +177,7 @@ jobs:
         cd ..
 
     - name: Upload Build Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: bc250-driver-linux-x86_64
         path: bc250-driver-linux-x86_64.tar.gz
@@ -296,7 +296,7 @@ jobs:
         tar -czvf ../bc250-driver-linux-i386.tar.gz bc250-driver-i386/
 
     - name: Upload 32-bit Build Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: bc250-driver-linux-i386
         path: bc250-driver-linux-i386.tar.gz
