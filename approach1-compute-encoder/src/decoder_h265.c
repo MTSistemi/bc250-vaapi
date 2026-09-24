@@ -502,6 +502,7 @@ static int prepare_picture(hevcd_t *d, const hevc_sps_t *sps,
      * covered. */
     for (int i = 0; i < sps->ctb_count; i++) d->slice_of_ctb[i] = -1;
     d->slice_now = -1;
+    d->filters_done = false;
     /* Nothing carries across a picture boundary. */
     d->have_segment_end = false;
     d->have_wpp_snapshot = false;
@@ -749,6 +750,7 @@ void hevc_decoder_destroy(hevc_decoder_t *h)
     free(d->qp_y_map); free(d->edges); free(d->no_filter);
     free(d->skip); free(d->cbf_map);
     hevcd_free_filters(d);
+    hevcd_pool_destroy(d->pool);
     free(h);
 }
 
@@ -887,7 +889,7 @@ void hevc_decoder_end_picture(hevc_decoder_t *h)
                    n * sizeof *g->slice_of_ctb);
     }
 
-    if (h->d.slice) hevcd_loop_filters(&h->d);
+    if (h->d.slice && !h->d.filters_done) hevcd_loop_filters(&h->d);
     h->is_open = false;
 }
 
@@ -1066,12 +1068,17 @@ int hevc_decoder_load(hevc_decoder_t *h, gpu_image_t out, gpu_memory_t mem)
     if (want > LOAD_MAX_THREAD) want = LOAD_MAX_THREAD;
     if (want > j.bands) want = j.bands;
 
-    pthread_t t[LOAD_MAX_THREAD];
-    int alive = 0;
-    for (int i = 1; i < want; i++)
-        if (pthread_create(&t[alive], NULL, load_worker, &j) == 0) alive++;
-    load_worker(&j);
-    for (int i = 0; i < alive; i++) pthread_join(t[i], NULL);
+    hevcd_pool_t *pool = want > 1 ? hevcd_pool_for(&h->d) : NULL;
+    if (pool) {
+        hevcd_pool_run(pool, load_worker, &j, want);
+    } else {
+        pthread_t t[LOAD_MAX_THREAD];
+        int alive = 0;
+        for (int i = 1; i < want; i++)
+            if (pthread_create(&t[alive], NULL, load_worker, &j) == 0) alive++;
+        load_worker(&j);
+        for (int i = 0; i < alive; i++) pthread_join(t[i], NULL);
+    }
 
     gpu_compute_unmap_surface(gpu, mem, unmap);
     return 0;

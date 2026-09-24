@@ -677,6 +677,8 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
 #undef B
 }
 
+static bool FUNC(sao_alloc)(hevcd_t *d);
+
 /* Is there any offset to apply in this picture, and somewhere to keep the
  * block borders as the deblocking filter left them. */
 static bool FUNC(sao_prepare)(hevcd_t *d)
@@ -688,6 +690,13 @@ static bool FUNC(sao_prepare)(hevcd_t *d)
         serve = d->sao[i].kind[0] || d->sao[i].kind[1] || d->sao[i].kind[2];
     if (!serve) return false;
 
+    return FUNC(sao_alloc)(d);
+}
+
+/* Somewhere to keep the block borders, whether or not any offset turns out
+ * to be needed - the wavefront has to decide before the picture is read. */
+static bool FUNC(sao_alloc)(hevcd_t *d)
+{
     for (int c = 0; c < 3; c++) {
         const int giu = c ? 1 : 0;
         const size_t w = (size_t)(d->sps->width >> giu);

@@ -40,6 +40,9 @@ enum { HEVCD_INTRA_PLANAR = 0, HEVCD_INTRA_DC = 1,
 /* Coefficient scan orders, 6.5.3. */
 enum { HEVCD_SCAN_DIAG = 0, HEVCD_SCAN_HORIZ = 1, HEVCD_SCAN_VERT = 2 };
 
+/* Threads kept for the life of a decoder. See hevc_wpp.c. */
+typedef struct hevcd_pool hevcd_pool_t;
+
 /* One picture's worth of decoding state. */
 /* Which reference lists a prediction unit uses. */
 enum { HEVCD_PF_L0 = 1, HEVCD_PF_L1 = 2, HEVCD_PF_BI = 3 };
@@ -282,6 +285,12 @@ typedef struct {
     const hevcd_img_t *col;         /* the collocated picture, or NULL */
 
     int ctb_addr;                   /* in the picture's raster order */
+    /* The wavefront has already run the loop filters over this picture,
+     * and hevc_decoder_end_picture() must not run them again. */
+    bool filters_done;
+    /* The decoder's threads, made the first time a picture wants more
+     * than one and kept until hevc_decoder_destroy(). NULL until then. */
+    hevcd_pool_t *pool;
     bool slice_end;
 } hevcd_t;
 
@@ -299,6 +308,26 @@ int hevcd_wavefront(hevcd_t *d, const hevc_sps_t *sps, const hevc_pps_t *pps,
 /* 8.7.2 and 8.7.3, over the whole finished picture, in that order, on as
  * many threads as BC250_HEVC_THREAD or the processor count allows. */
 void hevcd_loop_filters(hevcd_t *d);
+
+/* The same, one coding tree block row and one stage at a time: 0 the
+ * vertical edges, 1 the horizontal ones, 2 keeping the borders SAO reads,
+ * 3 SAO. hevcd_filters_prepare() says which of deblocking and SAO the
+ * picture has, and false when neither. For hevc_wpp.c, which runs them
+ * while the wavefront is still decoding. */
+bool hevcd_filters_prepare(hevcd_t *d, bool *deblock, bool *sao);
+void hevcd_filter_stage(hevcd_t *d, int stage, int ry);
+
+/* A pool of worker threads. hevcd_pool_run() calls fn(arg) on the caller
+ * and on up to n - 1 of the pool's threads, and returns once every one of
+ * them has returned; hevcd_pool_helpers() says how many it would use for
+ * n, so a job that must know its team size can know it beforehand.
+ * hevcd_pool_for() makes the decoder's pool if there is none yet and
+ * returns it, or NULL if threads cannot be had - callers then do the work
+ * on the threads of old. */
+hevcd_pool_t *hevcd_pool_for(hevcd_t *d);
+int hevcd_pool_helpers(const hevcd_pool_t *p, int n);
+void hevcd_pool_run(hevcd_pool_t *p, void *(*fn)(void *), void *arg, int n);
+void hevcd_pool_destroy(hevcd_pool_t *p);
 void hevcd_free_filters(hevcd_t *d);
 
 /* 8.5.3.2: what motion one prediction unit ended up with, and 8.5.3.3:
