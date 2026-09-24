@@ -1180,6 +1180,27 @@ int hevcd_prepare_zscan(hevcd_t *d)
     return 0;
 }
 
+/* One coding tree block's motion field back to "nothing": what an intra
+ * block leaves there, since it writes none of its own, and what the
+ * blocks decoded after it may not read anyway - a unit not decoded yet is
+ * in no slice, and every neighbour question asks about the slice first.
+ * Only the block's own entries, which only it writes. */
+void hevcd_clear_ctb_motion(hevcd_t *d, int rx, int ry)
+{
+    if (!d->mvf) return;
+    const hevc_sps_t *sps = d->sps;
+    const int l = sps->log2_ctb - 2;
+    const int stride = d->min_pu_width;
+    const int x0 = rx << l, y0 = ry << l;
+    int x1 = (rx + 1) << l, y1 = (ry + 1) << l;
+    if (x1 > stride) x1 = stride;
+    if (y1 > d->min_pu_height) y1 = d->min_pu_height;
+    if (x0 >= x1) return;
+    for (int y = y0; y < y1; y++)
+        memset(d->mvf + (size_t)y * stride + x0, 0,
+               (size_t)(x1 - x0) * sizeof *d->mvf);
+}
+
 int hevcd_read_ctu(hevcd_t *d, int x0, int y0)
 {
     const hevc_sps_t *sps = d->sps;
@@ -1189,6 +1210,7 @@ int hevcd_read_ctu(hevcd_t *d, int x0, int y0)
      * here rather than in each availability test, which is handed a
      * neighbour and has no idea where "here" is. */
     d->tile_now = hevcd_tile_at(d, x0, y0);
+    hevcd_clear_ctb_motion(d, x0 >> sps->log2_ctb, y0 >> sps->log2_ctb);
     if (d->slice_of_ctb) {
         const int rs = (y0 >> sps->log2_ctb) * sps->ctb_width
                        + (x0 >> sps->log2_ctb);

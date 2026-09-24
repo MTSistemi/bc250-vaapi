@@ -22,6 +22,9 @@
 
 typedef struct hevc_decoder hevc_decoder_t;
 
+/* How many pictures one decoder can have in flight at once. */
+#define HEVC_DECODER_FRAMES 2
+
 /* `gpu` may be NULL: without it the decoder keeps the planes and a caller
  * reads them with hevc_decoder_plane(). */
 hevc_decoder_t *hevc_decoder_create(void *gpu, int width, int height);
@@ -71,6 +74,27 @@ const uint8_t *hevc_decoder_plane(const hevc_decoder_t *d, int plane,
 int hevc_decoder_load(hevc_decoder_t *d, gpu_image_t out, gpu_memory_t mem);
 
 const char *hevc_decoder_reason(int e);
+
+/* The same, for a caller decoding more than one picture at a time - the
+ * functions above are frame 0 of these.
+ *
+ * A picture is begun, sliced, ended and loaded on frame k, 0 <= k <
+ * HEVC_DECODER_FRAMES; two frames may be in any of those at the same time,
+ * on different threads. ⚠️ Pictures are BEGUN in decoding order, one
+ * after the other, each after hevc_decoder_set_references() for it -
+ * nothing else of two pictures needs ordering. `refs` are the reference
+ * pictures the caller resolved (hevc_decoder_find_ref()) before beginning,
+ * and are held, like the picture itself, until frame k begins its next:
+ * a later picture's reference set cannot free them while they are read.
+ * A picture reading one still being decoded waits for the rows it needs. */
+int hevc_decoder_begin_frame(hevc_decoder_t *d, int k, const hevc_sps_t *sps,
+                             const hevc_pps_t *pps, uintptr_t id, int poc,
+                             const void *const *refs, int n_refs);
+int hevc_decoder_frame_slice(hevc_decoder_t *d, int k, const hevc_slice_t *sl,
+                             const uint8_t *rbsp, size_t n);
+void hevc_decoder_end_frame(hevc_decoder_t *d, int k);
+int hevc_decoder_load_frame(hevc_decoder_t *d, int k, gpu_image_t out,
+                            gpu_memory_t mem);
 
 /* 7.4.7.1: the entry point offsets count the NAL unit's bytes, emulation
  * prevention included, and everything downstream reads the payload with

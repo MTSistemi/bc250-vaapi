@@ -229,6 +229,10 @@ static bool temporal(const hevcd_t *d, int x0, int y0, int w, int h,
     const hevc_sps_t *sps = d->sps;
     if (!d->col || !d->col->mvf) return false;
     if (ref_idx < 0 || ref_idx >= d->n_refs[list_idx]) return false;
+    /* Both candidates are in this block's own coding tree block row of
+     * the collocated picture - the bottom-right one is refused below when
+     * it is not - and that picture may still be decoding. */
+    hevcd_await_rows(d->col, (y0 >> sps->log2_ctb) + 1);
 
     int x = x0 + w, y = y0 + h;
     if ((y0 >> sps->log2_ctb) == (y >> sps->log2_ctb)

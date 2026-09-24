@@ -24,8 +24,71 @@
 #include "bitreader.h"
 #include "hevc_dec_tables.h"   /* the diagonal scans, for the matrices */
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* One picture, everything vaEndPicture had, handed to the decode thread:
+ * the parameter buffers copied, the slices and their data moved out of the
+ * context rather than copied - the context starts the next picture with
+ * buffers of its own. */
+/* The picture's references, found in the decoder's buffer once, before
+ * the picture is begun. ⚠️ Not looked up per slice: with two pictures in
+ * flight the next one's reference set may already have let go of a
+ * picture this one still reads - the lookup would miss it, where the
+ * pointer taken beforehand is held and stays good. */
+struct resolved_refs {
+    const void *img[15];            /* by index into ReferenceFrames */
+    const void *closest;            /* the stand-in when a list is empty */
+};
+
+struct bc250_hevc_job {
+    VAPictureParameterBufferHEVC pic;
+    VAIQMatrixBufferHEVC iq;
+    int has_iq;
+    struct bc250_hevc_dec_slice *slices;
+    int n_slices;
+    uint8_t *data;
+    int width, height;
+    VASurfaceID target;
+    gpu_image_t img;
+    gpu_memory_t mem;
+    struct bc250_hevc_job *next;
+    /* Filled by begin_job(). */
+    int frame;
+    bool begun;
+    hevc_sps_t sps;
+    hevc_pps_t pps;
+    struct resolved_refs rr;
+};
+
+/* The context's decode thread and its queue.
+ *
+ * ⚠️ One thread per context, and pictures decoded in the order they were
+ * ended: the decoder keeps its own reference pictures and every picture
+ * predicts from the ones before it. The point is not decoding pictures at
+ * the same time but letting the application prepare the next one - parse
+ * it, fill its buffers - while this one decodes. */
+#define ASYNC_DEPTH 4
+struct bc250_hevc_async;
+struct decode_worker {
+    struct bc250_hevc_async *a;
+    int frame;                      /* the decoder frame this thread owns */
+    pthread_t thread;
+    uint8_t *rbsp;
+    size_t cap_rbsp;
+};
+struct bc250_hevc_async {
+    struct decode_worker w[HEVC_DECODER_FRAMES];
+    int n_workers;
+    pthread_mutex_t m;
+    pthread_cond_t cv;
+    struct bc250_hevc_job *head, *tail;
+    int queued;                     /* queued or running */
+    bool quit;
+    bc250_driver_data *data;
+    hevc_decoder_t *dec;
+};
 
 void bc250_hevc_dec_reset(bc250_context *c)
 {
@@ -307,7 +370,7 @@ static void fill_slice(const VAPictureParameterBufferHEVC *pp,
                        const VASliceParameterBufferHEVC *sp,
                        const hevc_pps_t *pps,
                        int nal_type,
-                       hevc_decoder_t *dec,
+                       const struct resolved_refs *rr,
                        hevc_slice_t *sl)
 {
     memset(sl, 0, sizeof(*sl));
@@ -389,7 +452,8 @@ static void fill_slice(const VAPictureParameterBufferHEVC *pp,
             if (ref_idx < 15 && is_valid(&pp->ReferenceFrames[ref_idx])) {
                 uintptr_t ref_surf = (uintptr_t)pp->ReferenceFrames[ref_idx].picture_id;
                 int ref_poc = pp->ReferenceFrames[ref_idx].pic_order_cnt;
-                const void *img = hevc_decoder_find_ref(dec, ref_surf, ref_poc);
+                (void)ref_surf; (void)ref_poc;
+                const void *img = rr->img[ref_idx];
                 if (img) {
                     /* Long-term or not decides whether a motion vector
                      * pointing at it may be scaled, 8.5.3.2.7. */
@@ -402,7 +466,7 @@ static void fill_slice(const VAPictureParameterBufferHEVC *pp,
         }
         /* Concealment fallback if reference frame was dropped or lost */
         if (sl->explicit_n_refs[l] == 0 && want > 0) {
-            const void *any = hevc_decoder_find_closest(dec, sl->poc);
+            const void *any = rr->closest;
             if (any) {
                 while (sl->explicit_n_refs[l] < want)
                     sl->explicit_ref_pic[l][sl->explicit_n_refs[l]++] = any;
@@ -428,11 +492,12 @@ static void fill_slice(const VAPictureParameterBufferHEVC *pp,
     }
 }
 
-VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
-                               gpu_memory_t mem)
+/* The checks vaEndPicture can still answer with an error. Everything here
+ * reads only the picture parameters, so it is cheap, and it is what used to
+ * be refused at the top of the decode. */
+VAStatus bc250_hevc_dec_check(bc250_context *c)
 {
-    hevc_decoder_t *dec = c->h265_dec;
-    if (!dec) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (!c->h265_dec) return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (!c->hevc_dec_state.has_pic || c->hevc_dec_state.n_slices == 0)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
@@ -462,18 +527,63 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
         && pp->pic_fields.bits.entropy_coding_sync_enabled_flag)
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     hevc_sps_t sps;
-    hevc_pps_t pps;
     fill_sps(pp, &sps);
-    fill_pps(pp, &pps);
     if (sps.width != c->width || sps.height != c->height)
         return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
+    return VA_STATUS_SUCCESS;
+}
+
+struct bc250_hevc_job *bc250_hevc_dec_take(bc250_context *c, VASurfaceID target,
+                                           gpu_image_t img, gpu_memory_t mem)
+{
+    struct bc250_hevc_job *job = calloc(1, sizeof *job);
+    if (!job) return NULL;
+    job->pic = c->hevc_dec_state.pic;
+    job->iq = c->hevc_dec_state.iq;
+    job->has_iq = c->hevc_dec_state.has_iq;
+    job->slices = c->hevc_dec_state.slices;
+    job->n_slices = c->hevc_dec_state.n_slices;
+    job->data = c->hevc_dec_state.data;
+    job->width = c->width;
+    job->height = c->height;
+    job->target = target;
+    job->img = img;
+    job->mem = mem;
+    /* Moved, not copied: the next picture grows buffers of its own. */
+    c->hevc_dec_state.slices = NULL;
+    c->hevc_dec_state.cap_slices = 0;
+    c->hevc_dec_state.data = NULL;
+    c->hevc_dec_state.cap_data = 0;
+    bc250_hevc_dec_reset(c);
+    return job;
+}
+
+static void free_job(struct bc250_hevc_job *job)
+{
+    free(job->slices);
+    free(job->data);
+    free(job);
+}
+
+/* The first half of a picture, which has to happen in decoding order: the
+ * parameter sets, which pictures are still references, pointers to them,
+ * and the picture opened on frame `frame`. Cheap; the decode thread does it
+ * with the queue lock held, which is what keeps the order. */
+static VAStatus begin_job(hevc_decoder_t *dec, int frame,
+                          struct bc250_hevc_job *job)
+{
+    const VAPictureParameterBufferHEVC *pp = &job->pic;
+    hevc_sps_t *sps = &job->sps;
+    hevc_pps_t *pps = &job->pps;
+    fill_sps(pp, sps);
+    fill_pps(pp, pps);
     /* Enabled with no matrix buffer means the defaults, as it does in a
      * bitstream. */
-    if (sps.scaling_list_enabled) {
-        if (c->hevc_dec_state.has_iq)
-            scaling_from_va(&c->hevc_dec_state.iq, &sps.scaling);
+    if (sps->scaling_list_enabled) {
+        if (job->has_iq)
+            scaling_from_va(&job->iq, &sps->scaling);
         else
-            hevc_scaling_defaults(&sps.scaling);
+            hevc_scaling_defaults(&sps->scaling);
     }
     /* ⚠️ NumPicTotalCurr sets the width of every list_entry in the slice
      * header the fallback parse below reads, and it counts long-term
@@ -486,7 +596,7 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
                 & (VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE
                    | VA_PICTURE_HEVC_RPS_ST_CURR_AFTER
                    | VA_PICTURE_HEVC_RPS_LT_CURR)))
-            pps.num_pic_total_curr++;
+            pps->num_pic_total_curr++;
 
     /* Which surfaces are still references. This runs before the picture is
      * opened, so that the one about to be decoded cannot be handed a slot
@@ -502,22 +612,47 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
     }
     hevc_decoder_set_references(dec, ref_pic, poc, n_refs);
 
-    if (hevc_decoder_begin_picture(dec, &sps, &pps,
-                                   (uintptr_t)c->current_render_target,
-                                   pp->CurrPic.pic_order_cnt) != 0)
+    /* Every reference found now, and held from begin_frame on. */
+    const void *held[16];
+    int n_held = 0;
+    memset(&job->rr, 0, sizeof job->rr);
+    for (int i = 0; i < 15; i++) {
+        if (!is_valid(&pp->ReferenceFrames[i])) continue;
+        job->rr.img[i] = hevc_decoder_find_ref(
+            dec, (uintptr_t)pp->ReferenceFrames[i].picture_id,
+            pp->ReferenceFrames[i].pic_order_cnt);
+        if (job->rr.img[i] && n_held < 16) held[n_held++] = job->rr.img[i];
+    }
+    job->rr.closest = hevc_decoder_find_closest(dec, pp->CurrPic.pic_order_cnt);
+    if (job->rr.closest && n_held < 16) held[n_held++] = job->rr.closest;
+
+    job->frame = frame;
+    if (hevc_decoder_begin_frame(dec, frame, sps, pps, (uintptr_t)job->target,
+                                 pp->CurrPic.pic_order_cnt, held, n_held) != 0)
         return VA_STATUS_ERROR_OPERATION_FAILED;
+    job->begun = true;
+    return VA_STATUS_SUCCESS;
+}
+
+/* The rest, which may run beside the next picture's: every slice, the loop
+ * filters, and the copy into the surface. */
+static VAStatus finish_job(hevc_decoder_t *dec, struct bc250_hevc_job *job,
+                           uint8_t **rbsp_p, size_t *cap_rbsp)
+{
+    const VAPictureParameterBufferHEVC *pp = &job->pic;
+    const int frame = job->frame;
+    const hevc_pps_t *pps = &job->pps;
 
     /* One set of parameter sets for optional bitstream entry-point fallback */
     hevc_sps_t sps_store[16];
     hevc_pps_t pps_store[64];
-    for (int i = 0; i < 16; i++) sps_store[i] = sps;
-    for (int i = 0; i < 64; i++) { pps_store[i] = pps; pps_store[i].pps_id = i; }
+    for (int i = 0; i < 16; i++) sps_store[i] = job->sps;
+    for (int i = 0; i < 64; i++) { pps_store[i] = *pps; pps_store[i].pps_id = i; }
 
-    for (int i = 0; i < c->hevc_dec_state.n_slices; i++) {
-        if (c->hevc_dec_state.slices[i].off == (size_t)-1) continue;
-        const uint8_t *raw = c->hevc_dec_state.data
-            + c->hevc_dec_state.slices[i].off;
-        const size_t raw_len = c->hevc_dec_state.slices[i].len;
+    for (int i = 0; i < job->n_slices; i++) {
+        if (job->slices[i].off == (size_t)-1) continue;
+        const uint8_t *raw = job->data + job->slices[i].off;
+        const size_t raw_len = job->slices[i].len;
         if (raw_len < 3) continue;
 
         /* Skip start code prefix if present in buffer */
@@ -530,19 +665,23 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
         const size_t len = raw_len - nal_off;
         if (len < 3) continue;
 
-        if (c->hevc_dec_state.cap_rbsp < len) {
-            uint8_t *p = realloc(c->hevc_dec_state.rbsp, len);
-            if (!p) return VA_STATUS_ERROR_ALLOCATION_FAILED;
-            c->hevc_dec_state.rbsp = p;
-            c->hevc_dec_state.cap_rbsp = len;
+        if (*cap_rbsp < len) {
+            uint8_t *p = realloc(*rbsp_p, len);
+            if (!p) {
+                hevc_decoder_end_frame(dec, frame);
+                return VA_STATUS_ERROR_ALLOCATION_FAILED;
+            }
+            *rbsp_p = p;
+            *cap_rbsp = len;
         }
-        const size_t n = br_extract_rbsp(c->hevc_dec_state.rbsp, len, nal, len);
+        uint8_t *rbsp = *rbsp_p;
+        const size_t n = br_extract_rbsp(rbsp, len, nal, len);
 
         const int kind = (nal[0] >> 1) & 0x3f;
-        const VASliceParameterBufferHEVC *sp = &c->hevc_dec_state.slices[i].p;
+        const VASliceParameterBufferHEVC *sp = &job->slices[i].p;
 
         hevc_slice_t sl;
-        fill_slice(pp, sp, &pps, kind, dec, &sl);
+        fill_slice(pp, sp, pps, kind, &job->rr, &sl);
 
         /* The header re-read, for what VA does not carry in the form the
          * decoder wants. ⚠️ Always tried, and when it reads cleanly it
@@ -556,7 +695,7 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
          * When it does not read, VA's figures stand. */
         {
             hevc_slice_t parsed;
-            if (hevc_ps_read_slice(&parsed, c->hevc_dec_state.rbsp, n, kind,
+            if (hevc_ps_read_slice(&parsed, rbsp, n, kind,
                                    sps_store, pps_store) == 0) {
                 sl.data_bit_offset = parsed.data_bit_offset;
                 sl.num_entry_point_offsets = parsed.num_entry_point_offsets;
@@ -567,14 +706,143 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
             }
         }
 
-        hevc_decoder_slice(dec, &sl, c->hevc_dec_state.rbsp, n);
+        hevc_decoder_frame_slice(dec, frame, &sl, rbsp, n);
     }
 
     /* ⚠️ Always finished, even when every slice was refused: a picture
      * that is never ended leaves the buffer holding a slot no later one
-     * can reuse, and the application still gets its surface back. */
-    hevc_decoder_end_picture(dec);
-    if (hevc_decoder_load(dec, out, mem) != 0)
+     * can reuse, the application still gets its surface back, and a
+     * picture decoding beside this one may be waiting for its rows. */
+    hevc_decoder_end_frame(dec, frame);
+    if (hevc_decoder_load_frame(dec, frame, job->img, job->mem) != 0)
         return VA_STATUS_ERROR_OPERATION_FAILED;
+    return VA_STATUS_SUCCESS;
+}
+
+/* Both halves in a row, on frame 0: the synchronous path. */
+static VAStatus run_job(hevc_decoder_t *dec, struct bc250_hevc_job *job,
+                        uint8_t **rbsp_p, size_t *cap_rbsp)
+{
+    const VAStatus st = begin_job(dec, 0, job);
+    if (st != VA_STATUS_SUCCESS) return st;
+    return finish_job(dec, job, rbsp_p, cap_rbsp);
+}
+
+/* One of the context's decode threads. It owns one decoder frame. It takes
+ * the next picture and begins it with the queue lock still held - so that
+ * pictures are begun strictly in the order they were ended, whichever
+ * thread takes them - then decodes it with the lock dropped, beside
+ * whatever the other thread is decoding. A picture that reads one still
+ * being decoded waits inside the decoder for the rows it needs. */
+static void *decode_thread(void *arg)
+{
+    struct decode_worker *w = arg;
+    struct bc250_hevc_async *a = w->a;
+    for (;;) {
+        pthread_mutex_lock(&a->m);
+        while (!a->head && !a->quit) pthread_cond_wait(&a->cv, &a->m);
+        struct bc250_hevc_job *job = a->head;
+        if (!job) {                         /* quit, and nothing left */
+            pthread_mutex_unlock(&a->m);
+            break;
+        }
+        a->head = job->next;
+        if (!a->head) a->tail = NULL;
+        VAStatus st = begin_job(a->dec, w->frame, job);
+        pthread_mutex_unlock(&a->m);
+
+        if (st == VA_STATUS_SUCCESS)
+            st = finish_job(a->dec, job, &w->rbsp, &w->cap_rbsp);
+        bc250_decode_finished(a->data, job->target, st);
+        free_job(job);
+
+        pthread_mutex_lock(&a->m);
+        a->queued--;
+        pthread_cond_broadcast(&a->cv);     /* room in the queue */
+        pthread_mutex_unlock(&a->m);
+    }
+    return NULL;
+}
+
+static struct bc250_hevc_async *async_start(bc250_driver_data *data,
+                                            hevc_decoder_t *dec)
+{
+    struct bc250_hevc_async *a = calloc(1, sizeof *a);
+    if (!a) return NULL;
+    a->data = data;
+    a->dec = dec;
+    pthread_mutex_init(&a->m, NULL);
+    pthread_cond_init(&a->cv, NULL);
+
+    /* BC250_HEVC_FRAMES=1 decodes one picture at a time, in order - still
+     * after vaEndPicture has returned. */
+    int want = HEVC_DECODER_FRAMES;
+    const char *s = getenv("BC250_HEVC_FRAMES");
+    if (s && atoi(s) >= 1 && atoi(s) < want) want = atoi(s);
+    for (int k = 0; k < want; k++) {
+        struct decode_worker *w = &a->w[a->n_workers];
+        w->a = a;
+        w->frame = k;
+        if (pthread_create(&w->thread, NULL, decode_thread, w) == 0)
+            a->n_workers++;
+    }
+    if (!a->n_workers) {
+        pthread_mutex_destroy(&a->m);
+        pthread_cond_destroy(&a->cv);
+        free(a);
+        return NULL;
+    }
+    return a;
+}
+
+void bc250_hevc_async_stop(struct bc250_hevc_async *a)
+{
+    if (!a) return;
+    pthread_mutex_lock(&a->m);
+    a->quit = true;
+    pthread_cond_broadcast(&a->cv);
+    pthread_mutex_unlock(&a->m);
+    for (int k = 0; k < a->n_workers; k++) {
+        pthread_join(a->w[k].thread, NULL);
+        free(a->w[k].rbsp);
+    }
+    pthread_mutex_destroy(&a->m);
+    pthread_cond_destroy(&a->cv);
+    free(a);
+}
+
+VAStatus bc250_hevc_dec_submit(bc250_driver_data *data, bc250_context *c,
+                               struct bc250_hevc_job *job)
+{
+    /* Asked every picture rather than remembered: two contexts can end
+     * pictures at the same moment, and a remembered answer written by
+     * both is a data race, harmless or not. getenv is cheap next to a
+     * picture. */
+    const bool sync_mode = getenv("BC250_HEVC_SYNC") != NULL;
+
+    if (!c->hevc_async && !sync_mode)
+        c->hevc_async = async_start(data, c->h265_dec);
+    struct bc250_hevc_async *a = c->hevc_async;
+    if (!a) {
+        /* Synchronous, as before: asked for, or no thread to be had. */
+        const VAStatus st = run_job(c->h265_dec, job,
+                                    &c->hevc_dec_state.rbsp,
+                                    &c->hevc_dec_state.cap_rbsp);
+        bc250_decode_finished(data, job->target, st);
+        free_job(job);
+        return st;
+    }
+
+    pthread_mutex_lock(&a->m);
+    /* A few pictures ahead at most: past that the application is only
+     * filling memory, and a player's latency grows with every one. */
+    while (a->queued >= ASYNC_DEPTH) pthread_cond_wait(&a->cv, &a->m);
+    job->next = NULL;
+    if (a->tail) a->tail->next = job;
+    else a->head = job;
+    a->tail = job;
+    a->queued++;
+    pthread_cond_broadcast(&a->cv);
+    pthread_mutex_unlock(&a->m);
     return VA_STATUS_SUCCESS;
 }

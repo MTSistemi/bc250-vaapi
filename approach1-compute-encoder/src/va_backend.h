@@ -83,6 +83,12 @@ struct bc250_surface {
      * caller's point of view while still deferring the actual Vulkan
      * teardown until the last outstanding derived image is destroyed. */
     int pending_destroy;
+    /* How many decodes into this surface are queued or running, and how
+     * the last one ended. A surface with one pending is not ready: every
+     * call that reads or replaces its contents waits for zero first - see
+     * wait_decoded() in va_backend.c. */
+    int decode_pending;
+    VAStatus decode_status;
 };
 
 struct bc250_config {
@@ -127,6 +133,9 @@ struct bc250_context {
     hevc_encoder_t *hevc_enc;
     h264_decoder_t *h264_dec;
     hevc_decoder_t *h265_dec;
+    /* The thread that decodes this context's H.265 pictures after
+     * vaEndPicture has returned. NULL until the first one. */
+    struct bc250_hevc_async *hevc_async;
 
     /* BC250_PIPELINE=1 only: one frame whose GPU work is in flight and whose
      * CPU entropy coding has not been done yet. At most one - the pipeline is
@@ -247,6 +256,8 @@ struct bc250_image {
 
 typedef struct {
     pthread_mutex_t lock;
+    /* Signalled, under `lock`, whenever a surface's decode_pending drops. */
+    pthread_cond_t idle;
     gpu_context_t gpu;
 
     bc250_surface surfaces[MAX_SURFACES];
@@ -274,8 +285,23 @@ VAStatus bc250_dec_decode(bc250_context *c, gpu_image_t out, gpu_memory_t mem);
 void bc250_hevc_dec_reset(bc250_context *c);
 void bc250_hevc_dec_free(bc250_context *c);
 VAStatus bc250_hevc_dec_render(bc250_context *c, bc250_buffer *b);
-VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
-                               gpu_memory_t mem);
+/* vaEndPicture for H.265, in two halves. check() refuses what can be
+ * refused while the application is still waiting for an answer, with the
+ * driver lock held. submit() - lock DROPPED, target surface pinned and
+ * marked pending - takes the accumulated picture and queues it for the
+ * context's decode thread, or with BC250_HEVC_SYNC=1 decodes it there and
+ * then. Either way the picture ends in bc250_decode_finished(). */
+VAStatus bc250_hevc_dec_check(bc250_context *c);
+struct bc250_hevc_job *bc250_hevc_dec_take(bc250_context *c, VASurfaceID target,
+                                           gpu_image_t img, gpu_memory_t mem);
+VAStatus bc250_hevc_dec_submit(bc250_driver_data *data, bc250_context *c,
+                               struct bc250_hevc_job *job);
+/* Waits for everything queued, then stops the thread. Lock DROPPED. */
+void bc250_hevc_async_stop(struct bc250_hevc_async *a);
+/* A decode into `target` is over: unpins it, lowers decode_pending and
+ * wakes whoever waits. Takes the driver lock itself. */
+void bc250_decode_finished(bc250_driver_data *data, VASurfaceID target,
+                           VAStatus st);
 
 /* Core VA-API Driver Functions */
 VAStatus __vaDriverInit_1_0(VADriverContextP ctx);

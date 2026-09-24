@@ -134,7 +134,8 @@ int hevcd_prepare_tiles(hevcd_t *d)
 
 void hevcd_free_tiles(hevcd_t *d)
 {
-    free(d->slice_of_ctb); d->slice_of_ctb = NULL;
+    /* The slice map belongs to the picture, which frees it. */
+    d->slice_of_ctb = NULL;
     d->n_slice_map = 0;
     free(d->rs_to_ts); d->rs_to_ts = NULL;
     free(d->ts_to_rs); d->ts_to_rs = NULL;

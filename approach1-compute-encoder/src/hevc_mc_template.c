@@ -359,6 +359,22 @@ static void FUNC(predict_inter)(hevcd_t *d, int x0, int y0,
                           (m->pred_flag & HEVCD_PF_L1) != 0 };
     const bool weights = FUNC(has_weights)(d);
 
+    /* ⚠️ A reference may be a picture still being decoded at the same
+     * time as this one. Wait for the rows this block reads from it: as
+     * far down as the vector reaches, plus the filter's reach below - four
+     * luma rows, two chroma ones. */
+    for (int l = 0; l < 2; l++) {
+        if (!usa[l]) continue;
+        const int i = m->ref_idx[l];
+        if (i < 0 || i >= d->n_refs[l] || !d->ref_pic[l][i]) continue;
+        int last = y0 + h - 1 + (m->mv[l][1] >> 2) + 4;
+        const int last_c = 2 * ((y0 >> 1) + (h >> 1) - 1 + (m->mv[l][1] >> 3) + 2) + 1;
+        if (last_c > last) last = last_c;
+        if (last >= sps->height) last = sps->height - 1;
+        if (last < 0) last = 0;
+        hevcd_await_rows(d->ref_pic[l][i], (last >> sps->log2_ctb) + 1);
+    }
+
     for (int plane = 0; plane < 3; plane++) {
         /* ⚠️ Luma and chroma carry their own depth. Equal in every profile
          * we accept, and reading the wrong one would be invisible until

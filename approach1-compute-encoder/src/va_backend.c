@@ -464,6 +464,30 @@ static void bc250_surface_unref(bc250_driver_data *data, VASurfaceID id) {
     }
 }
 
+/* Until no decode into this surface is queued or running. Called with the
+ * driver lock held exactly once - the condition variable releases one
+ * level of the recursive mutex, and a second level would keep the decode
+ * thread from ever finishing. */
+static void wait_decoded(bc250_driver_data *data, VASurfaceID id) {
+    while (VALID_ID(id, MAX_SURFACES) && data->surfaces[id].allocated
+           && data->surfaces[id].decode_pending > 0)
+        pthread_cond_wait(&data->idle, &data->lock);
+}
+
+void bc250_decode_finished(bc250_driver_data *data, VASurfaceID target,
+                           VAStatus st) {
+    DRIVER_LOCK(data);
+    if (VALID_ID(target, MAX_SURFACES) && data->surfaces[target].allocated) {
+        bc250_surface *s = &data->surfaces[target];
+        if (s->decode_pending > 0) s->decode_pending--;
+        s->decode_status = st;
+        s->image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+        bc250_surface_unref(data, target);
+    }
+    pthread_cond_broadcast(&data->idle);
+    DRIVER_UNLOCK(data);
+}
+
 VAStatus bc250_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list, int num_surfaces) {
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data || !surface_list) return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -479,6 +503,7 @@ VAStatus bc250_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list, 
          * app-held reference - only the first vaDestroySurfaces() call on
          * a given surface releases that reference. */
         if (surf->pending_destroy) continue;
+        wait_decoded(data, id);
 
         /* From here on this VASurfaceID is invalid for the application to
          * use in any other VA call (vaBeginPicture, vaDeriveImage,
@@ -620,6 +645,16 @@ VAStatus bc250_DestroyContext(VADriverContextP ctx, VAContextID context) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
     bc250_context *c = &data->contexts[context];
+    /* ⚠️ The decode thread finishes what is queued before it stops, and
+     * finishing takes the driver lock - so it is stopped with the lock
+     * dropped. */
+    if (c->hevc_async) {
+        struct bc250_hevc_async *a = c->hevc_async;
+        c->hevc_async = NULL;
+        DRIVER_UNLOCK(data);
+        bc250_hevc_async_stop(a);
+        DRIVER_LOCK(data);
+    }
     /* Deliberately dropped rather than finished: the client is tearing the
      * context down, so it is never going to read this frame's coded buffer,
      * and finishing would mean entropy-coding a frame nobody wants. Cleared
@@ -862,6 +897,9 @@ VAStatus bc250_BeginPicture(VADriverContextP ctx, VAContextID context, VASurface
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
+    /* Decoding into a surface still being decoded into would race the
+     * decode thread for its contents. */
+    wait_decoded(data, render_target);
     bc250_context *c = &data->contexts[context];
     c->current_render_target = render_target;
     c->coded_buf_id = VA_INVALID_ID;
@@ -1293,6 +1331,7 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
             DRIVER_UNLOCK(data);
             return VA_STATUS_ERROR_INVALID_SURFACE;
         }
+        wait_decoded(data, c->vpp_state.source);
         bc250_surface *from = &data->surfaces[c->vpp_state.source];
 
         /* Whole surface unless the caller named a rectangle. */
@@ -1323,20 +1362,27 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
     }
 
     if (c->h265_dec) {
+        /* What can be refused is refused now, while the application waits
+         * for the answer; the decoding itself happens after this returns,
+         * on the context's own thread. The surface stays pinned and marked
+         * pending until it is done - see bc250_decode_finished(). */
+        const VAStatus chk = bc250_hevc_dec_check(c);
+        if (chk != VA_STATUS_SUCCESS) {
+            DRIVER_UNLOCK(data);
+            return chk;
+        }
         VASurfaceID target = c->current_render_target;
-        gpu_image_t img = surf->image;
-        gpu_memory_t memo = surf->memory;
+        struct bc250_hevc_job *job = bc250_hevc_dec_take(c, target, surf->image,
+                                                         surf->memory);
+        if (!job) {
+            DRIVER_UNLOCK(data);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
         surf->ref_count++;
+        surf->decode_pending++;
+        surf->decode_status = VA_STATUS_SUCCESS;
         DRIVER_UNLOCK(data);
-
-        VAStatus st = bc250_hevc_dec_decode(c, img, memo);
-
-        DRIVER_LOCK(data);
-        bc250_surface_unref(data, target);
-        if (VALID_ID(target, MAX_SURFACES) && data->surfaces[target].allocated)
-            data->surfaces[target].image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
-        DRIVER_UNLOCK(data);
-        return st;
+        return bc250_hevc_dec_submit(data, c, job);
     }
 
     if (c->h264_dec) {
@@ -1473,6 +1519,8 @@ VAStatus bc250_SyncSurface(VADriverContextP ctx, VASurfaceID render_target) {
                 bc250_finish_pending_frame(data, &data->contexts[i]);
         }
     }
+    wait_decoded(data, render_target);
+    const VAStatus decoded = data->surfaces[render_target].decode_status;
     int slot = gpu_compute_submitted_slot(&data->gpu);
     DRIVER_UNLOCK(data);
 
@@ -1482,13 +1530,21 @@ VAStatus bc250_SyncSurface(VADriverContextP ctx, VASurfaceID render_target) {
         int sync_res = gpu_compute_sync_slot(&data->gpu, slot);
         if (sync_res != 0) return VA_STATUS_ERROR_OPERATION_FAILED;
     }
-    return VA_STATUS_SUCCESS;
+    /* A decode that failed after vaEndPicture had already said yes. */
+    return decoded == VA_STATUS_SUCCESS ? VA_STATUS_SUCCESS
+                                        : VA_STATUS_ERROR_DECODING_ERROR;
 }
 
 VAStatus bc250_QuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target, VASurfaceStatus *status) {
-    (void)ctx; (void)render_target;
     if (!status) return VA_STATUS_ERROR_INVALID_PARAMETER;
     *status = VASurfaceReady;
+    bc250_driver_data *data = get_driver_data(ctx);
+    if (!data) return VA_STATUS_SUCCESS;
+    DRIVER_LOCK(data);
+    if (VALID_ID(render_target, MAX_SURFACES) && data->surfaces[render_target].allocated
+        && data->surfaces[render_target].decode_pending > 0)
+        *status = VASurfaceRendering;
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1620,6 +1676,7 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
         DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
+    wait_decoded(data, surface);
     bc250_surface *surf = &data->surfaces[surface];
 
     const int ten_bit = surf->image.format == GPU_IMAGE_P010;
@@ -1723,6 +1780,7 @@ VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         return VA_STATUS_ERROR_INVALID_IMAGE;
     }
 
+    wait_decoded(data, surface);
     bc250_surface *surf = &data->surfaces[surface];
     bc250_image *img = &data->images[image];
     bc250_buffer *buf = &data->buffers[img->buffer_id];
@@ -1777,6 +1835,7 @@ VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID ima
         return VA_STATUS_ERROR_INVALID_IMAGE;
     }
 
+    wait_decoded(data, surface);
     bc250_surface *surf = &data->surfaces[surface];
     bc250_image *img = &data->images[image];
     bc250_buffer *buf = &data->buffers[img->buffer_id];
@@ -1836,6 +1895,7 @@ VAStatus bc250_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
     }
+    wait_decoded(data, surface_id);
     bc250_surface *surf = &data->surfaces[surface_id];
 
     gpu_nv12_layout_t layout;
@@ -2037,6 +2097,16 @@ VAStatus bc250_QueryVideoProcPipelineCaps(VADriverContextP ctx, VAContextID cont
 VAStatus bc250_Terminate(VADriverContextP ctx) {
     bc250_driver_data *data = get_driver_data(ctx);
     if (data) {
+        /* ⚠️ Before the lock: the contexts below are destroyed with it
+         * held twice over, and a decode thread still finishing a picture
+         * could then never take it. */
+        for (int i = 0; i < MAX_CONTEXTS; i++) {
+            if (data->contexts[i].allocated && data->contexts[i].hevc_async) {
+                struct bc250_hevc_async *a = data->contexts[i].hevc_async;
+                data->contexts[i].hevc_async = NULL;
+                bc250_hevc_async_stop(a);
+            }
+        }
         DRIVER_LOCK(data);
         /* The VA-API contract expects callers to have destroyed every
          * config/context/buffer/image/surface before vaTerminate(), but a
@@ -2074,6 +2144,7 @@ VAStatus bc250_Terminate(VADriverContextP ctx) {
         gpu_compute_terminate(&data->gpu);
         ctx->pDriverData = NULL;
         DRIVER_UNLOCK(data);
+        pthread_cond_destroy(&data->idle);
         pthread_mutex_destroy(&data->lock);
         free(data);
     }
@@ -2091,6 +2162,7 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&data->lock, &attr);
     pthread_mutexattr_destroy(&attr);
+    pthread_cond_init(&data->idle, NULL);
 
     if (gpu_compute_init(&data->gpu) != 0) {
         fprintf(stderr, "[bc250-drv] Failed to initialize Vulkan compute backend!\n");

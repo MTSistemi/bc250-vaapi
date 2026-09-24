@@ -106,6 +106,8 @@ typedef struct {
     int next_task[4];               /* the next row of each stage to claim */
     uint8_t *task_done;             /* [stage * rows + row] */
     int tasks_left;
+    bool deblock_on, sao_on;
+    int final_rows;                 /* rows announced as final so far */
 } wave_t;
 
 /* This row has finished `count` units, and whoever is below may go on. */
@@ -268,6 +270,17 @@ static bool ready(const wave_t *o, int s, int r)
     }
 }
 
+/* Is row r final: nothing will write it again. With SAO that is its own
+ * SAO done; with deblocking alone, its horizontal edges and the ones of
+ * the row below, whose top edge reaches three rows into it. Under fm. */
+static bool row_final(const wave_t *o, int r)
+{
+    const int last = o->rows - 1;
+    if (o->sao_on) return DONE(3, r);
+    if (o->deblock_on) return DONE(1, r) && (r == last || DONE(1, r + 1));
+    return decoded(o, r);
+}
+
 /* Take filter work until there is none left in the picture, sleeping
  * while what remains waits on something still running. */
 static void filter_tasks(wave_t *o)
@@ -292,6 +305,13 @@ static void filter_tasks(wave_t *o)
         pthread_mutex_lock(&o->fm);
         o->task_done[s * o->rows + r] = 1;
         o->tasks_left--;
+        /* Rows now final, from the top, for a picture that predicts from
+         * this one and is decoding at the same time. */
+        const int before = o->final_rows;
+        while (o->final_rows < o->rows && row_final(o, o->final_rows))
+            o->final_rows++;
+        if (o->final_rows > before)
+            hevcd_rows_ready(o->pic->current, o->final_rows);
         pthread_cond_broadcast(&o->fc);
     }
     pthread_mutex_unlock(&o->fm);
@@ -309,6 +329,32 @@ static void *worker(void *arg)
     }
     if (o->filtering) filter_tasks(o);
     return NULL;
+}
+
+/* --------------------------------------------------- rows and readers */
+
+void hevcd_rows_ready(hevcd_img_t *g, int rows)
+{
+    if (!g) return;
+    if (atomic_load_explicit(&g->rows_ready, memory_order_relaxed) >= rows)
+        return;
+    if (g->progress) pthread_mutex_lock(&g->progress->m);
+    atomic_store_explicit(&g->rows_ready, rows, memory_order_release);
+    if (g->progress) {
+        pthread_cond_broadcast(&g->progress->cv);
+        pthread_mutex_unlock(&g->progress->m);
+    }
+}
+
+void hevcd_await_rows(const hevcd_img_t *g, int rows)
+{
+    if (!g || !g->progress) return;
+    if (atomic_load_explicit(&g->rows_ready, memory_order_acquire) >= rows)
+        return;
+    pthread_mutex_lock(&g->progress->m);
+    while (atomic_load_explicit(&g->rows_ready, memory_order_acquire) < rows)
+        pthread_cond_wait(&g->progress->cv, &g->progress->m);
+    pthread_mutex_unlock(&g->progress->m);
 }
 
 /* ------------------------------------------------------------ the pool
@@ -503,6 +549,8 @@ int hevcd_wavefront(hevcd_t *d, const hevc_sps_t *sps, const hevc_pps_t *pps,
         if (o.task_done) {
             o.filtering = true;
             o.pic = d;
+            o.deblock_on = deblock;
+            o.sao_on = sao;
             pthread_mutex_init(&o.fm, NULL);
             pthread_cond_init(&o.fc, NULL);
             /* A stage the picture does not have is done before it starts. */

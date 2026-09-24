@@ -15,6 +15,8 @@
 #define BC250_HEVC_DEC_INTERNAL_H
 
 #include "hevc_ps.h"
+
+#include <pthread.h>
 #include "hevc_cabac_dec.h"
 
 /* Prediction modes, 7.4.9.5. */
@@ -65,6 +67,13 @@ typedef struct {
     int32_t ref_poc[2];
 } hevcd_mvf_t;
 
+/* Where pictures announce progress, and where readers wait for it: one
+ * per decoder, shared by every picture in its buffer. */
+typedef struct hevcd_progress {
+    pthread_mutex_t m;
+    pthread_cond_t cv;
+} hevcd_progress_t;
+
 /* A picture that later ones predict from.
  *
  * ⚠️ It carries its own reference lists as picture order counts and not as
@@ -92,8 +101,23 @@ typedef struct {
         uint8_t is_lt[2][16];
     } *lists;
     size_t n_lists;
-    int32_t *slice_of_ctb;      /* a copy, taken when the picture ends */
+    /* Which slice decoded each coding tree block. ⚠️ The picture's own,
+     * written as it is decoded - the decoder's map points here - and not
+     * a copy taken at the end: a later picture decoding at the same time
+     * reads it for its collocated motion before this one has ended. */
+    int32_t *slice_of_ctb;
     size_t n_slice_map;
+    /* How many coding tree block rows, from the top, are final: decoded,
+     * deblocked and offset, never to change again. A picture decoding at
+     * the same time as this one reads it only that far - see
+     * hevcd_await_rows(). Published with release ordering, so everything
+     * written into those rows is visible to whoever sees the count. */
+    _Atomic int rows_ready;
+    hevcd_progress_t *progress;
+    /* How many pictures in flight hold this slot - the one writing it and
+     * every one predicting from it. A held slot is not reused even once
+     * no longer a reference. Under the decoder's buffer lock. */
+    int users;
 } hevcd_img_t;
 
 /* One coding tree block's sample adaptive offset, 7.3.8.3.
@@ -126,6 +150,8 @@ typedef struct {
     const hevc_sps_t *sps;
     const hevc_pps_t *pps;
     const hevc_slice_t *slice;
+    /* The decoder's, handed to every picture it opens. */
+    hevcd_progress_t *progress;
 
     hevcd_cabac_t cabac;
 
@@ -298,6 +324,10 @@ typedef struct {
  * non-zero when the slice cannot go on. */
 int hevcd_read_ctu(hevcd_t *d, int x0, int y0);
 
+/* Clears one coding tree block's entries in the motion field. Done as each
+ * block is decoded, not for the whole picture up front. */
+void hevcd_clear_ctb_motion(hevcd_t *d, int rx, int ry);
+
 /* Several coding tree block rows at once, when the stream was written to
  * allow it. Returns the same reasons as the serial walk, or -1 when this
  * slice is not one it can split up. */
@@ -325,6 +355,12 @@ void hevcd_filter_stage(hevcd_t *d, int stage, int ry);
  * returns it, or NULL if threads cannot be had - callers then do the work
  * on the threads of old. */
 hevcd_pool_t *hevcd_pool_for(hevcd_t *d);
+
+/* A picture's final rows, announced and waited for. rows_ready only grows;
+ * hevcd_await_rows() returns once at least `rows` rows are final. Both
+ * accept NULL, for a picture nobody decodes. */
+void hevcd_rows_ready(hevcd_img_t *g, int rows);
+void hevcd_await_rows(const hevcd_img_t *g, int rows);
 int hevcd_pool_helpers(const hevcd_pool_t *p, int n);
 void hevcd_pool_run(hevcd_pool_t *p, void *(*fn)(void *), void *arg, int n);
 void hevcd_pool_destroy(hevcd_pool_t *p);
