@@ -372,6 +372,11 @@ struct hevc_encoder {
     /* Inter prediction & motion vector maps (for spatial merge candidate derivation).
      * Size: (width_ctu * 2) * (height_ctu * 2). MVs in 1/4-pel units. */
     uint8_t *cu_is_inter;
+    /* Quadtree depth of the CU covering each 8x8 cell: 0 for a whole-CTU
+     * CU, 1 for an 8x8 one. split_cu_flag's context reads it. */
+    uint8_t *cu_depth;
+    /* Whole-CTU skips: on unless BC250_HEVC_CU16=0. */
+    bool cu16;
     int16_t *mv_x_map;
     int16_t *mv_y_map;
     uint32_t last_frame_sad;
@@ -551,6 +556,11 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     size_t num_cus = (size_t)(enc->width_ctu * 2) * (enc->height_ctu * 2);
     enc->cu_skip_map = calloc(num_cus, 1);
     enc->cu_is_inter = calloc(num_cus, 1);
+    enc->cu_depth = calloc(num_cus, 1);
+    {
+        const char *e = getenv("BC250_HEVC_CU16");
+        enc->cu16 = !(e && strcmp(e, "0") == 0);
+    }
     enc->mv_x_map = calloc(num_cus, sizeof(int16_t));
     enc->mv_y_map = calloc(num_cus, sizeof(int16_t));
 
@@ -620,7 +630,7 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     if (!enc->src_y || !enc->src_cb || !enc->src_cr ||
         !enc->recon_y || !enc->recon_cb || !enc->recon_cr ||
         !enc->prev_recon_y || !enc->prev_recon_cb || !enc->prev_recon_cr ||
-        !enc->cu_skip_map || !enc->cu_is_inter || !enc->mv_x_map || !enc->mv_y_map ||
+        !enc->cu_skip_map || !enc->cu_is_inter || !enc->cu_depth || !enc->mv_x_map || !enc->mv_y_map ||
         !enc->luma_mode_map || !enc->dl_y || !enc->dl_uv ||
         !enc->slice_rbsp || !enc->scratch_out || !enc->gpu_mvs ||
         !enc->hpel[0] || !enc->hpel[1] || !enc->hpel[2] || !enc->hpel[3] || !enc->hpel_tmp ||
@@ -784,6 +794,7 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     free(encoder->prev_recon_y); free(encoder->prev_recon_cb); free(encoder->prev_recon_cr);
     free(encoder->cu_skip_map);
     free(encoder->cu_is_inter);
+    free(encoder->cu_depth);
     free(encoder->mv_x_map);
     free(encoder->mv_y_map);
     free(encoder->luma_mode_map);
@@ -840,10 +851,9 @@ static inline bool hevc_cu_is_available(uint32_t width_ctu, uint32_t height_ctu,
  * Output cand_mvs has exactly 5 candidates (padded with (0,0)), in 1/4-pel units.
  * All candidates are strictly derived from spatial neighbors or zero-vectors,
  * ensuring 100% bit-exact candidate derivation matching hardware decoders. */
-static int derive_merge_candidates(int cuy_min, const hevc_encoder_t *enc,
-                                   int cux, int cuy,
-                                   hevc_mv_t cand_mvs[5])
-{
+static int derive_merge_candidates_n(int cuy_min, const hevc_encoder_t *enc,
+                                     int cux, int cuy, int n,
+                                     hevc_mv_t cand_mvs[5]){
     uint32_t w_cu = enc->width_ctu * 2;
     uint32_t h_cu = enc->height_ctu * 2;
 
@@ -853,8 +863,8 @@ static int derive_merge_candidates(int cuy_min, const hevc_encoder_t *enc,
     /* 1. Candidate A1 (Left): (cux - 1, cuy) */
     bool a1_has_inter = false;
     hevc_mv_t mv_a1 = {0, 0};
-    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux - 1, cuy, cuy_min)) {
-        uint32_t a1_idx = (uint32_t)cuy * w_cu + (uint32_t)(cux - 1);
+    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux - 1, cuy + n - 1, cuy_min)) {
+        uint32_t a1_idx = (uint32_t)(cuy + n - 1) * w_cu + (uint32_t)(cux - 1);
         if (enc->cu_is_inter[a1_idx]) {
             a1_has_inter = true;
             mv_a1.x = enc->mv_x_map[a1_idx];
@@ -866,8 +876,8 @@ static int derive_merge_candidates(int cuy_min, const hevc_encoder_t *enc,
     /* 2. Candidate B1 (Above): (cux, cuy - 1) */
     bool b1_has_inter = false;
     hevc_mv_t mv_b1 = {0, 0};
-    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux, cuy - 1, cuy_min)) {
-        uint32_t b1_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)cux;
+    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux + n - 1, cuy - 1, cuy_min)) {
+        uint32_t b1_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)(cux + n - 1);
         if (enc->cu_is_inter[b1_idx]) {
             b1_has_inter = true;
             mv_b1.x = enc->mv_x_map[b1_idx];
@@ -882,8 +892,8 @@ static int derive_merge_candidates(int cuy_min, const hevc_encoder_t *enc,
     /* 3. Candidate B0 (Above-Right): (cux + 1, cuy - 1) */
     bool b0_has_inter = false;
     hevc_mv_t mv_b0 = {0, 0};
-    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux + 1, cuy - 1, cuy_min)) {
-        uint32_t b0_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)(cux + 1);
+    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux + n, cuy - 1, cuy_min)) {
+        uint32_t b0_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)(cux + n);
         if (enc->cu_is_inter[b0_idx]) {
             b0_has_inter = true;
             mv_b0.x = enc->mv_x_map[b0_idx];
@@ -898,8 +908,8 @@ static int derive_merge_candidates(int cuy_min, const hevc_encoder_t *enc,
     /* 4. Candidate A0 (Below-Left): (cux - 1, cuy + 1) */
     bool a0_has_inter = false;
     hevc_mv_t mv_a0 = {0, 0};
-    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux - 1, cuy + 1, cuy_min)) {
-        uint32_t a0_idx = (uint32_t)(cuy + 1) * w_cu + (uint32_t)(cux - 1);
+    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux - 1, cuy + n, cuy_min)) {
+        uint32_t a0_idx = (uint32_t)(cuy + n) * w_cu + (uint32_t)(cux - 1);
         if (enc->cu_is_inter[a0_idx]) {
             a0_has_inter = true;
             mv_a0.x = enc->mv_x_map[a0_idx];
@@ -940,6 +950,13 @@ static int derive_merge_candidates(int cuy_min, const hevc_encoder_t *enc,
     }
 
     return num_cand;
+}
+
+/* The 8x8 CU case, which is every CU but a whole-CTU skip. */
+static inline int derive_merge_candidates(int cuy_min, const hevc_encoder_t *enc,
+                                          int cux, int cuy, hevc_mv_t cand_mvs[5])
+{
+    return derive_merge_candidates_n(cuy_min, enc, cux, cuy, 1, cand_mvs);
 }
 
 /* ============================================================================
@@ -1093,6 +1110,9 @@ static inline int lambda_sad_q8(int qp)
 {
     return (int)(sqrt(0.57 * pow(2.0, (qp - 12) / 3.0)) * 256.0 + 0.5);
 }
+
+/* What an 8x8 CU of a P picture was decided to be. */
+enum { CU_SKIP, CU_MERGE, CU_AMVP, CU_INTRA };
 
 /* Everything that touches samples, once per bit depth. */
 #define BIT_DEPTH 8
@@ -1252,6 +1272,7 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     memset(encoder->luma_mode_map, 0, (size_t)encoder->mode_map_stride * (encoder->coded_height / HEVC_PU_SIZE));
     memset(encoder->cu_skip_map, 0, num_cus);
     memset(encoder->cu_is_inter, 0, num_cus);
+    memset(encoder->cu_depth, 0, num_cus);
     memset(encoder->mv_x_map, 0, num_cus * sizeof(int16_t));
     memset(encoder->mv_y_map, 0, num_cus * sizeof(int16_t));
 

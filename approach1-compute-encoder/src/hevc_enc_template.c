@@ -766,38 +766,124 @@ static void FUNC(emit_inter_residual)(hevc_cabac_t *cab, const FUNC(inter_res_t)
 
 /* ------------------------------------------------------------------- CU */
 
-static void FUNC(encode_cu)(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y, bool is_idr, int y_min, uint32_t *sad_out) {
-    int cux = cu_x / HEVC_CU_SIZE;
-    int cuy = cu_y / HEVC_CU_SIZE;
-    uint32_t cu_stride = enc->width_ctu * 2;
-    uint32_t cu_idx = (uint32_t)cuy * cu_stride + (uint32_t)cux;
+/* What decide_cu() chose for one 8x8 CU of a P picture, kept so that its
+ * syntax can be written once the CTU has been decided as a whole. */
+typedef struct {
+    int kind;                 /* CU_SKIP, CU_MERGE, CU_AMVP, CU_INTRA */
+    int merge_idx;
+    int mvp_idx;
+    hevc_mv_t mvd;
+    int64_t j;                /* D * 256 + lambda * R */
+    FUNC(inter_res_t) res;    /* CU_MERGE, CU_AMVP; for CU_SKIP only rec_* */
+    FUNC(intra_cu_t) intra;   /* CU_INTRA */
+} FUNC(cu_decision_t);
 
-    int cond_l = (cux > 0 && enc->cu_skip_map[cu_idx - 1]) ? 1 : 0;
-    int cond_a = (cu_y > y_min && enc->cu_skip_map[cu_idx - cu_stride]) ? 1 : 0;
-    int skip_ctx_inc = cond_l + cond_a;
-
-    FUNC(intra_cu_t) intra;
-
-    if (is_idr || !enc->has_ref) {
-        FUNC(intra_trial)(enc, cu_x, cu_y, y_min, &intra);
-        enc->cu_skip_map[cu_idx] = 0;
-        enc->cu_is_inter[cu_idx] = 0;
-        enc->mv_x_map[cu_idx] = 0;
-        enc->mv_y_map[cu_idx] = 0;
-        FUNC(emit_intra)(enc, cab, cu_x, cu_y, is_idr, skip_ctx_inc, &intra);
-        return;
+static void FUNC(set_cu_maps)(hevc_encoder_t *enc, int cu_x, int cu_y, int size_cu,
+                              int skip, int inter, hevc_mv_t mv, int depth)
+{
+    const uint32_t stride = enc->width_ctu * 2;
+    const int cux = cu_x / HEVC_CU_SIZE, cuy = cu_y / HEVC_CU_SIZE;
+    for (int dy = 0; dy < size_cu; dy++)
+        for (int dx = 0; dx < size_cu; dx++) {
+            const uint32_t i = (uint32_t)(cuy + dy) * stride + (uint32_t)(cux + dx);
+            enc->cu_skip_map[i] = (uint8_t)skip;
+            enc->cu_is_inter[i] = (uint8_t)inter;
+            enc->mv_x_map[i] = inter ? mv.x : 0;
+            enc->mv_y_map[i] = inter ? mv.y : 0;
+            enc->cu_depth[i] = (uint8_t)depth;
+        }
+    if (inter) {
+        for (int y = 0; y < size_cu * 2; y++)
+            for (int x = 0; x < size_cu * 2; x++)
+                enc->luma_mode_map[(cu_y / 4 + y) * enc->mode_map_stride + (cu_x / 4 + x)] = HEVC_MODE_DC;
     }
+}
 
+/* cu_skip_flag's context: whether the CUs to the left and above were
+ * skipped (9.3.4.2.2). */
+static inline int FUNC(skip_ctx)(const hevc_encoder_t *enc, int cu_x, int cu_y, int y_min)
+{
+    const uint32_t stride = enc->width_ctu * 2;
+    const uint32_t i = (uint32_t)(cu_y / HEVC_CU_SIZE) * stride + (uint32_t)(cu_x / HEVC_CU_SIZE);
+    return (cu_x > 0 && enc->cu_skip_map[i - 1] ? 1 : 0)
+         + (cu_y > y_min && enc->cu_skip_map[i - stride] ? 1 : 0);
+}
+
+static void FUNC(emit_cu)(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y, int y_min,
+                          const FUNC(cu_decision_t) *d)
+{
+    const int ctx = FUNC(skip_ctx)(enc, cu_x, cu_y, y_min);
+    switch (d->kind) {
+    case CU_SKIP:
+        hevc_cabac_code_cu_skip_flag(cab, 1, ctx);
+        hevc_cabac_code_merge_idx(cab, d->merge_idx);
+        return;
+    case CU_INTRA:
+        FUNC(emit_intra)(enc, cab, cu_x, cu_y, false, ctx, &d->intra);
+        return;
+    default:
+        break;
+    }
+    hevc_cabac_code_cu_skip_flag(cab, 0, ctx);
+    hevc_cabac_code_pred_mode_flag(cab, 0 /* MODE_INTER */);
+    hevc_cabac_code_part_mode_intra(cab, 1 /* PART_2Nx2N: part_mode's first bin, one context */);
+    if (d->kind == CU_MERGE) {
+        hevc_cabac_code_merge_flag(cab, 1);
+        hevc_cabac_code_merge_idx(cab, d->merge_idx);
+        /* rqt_root_cbf is not coded for a 2Nx2N merge: it is 1, and the
+         * residual is there - an empty one would have been a skip. */
+        FUNC(emit_inter_residual)(cab, &d->res);
+    } else {
+        hevc_cabac_code_merge_flag(cab, 0);
+        hevc_cabac_code_mvd(cab, d->mvd.x, d->mvd.y);
+        hevc_cabac_code_mvp_idx(cab, d->mvp_idx);
+        const int root = FUNC(inter_any_cbf)(&d->res);
+        hevc_cabac_code_rqt_root_cbf(cab, root);
+        if (root) FUNC(emit_inter_residual)(cab, &d->res);
+    }
+}
+
+/* What a candidate costs: its syntax run through a copy of the estimation
+ * chain, the bits turned into the distortion's units with lambda. `after`
+ * keeps the contexts it leaves behind, for when it is chosen. */
+static int64_t FUNC(rd_cost)(hevc_encoder_t *enc, const hevc_cabac_t *chain, int cu_x, int cu_y,
+                             int y_min, const FUNC(cu_decision_t) *d, int64_t dist,
+                             hevc_cabac_t *after)
+{
+    hevc_cabac_estimator(after, chain);
+    FUNC(emit_cu)(enc, after, cu_x, cu_y, y_min, d);
+    return dist * 256 + ((enc->lambda_sse_q8 * (int64_t)after->est_bits) >> 15);
+}
+
+/* Squared error of a prediction alone, luma and chroma, eight-bit units. */
+static int64_t FUNC(pred_dist)(const hevc_encoder_t *enc, int cu_x, int cu_y,
+                               const pixel py[64], const pixel pcb[16], const pixel pcr[16])
+{
+    const uint32_t cw = enc->coded_width, ccw = cw / 2;
+    const size_t co = (size_t)(cu_y / 2) * ccw + cu_x / 2;
+    return FUNC(sse)((const pixel *)enc->src_y + (size_t)cu_y * cw + cu_x, cw, py, 8, 8, 8)
+         + FUNC(sse)((const pixel *)enc->src_cb + co, ccw, pcb, 4, 4, 4)
+         + FUNC(sse)((const pixel *)enc->src_cr + co, ccw, pcr, 4, 4, 4);
+}
+
+/* Decide one 8x8 CU of a P picture by rate and distortion, and reconstruct
+ * it into the frame; the syntax is left for emit_cu(). Every candidate's
+ * bits are counted by running its syntax through `chain`, which then moves
+ * on with the contexts the chosen one leaves. */
+static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, int cu_y, int y_min,
+                            FUNC(cu_decision_t) *d, uint32_t *sad_out)
+{
+    const int cux = cu_x / HEVC_CU_SIZE, cuy = cu_y / HEVC_CU_SIZE;
     const int lsad = enc->lambda_sad_q8;
-    const int64_t lsse = enc->lambda_sse_q8;
     const pixel *src = (const pixel *)enc->src_y + (size_t)cu_y * enc->coded_width + cu_x;
+    const uint32_t cw = enc->coded_width, ccw = cw / 2;
+    const size_t co = (size_t)(cu_y / 2) * ccw + cu_x / 2;
 
-    /* 1. The best merge candidate, by SAD. */
+    /* The best merge candidate, by SAD on the search planes. */
     hevc_mv_t cand[5];
     derive_merge_candidates(y_min / HEVC_CU_SIZE, enc, cux, cuy, cand);
     int best_merge = 0;
     int64_t best_merge_cost = INT64_MAX;
-    pixel pred_y[64], pred_cb[16], pred_cr[16];
     for (int i = 0; i < 5; i++) {
         bool dup = false;
         for (int p = 0; p < i; p++)
@@ -808,31 +894,35 @@ static void FUNC(encode_cu)(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, in
                         + (int64_t)lsad * (i + 1);
         if (c < best_merge_cost) { best_merge_cost = c; best_merge = i; }
     }
-
-    /* 2. Its residual. None at all is a skip, and nothing beats a skip. */
-    FUNC(inter_res_t) merge_res;
-    FUNC(predict_cu)(enc, cu_x, cu_y, cand[best_merge], pred_y, pred_cb, pred_cr);
-    FUNC(inter_residual)(enc, cu_x, cu_y, pred_y, pred_cb, pred_cr, &merge_res);
     *sad_out += (uint32_t)(best_merge_cost >> 8);
-    if (!FUNC(inter_any_cbf)(&merge_res)) {
-        enc->cu_skip_map[cu_idx] = 1;
-        enc->cu_is_inter[cu_idx] = 1;
-        enc->mv_x_map[cu_idx] = cand[best_merge].x;
-        enc->mv_y_map[cu_idx] = cand[best_merge].y;
-        hevc_cabac_code_cu_skip_flag(cab, 1, skip_ctx_inc);
-        hevc_cabac_code_merge_idx(cab, best_merge);
-        FUNC(write_back_inter)(enc, cu_x, cu_y, merge_res.rec_y, merge_res.rec_cb, merge_res.rec_cr);
-        for (int pu = 0; pu < 4; pu++) {
-            int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-            enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = HEVC_MODE_DC;
-        }
-        return;
-    }
-    /* skip, pred_mode, part_mode, merge_flag, merge_idx, cbf flags */
-    const int64_t j_merge = merge_res.dist * 256
-                          + lsse * (4 + best_merge + 1 + 6 + merge_res.bits);
 
-    /* 3. A searched vector, coded against the better AMVP predictor. */
+    FUNC(cu_decision_t) cd;
+    hevc_cabac_t after, best_after;
+    int64_t best_j = INT64_MAX;
+    hevc_mv_t best_mv = cand[best_merge];
+
+#define TRY(kind_, dist_, mv_) do {                                              \
+        cd.kind = (kind_);                                                         \
+        const int64_t j_ = FUNC(rd_cost)(enc, chain, cu_x, cu_y, y_min, &cd, (dist_), &after); \
+        if (j_ < best_j) { best_j = j_; *d = cd; d->j = j_; best_after = after; best_mv = (mv_); } \
+    } while (0)
+
+    /* Skip: the prediction alone, whatever the residual would have been. */
+    pixel py[64], pcb[16], pcr[16];
+    FUNC(predict_cu)(enc, cu_x, cu_y, cand[best_merge], py, pcb, pcr);
+    cd.merge_idx = best_merge;
+    memcpy(cd.res.rec_y, py, sizeof(py));
+    memcpy(cd.res.rec_cb, pcb, sizeof(pcb));
+    memcpy(cd.res.rec_cr, pcr, sizeof(pcr));
+    TRY(CU_SKIP, FUNC(pred_dist)(enc, cu_x, cu_y, py, pcb, pcr), cand[best_merge]);
+
+    /* Merge with its residual - unless there is none, which is the skip. */
+    FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, &cd.res);
+    if (FUNC(inter_any_cbf)(&cd.res))
+        TRY(CU_MERGE, cd.res.dist, cand[best_merge]);
+
+    /* A searched vector, coded against the better AMVP predictor: with its
+     * residual, and without it. */
     hevc_mv_t mvp[2];
     derive_amvp_candidates(y_min / HEVC_CU_SIZE, enc, cux, cuy, mvp);
     hevc_mv_t starts[10];
@@ -854,87 +944,178 @@ static void FUNC(encode_cu)(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, in
     uint32_t me_sad;
     const hevc_mv_t mv = FUNC(motion_search)(enc, cu_x, cu_y, mvp, starts, n_starts,
                                              lsad, &mvp_idx, &me_cost, &me_sad);
-    FUNC(inter_res_t) amvp_res;
-    int64_t j_amvp = INT64_MAX;
-    const bool same_as_merge = mv.x == cand[best_merge].x && mv.y == cand[best_merge].y;
-    if (!same_as_merge) {
-        pixel ay[64], acb[16], acr[16];
-        FUNC(predict_cu)(enc, cu_x, cu_y, mv, ay, acb, acr);
-        FUNC(inter_residual)(enc, cu_x, cu_y, ay, acb, acr, &amvp_res);
-        const int mvbits = mvd_bits(mv.x - mvp[mvp_idx].x) + mvd_bits(mv.y - mvp[mvp_idx].y);
-        j_amvp = amvp_res.dist * 256
-               + lsse * (4 + mvbits + 1 + 1 + (FUNC(inter_any_cbf)(&amvp_res) ? 6 : 0) + amvp_res.bits);
+    if (mv.x != cand[best_merge].x || mv.y != cand[best_merge].y) {
+        FUNC(predict_cu)(enc, cu_x, cu_y, mv, py, pcb, pcr);
+        cd.mvp_idx = mvp_idx;
+        cd.mvd.x = (int16_t)(mv.x - mvp[mvp_idx].x);
+        cd.mvd.y = (int16_t)(mv.y - mvp[mvp_idx].y);
+        FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, &cd.res);
+        const bool coded = FUNC(inter_any_cbf)(&cd.res);
+        TRY(CU_AMVP, cd.res.dist, mv);
+        if (coded) {
+            /* The same vector with no residual at all. */
+            memset(cd.res.cbf_y, 0, sizeof(cd.res.cbf_y));
+            cd.res.cbf_cb = cd.res.cbf_cr = 0;
+            memcpy(cd.res.rec_y, py, sizeof(py));
+            memcpy(cd.res.rec_cb, pcb, sizeof(pcb));
+            memcpy(cd.res.rec_cr, pcr, sizeof(pcr));
+            TRY(CU_AMVP, FUNC(pred_dist)(enc, cu_x, cu_y, py, pcb, pcr), mv);
+        }
     }
 
-    /* 4. Intra, tried for real: it has to be reconstructed to be judged.
+    /* Intra, tried for real: it has to be reconstructed to be judged.
      * ⚠️ Every time. Skipping it when the motion search looked good enough
      * - better than a flat block, or than an 8x8 intra guess - saved 7 to
      * 15% of the time and cost 4 to 16% more bits on ducks_take_off, where
      * the water is exactly what 4x4 intra wins. */
-    FUNC(intra_trial)(enc, cu_x, cu_y, y_min, &intra);
-    int intra_bits = 3 + 4 * 4 + 1 + 6;
-    for (int pu = 0; pu < 4; pu++) intra_bits += intra.cbf_luma[pu] ? coeff_bits(intra.luma_coeff[pu]) : 0;
-    intra_bits += (intra.cbf_cb ? coeff_bits(intra.coeff_cb) : 0) + (intra.cbf_cr ? coeff_bits(intra.coeff_cr) : 0);
+    FUNC(intra_trial)(enc, cu_x, cu_y, y_min, &cd.intra);
+    const int64_t dist_intra =
+          FUNC(sse)(src, cw, (const pixel *)enc->recon_y + (size_t)cu_y * cw + cu_x, cw, 8, 8)
+        + FUNC(sse)((const pixel *)enc->src_cb + co, ccw, (const pixel *)enc->recon_cb + co, ccw, 4, 4)
+        + FUNC(sse)((const pixel *)enc->src_cr + co, ccw, (const pixel *)enc->recon_cr + co, ccw, 4, 4);
     {
-        const uint32_t cw = enc->coded_width, ccw = cw / 2;
-        const size_t co = (size_t)(cu_y / 2) * ccw + cu_x / 2;
-        const int64_t d = FUNC(sse)(src, cw, (const pixel *)enc->recon_y + (size_t)cu_y * cw + cu_x, cw, 8, 8)
-                        + FUNC(sse)((const pixel *)enc->src_cb + co, ccw, (const pixel *)enc->recon_cb + co, ccw, 4, 4)
-                        + FUNC(sse)((const pixel *)enc->src_cr + co, ccw, (const pixel *)enc->recon_cr + co, ccw, 4, 4);
-        const int64_t j_intra = d * 256 + lsse * intra_bits;
-        if (j_intra < j_merge && j_intra < j_amvp) {
-            enc->cu_skip_map[cu_idx] = 0;
-            enc->cu_is_inter[cu_idx] = 0;
-            enc->mv_x_map[cu_idx] = 0;
-            enc->mv_y_map[cu_idx] = 0;
-            FUNC(emit_intra)(enc, cab, cu_x, cu_y, false, skip_ctx_inc, &intra);
-            return;
-        }
+        const hevc_mv_t zero = { 0, 0 };
+        TRY(CU_INTRA, dist_intra, zero);
     }
+#undef TRY
 
-    /* 5. Inter it is. */
-    const bool use_merge = j_merge <= j_amvp;
-    const FUNC(inter_res_t) *r = use_merge ? &merge_res : &amvp_res;
-    const hevc_mv_t chosen = use_merge ? cand[best_merge] : mv;
-    enc->cu_skip_map[cu_idx] = 0;
-    enc->cu_is_inter[cu_idx] = 1;
-    enc->mv_x_map[cu_idx] = chosen.x;
-    enc->mv_y_map[cu_idx] = chosen.y;
-    FUNC(write_back_inter)(enc, cu_x, cu_y, r->rec_y, r->rec_cb, r->rec_cr);
-    for (int pu = 0; pu < 4; pu++) {
-        int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-        enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = HEVC_MODE_DC;
+    *chain = best_after;
+    switch (d->kind) {
+    case CU_INTRA: {
+        const hevc_mv_t zero = { 0, 0 };
+        FUNC(set_cu_maps)(enc, cu_x, cu_y, 1, 0, 0, zero, 1);
+        break;   /* its samples are already in the frame */
     }
+    case CU_SKIP:
+        FUNC(set_cu_maps)(enc, cu_x, cu_y, 1, 1, 1, best_mv, 1);
+        FUNC(write_back_inter)(enc, cu_x, cu_y, d->res.rec_y, d->res.rec_cb, d->res.rec_cr);
+        break;
+    default:
+        FUNC(set_cu_maps)(enc, cu_x, cu_y, 1, 0, 1, best_mv, 1);
+        FUNC(write_back_inter)(enc, cu_x, cu_y, d->res.rec_y, d->res.rec_cb, d->res.rec_cr);
+        break;
+    }
+}
 
-    hevc_cabac_code_cu_skip_flag(cab, 0, skip_ctx_inc);
-    hevc_cabac_code_pred_mode_flag(cab, 0 /* MODE_INTER */);
-    hevc_cabac_code_part_mode_intra(cab, 1 /* PART_2Nx2N: part_mode's first bin, one context */);
-    if (use_merge) {
-        hevc_cabac_code_merge_flag(cab, 1);
-        hevc_cabac_code_merge_idx(cab, best_merge);
-        /* rqt_root_cbf is not coded for a 2Nx2N merge: it is 1, and the
-         * residual is there - an empty one would have been a skip. */
-        FUNC(emit_inter_residual)(cab, r);
-    } else {
-        hevc_cabac_code_merge_flag(cab, 0);
-        hevc_cabac_code_mvd(cab, mv.x - mvp[mvp_idx].x, mv.y - mvp[mvp_idx].y);
-        hevc_cabac_code_mvp_idx(cab, mvp_idx);
-        const int root = FUNC(inter_any_cbf)(r);
-        hevc_cabac_code_rqt_root_cbf(cab, root);
-        if (root) FUNC(emit_inter_residual)(cab, r);
+/* The whole CTU as one 16x16 skip: the best merge candidate for a 16x16
+ * prediction unit, no residual. Returns its distortion; the candidate and
+ * the prediction come back through the pointers. */
+static int64_t FUNC(skip16_dist)(hevc_encoder_t *enc, int x, int y, int y_min,
+                                 int *merge_idx, hevc_mv_t *mv,
+                                 pixel py[256], pixel pcb[64], pixel pcr[64])
+{
+    const int cux = x / HEVC_CU_SIZE, cuy = y / HEVC_CU_SIZE;
+    const int cw = (int)enc->coded_width, ch = (int)enc->coded_height;
+    const pixel *src = (const pixel *)enc->src_y + (size_t)y * cw + x;
+    hevc_mv_t cand[5];
+    derive_merge_candidates_n(y_min / HEVC_CU_SIZE, enc, cux, cuy, 2, cand);
+    int best = 0;
+    int64_t best_c = INT64_MAX;
+    for (int i = 0; i < 5; i++) {
+        bool dup = false;
+        for (int p = 0; p < i; p++)
+            if (cand[p].x == cand[i].x && cand[p].y == cand[i].y) { dup = true; break; }
+        if (dup) continue;
+        int64_t s = 0;
+        for (int q = 0; q < 4; q++)
+            s += FUNC(search_sad)(enc, src + (q >> 1) * 8 * cw + (q & 1) * 8,
+                                  (x + (q & 1) * 8) * 4 + cand[i].x, (y + (q >> 1) * 8) * 4 + cand[i].y);
+        const int64_t c = s * 256 + (int64_t)enc->lambda_sad_q8 * (i + 1);
+        if (c < best_c) { best_c = c; best = i; }
     }
+    *merge_idx = best;
+    *mv = cand[best];
+    FUNC(hevc_mc_uni)(enc->prev_recon_y, cw, cw, ch, x, y, 16, 16, mv->x, mv->y, 0, py, 16);
+    FUNC(hevc_mc_uni)(enc->prev_recon_cb, cw / 2, cw / 2, ch / 2, x / 2, y / 2, 8, 8, mv->x, mv->y, 1, pcb, 8);
+    FUNC(hevc_mc_uni)(enc->prev_recon_cr, cw / 2, cw / 2, ch / 2, x / 2, y / 2, 8, 8, mv->x, mv->y, 1, pcr, 8);
+    const size_t co = (size_t)(y / 2) * (cw / 2) + x / 2;
+    return FUNC(sse)(src, cw, py, 16, 16, 16)
+         + FUNC(sse)((const pixel *)enc->src_cb + co, cw / 2, pcb, 8, 8, 8)
+         + FUNC(sse)((const pixel *)enc->src_cr + co, cw / 2, pcr, 8, 8, 8);
 }
 
 static void FUNC(encode_ctu)(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int ctu_row, bool is_idr, int y_min, uint32_t *sad_out) {
     int ctu_x = ctu_col * HEVC_CTU_SIZE, ctu_y = ctu_row * HEVC_CTU_SIZE;
-    int cond_l = ctu_col > 0 ? 1 : 0;
-    int cond_a = (ctu_row * HEVC_CTU_SIZE > y_min) ? 1 : 0;
-    hevc_cabac_code_split_cu_flag(cab, 1, cond_l + cond_a);
-
     static const int cu_off_x[4] = { 0, 8, 0, 8 };
     static const int cu_off_y[4] = { 0, 0, 8, 8 };
+
+    /* split_cu_flag's context: whether the CUs to the left and above sit
+     * deeper in their quadtree than this one does (9.3.4.2.2). */
+    const uint32_t stride = enc->width_ctu * 2;
+    const uint32_t c0 = (uint32_t)(ctu_y / HEVC_CU_SIZE) * stride + (uint32_t)(ctu_x / HEVC_CU_SIZE);
+    const int split_ctx = (ctu_col > 0 && enc->cu_depth[c0 - 1] > 0 ? 1 : 0)
+                        + (ctu_y > y_min && enc->cu_depth[c0 - stride] > 0 ? 1 : 0);
+
+    if (is_idr || !enc->has_ref) {
+        hevc_cabac_code_split_cu_flag(cab, 1, split_ctx);
+        for (int i = 0; i < 4; i++) {
+            const int x = ctu_x + cu_off_x[i], y = ctu_y + cu_off_y[i];
+            FUNC(intra_cu_t) intra;
+            FUNC(intra_trial)(enc, x, y, y_min, &intra);
+            const hevc_mv_t zero = { 0, 0 };
+            FUNC(set_cu_maps)(enc, x, y, 1, 0, 0, zero, 1);
+            FUNC(emit_intra)(enc, cab, x, y, is_idr, FUNC(skip_ctx)(enc, x, y, y_min), &intra);
+        }
+        return;
+    }
+
+    /* The whole CTU as one skip, costed first. */
+    pixel py16[256], pcb16[64], pcr16[64];
+    int idx16 = 0;
+    hevc_mv_t mv16 = { 0, 0 };
+    int64_t j16 = INT64_MAX;
+    hevc_cabac_t chain;
+    hevc_cabac_estimator(&chain, cab);
+    hevc_cabac_code_split_cu_flag(&chain, 1, split_ctx);
+    const uint32_t split_bits = chain.est_bits;
+    if (enc->cu16) {
+        const int64_t dist = FUNC(skip16_dist)(enc, ctu_x, ctu_y, y_min, &idx16, &mv16, py16, pcb16, pcr16);
+        hevc_cabac_t e16;
+        hevc_cabac_estimator(&e16, cab);
+        hevc_cabac_code_split_cu_flag(&e16, 0, split_ctx);
+        hevc_cabac_code_cu_skip_flag(&e16, 1, FUNC(skip_ctx)(enc, ctu_x, ctu_y, y_min));
+        hevc_cabac_code_merge_idx(&e16, idx16);
+        j16 = dist * 256 + ((enc->lambda_sse_q8 * (int64_t)e16.est_bits) >> 15);
+    }
+
+    /* Four 8x8 CUs can never cost less than their split flag and about a
+     * bit each. A skip already under that is taken without trying them -
+     * most of a still picture, and none of the work. */
+    const int64_t floor_split = (enc->lambda_sse_q8 * (int64_t)(split_bits + 4 * 32768)) >> 15;
+    FUNC(cu_decision_t) d[4];
+    uint32_t sad8 = 0;
+    int64_t j_split = INT64_MAX;
+    if (j16 >= floor_split) {
+        /* Each CU decided against the contexts the ones before it leave. */
+        j_split = (enc->lambda_sse_q8 * (int64_t)split_bits) >> 15;
+        for (int i = 0; i < 4; i++) {
+            FUNC(decide_cu)(enc, &chain, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i], y_min, &d[i], &sad8);
+            j_split += d[i].j;
+        }
+    }
+
+    if (j16 < j_split) {
+        const uint32_t cw = enc->coded_width, ccw = cw / 2;
+        pixel *ry = (pixel *)enc->recon_y + (size_t)ctu_y * cw + ctu_x;
+        pixel *rcb = (pixel *)enc->recon_cb + (size_t)(ctu_y / 2) * ccw + ctu_x / 2;
+        pixel *rcr = (pixel *)enc->recon_cr + (size_t)(ctu_y / 2) * ccw + ctu_x / 2;
+        for (int y = 0; y < 16; y++) memcpy(ry + (size_t)y * cw, py16 + y * 16, 16 * sizeof(pixel));
+        for (int y = 0; y < 8; y++) {
+            memcpy(rcb + (size_t)y * ccw, pcb16 + y * 8, 8 * sizeof(pixel));
+            memcpy(rcr + (size_t)y * ccw, pcr16 + y * 8, 8 * sizeof(pixel));
+        }
+        FUNC(set_cu_maps)(enc, ctu_x, ctu_y, 2, 1, 1, mv16, 0);
+        hevc_cabac_code_split_cu_flag(cab, 0, split_ctx);
+        hevc_cabac_code_cu_skip_flag(cab, 1, FUNC(skip_ctx)(enc, ctu_x, ctu_y, y_min));
+        hevc_cabac_code_merge_idx(cab, idx16);
+        *sad_out += sad8;
+        return;
+    }
+
+    hevc_cabac_code_split_cu_flag(cab, 1, split_ctx);
     for (int i = 0; i < 4; i++)
-        FUNC(encode_cu)(enc, cab, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i], is_idr, y_min, sad_out);
+        FUNC(emit_cu)(enc, cab, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i], y_min, &d[i]);
+    *sad_out += sad8;
 }
 
 /* The downloaded picture (dl_y / dl_uv, real width x height, chroma

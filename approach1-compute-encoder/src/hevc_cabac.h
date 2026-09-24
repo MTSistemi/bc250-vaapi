@@ -111,7 +111,24 @@ typedef struct {
     int      num_buffered_bytes;
 
     uint8_t  ctx[HEVC_NUM_CTX];
+
+    /* Estimation: when set, nothing is written - every bin adds what it
+     * would cost to est_bits, in 1/32768 of a bit, and the context states
+     * move exactly as they would. See hevc_cabac_estimator(). */
+    int      est;
+    uint32_t est_bits;
 } hevc_cabac_t;
+
+/* A coder that counts instead of writing, starting from `from`'s context
+ * states. The encoder runs a candidate's syntax through one to learn what
+ * it costs - the same functions, the same order, the same contexts. */
+static inline void hevc_cabac_estimator(hevc_cabac_t *est, const hevc_cabac_t *from)
+{
+    *est = *from;
+    est->bs = NULL;
+    est->est = 1;
+    est->est_bits = 0;
+}
 
 /* Bind the coder to an output bit-writer (does not reset arithmetic/context
  * state - call hevc_cabac_reset_contexts() once, then hevc_cabac_start()

@@ -84,6 +84,29 @@ static const uint8_t g_hevc_sig_ctx4[16] = {
 #define COEF_REMAIN_BIN_REDUCTION 3
 #define C1FLAG_NUMBER             8
 
+/* What coding a bin costs, in 1/32768 of a bit, by context state:
+ * [state << 1] for the most probable symbol, [state << 1 | 1] for the
+ * least. From the probability the state stands for, 9.3.4.3.2: pLPS =
+ * 0.5 * a^state with a = (0.01875 / 0.5)^(1/63). */
+static const uint32_t g_hevc_entropy_bits[128] = {
+     32768,  32768,  30426,  35232,  28306,  37696,  26377,  40159,
+     24617,  42623,  23005,  45087,  21523,  47551,  20159,  50015,
+     18899,  52479,  17734,  54942,  16653,  57406,  15650,  59870,
+     14717,  62334,  13849,  64798,  13038,  67262,  12282,  69725,
+     11575,  72189,  10914,  74653,  10294,  77117,   9714,  79581,
+      9169,  82044,   8658,  84508,   8178,  86972,   7727,  89436,
+      7303,  91900,   6903,  94364,   6527,  96827,   6173,  99291,
+      5840, 101755,   5525, 104219,   5228, 106683,   4948, 109147,
+      4684, 111610,   4435, 114074,   4199, 116538,   3977, 119002,
+      3767, 121466,   3568, 123929,   3380, 126393,   3202, 128857,
+      3034, 131321,   2876, 133785,   2725, 136249,   2583, 138712,
+      2448, 141176,   2321, 143640,   2200, 146104,   2086, 148568,
+      1978, 151032,   1875, 153495,   1778, 155959,   1686, 158423,
+      1599, 160887,   1517, 163351,   1439, 165814,   1364, 168278,
+      1294, 170742,   1228, 173206,   1164, 175670,   1105, 178134,
+      1048, 180597,    994, 183061,    943, 185525,    943, 185525,
+};
+
 /* ===================== Context init values (Rec. ITU-T H.265 9.3.2.2) ==== */
 /* Row index 0 = P-slice (initType 1), Row index 1 = I-slice (initType 2).
  * Values match ITU-T H.265 Tables 9-5 through 9-30 and x265 entropy.cpp. */
@@ -227,6 +250,10 @@ static void cabac_write_out(hevc_cabac_t *cb) {
 void hevc_cabac_encode_bin(hevc_cabac_t *cb, int ctx_idx, uint32_t bin) {
     uint32_t mstate = cb->ctx[ctx_idx];
     cb->ctx[ctx_idx] = g_hevc_next_state[mstate][bin & 1];
+    if (cb->est) {
+        cb->est_bits += g_hevc_entropy_bits[mstate ^ (bin & 1)];
+        return;
+    }
 
     uint32_t range = cb->range;
     uint32_t state = mstate >> 1;
@@ -250,6 +277,7 @@ void hevc_cabac_encode_bin(hevc_cabac_t *cb, int ctx_idx, uint32_t bin) {
 }
 
 void hevc_cabac_encode_bypass(hevc_cabac_t *cb, uint32_t bin) {
+    if (cb->est) { cb->est_bits += 32768; return; }
     cb->low <<= 1;
     if (bin) cb->low += cb->range;
     cb->bits_left++;
@@ -257,6 +285,7 @@ void hevc_cabac_encode_bypass(hevc_cabac_t *cb, uint32_t bin) {
 }
 
 void hevc_cabac_encode_bypass_bins(hevc_cabac_t *cb, uint32_t value, int num_bins) {
+    if (cb->est) { cb->est_bits += 32768u * (uint32_t)num_bins; return; }
     while (num_bins > 8) {
         num_bins -= 8;
         uint32_t pattern = value >> num_bins;
@@ -273,6 +302,7 @@ void hevc_cabac_encode_bypass_bins(hevc_cabac_t *cb, uint32_t value, int num_bin
 }
 
 void hevc_cabac_encode_terminate(hevc_cabac_t *cb, uint32_t bin) {
+    if (cb->est) return;
     cb->range -= 2;
     if (bin) {
         cb->low += cb->range;
