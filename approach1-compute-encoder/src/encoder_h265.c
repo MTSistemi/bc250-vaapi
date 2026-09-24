@@ -477,6 +477,14 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     if (qp_pinned) {
         enc->rc.current_qp = enc->qp;
         enc->rc.base_qp = enc->qp;
+    } else {
+        /* HEVC achieves target bitrates at roughly ~3 to 5 QP higher than H.264
+         * for the same content complexity. Offset initial base_qp so the first
+         * GOP doesn't start severely over-quantized at QP 12. */
+        if (enc->rc.base_qp + 4 <= enc->rc.qp_max) {
+            enc->rc.base_qp += 4;
+            enc->rc.current_qp = enc->rc.base_qp;
+        }
     }
     enc->pps_init_qp = enc->qp;
     enc->cbr_intent = false;
@@ -631,6 +639,10 @@ void hevc_encoder_set_bitrate(hevc_encoder_t *encoder, uint32_t bitrate)
         encoder->bitrate = bitrate;
         rc_init(&encoder->rc, encoder->rc.mode, bitrate, (double)encoder->fps,
                 encoder->width, encoder->height);
+        if (encoder->rc.mode != RC_CQP && encoder->rc.base_qp + 4 <= encoder->rc.qp_max) {
+            encoder->rc.base_qp += 4;
+            encoder->rc.current_qp = encoder->rc.base_qp;
+        }
     }
 }
 
@@ -645,6 +657,10 @@ void hevc_encoder_set_fps(hevc_encoder_t *encoder, uint32_t fps)
         encoder->fps = fps;
         rc_init(&encoder->rc, encoder->rc.mode, encoder->rc.target_bitrate,
                 (double)fps, encoder->width, encoder->height);
+        if (encoder->rc.mode != RC_CQP && encoder->rc.base_qp + 4 <= encoder->rc.qp_max) {
+            encoder->rc.base_qp += 4;
+            encoder->rc.current_qp = encoder->rc.base_qp;
+        }
     }
 }
 

@@ -1077,12 +1077,14 @@ typedef struct {
 static void interleave8(uint8_t *o, const uint8_t *a, const uint8_t *b, int n)
 {
     int x = 0;
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
     for (; x + 16 <= n; x += 16) {
         const __m128i va = _mm_loadu_si128((const __m128i *)(a + x));
         const __m128i vb = _mm_loadu_si128((const __m128i *)(b + x));
         _mm_storeu_si128((__m128i *)(o + 2 * x), _mm_unpacklo_epi8(va, vb));
         _mm_storeu_si128((__m128i *)(o + 2 * x + 16), _mm_unpackhi_epi8(va, vb));
     }
+#endif
     for (; x < n; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
 }
 
@@ -1090,9 +1092,11 @@ static void interleave8(uint8_t *o, const uint8_t *a, const uint8_t *b, int n)
 static void shift10(uint16_t *o, const uint16_t *s, int n)
 {
     int x = 0;
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
     for (; x + 8 <= n; x += 8)
         _mm_storeu_si128((__m128i *)(o + x),
             _mm_slli_epi16(_mm_loadu_si128((const __m128i *)(s + x)), 6));
+#endif
     for (; x < n; x++) o[x] = (uint16_t)(s[x] << 6);
 }
 
@@ -1100,6 +1104,7 @@ static void interleave10(uint16_t *o, const uint16_t *a, const uint16_t *b,
                          int n)
 {
     int x = 0;
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
     for (; x + 8 <= n; x += 8) {
         const __m128i va = _mm_slli_epi16(
             _mm_loadu_si128((const __m128i *)(a + x)), 6);
@@ -1108,6 +1113,7 @@ static void interleave10(uint16_t *o, const uint16_t *a, const uint16_t *b,
         _mm_storeu_si128((__m128i *)(o + 2 * x), _mm_unpacklo_epi16(va, vb));
         _mm_storeu_si128((__m128i *)(o + 2 * x + 8), _mm_unpackhi_epi16(va, vb));
     }
+#endif
     for (; x < n; x++) {
         o[2 * x] = (uint16_t)(a[x] << 6);
         o[2 * x + 1] = (uint16_t)(b[x] << 6);

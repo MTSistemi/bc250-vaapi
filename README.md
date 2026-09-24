@@ -46,8 +46,8 @@ Bit-exact conformance against official ITU JCT-VC test streams and reference dec
 | :--- | :--- | :--- | :--- | :--- |
 | **H.264** | 1080p (CRF 23) | 1 thread | **68.4 fps** | 100% Bit-Exact (90/90 pass) |
 | **H.264** | 1080p (CRF 23) | 8 threads (multi-slice) | **156.2 – 181.5 fps** | 100% Bit-Exact (90/90 pass) |
-| **H.265 / HEVC** | 1080p | 1 thread | **66.3 fps** | **146 of 147 Bit-Exact (99.3%)** |
-| **H.265 / HEVC** | 1080p | 6 threads (wavefront) | **97.6 fps** | **146 of 147 Bit-Exact (99.3%)** |
+| **H.265 / HEVC** | 1080p | Multi-threaded (Wavefront + In-Flight) | **323+ fps** (3.3x speedup) | **146 of 147 Bit-Exact (99.3%)** |
+| **H.265 / HEVC** | 4K (2160p) | Multi-threaded (Wavefront + In-Flight) | **164+ fps** (5.8x speedup) | **146 of 147 Bit-Exact (99.3%)** |
 
 *(Note: The sole unmapped test vector, `TSUNEQBD_A_MAIN10`, specifies differing bit depths for luma and chroma, which FFmpeg itself does not support).*
 

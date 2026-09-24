@@ -96,6 +96,15 @@ static void test_rate_control_cqp_and_vbr(void) {
     int qp2 = rc_get_frame_qp(&rc, 5000);
     assert(qp2 >= qp1);
 
+    /* Test nominal drain: rc_update_stats drains exactly target_bits_per_frame for recording */
+    rate_control_t rc_cbr;
+    rc_init(&rc_cbr, RC_CBR, 6000000, 60.0, 1920, 1080);
+    assert(rc_cbr.target_bits_per_frame == 100000);
+    int64_t initial_fullness = rc_cbr.buffer_fullness;
+    /* Consuming exactly target_bits_per_frame leaves buffer fullness unchanged */
+    rc_update_stats(&rc_cbr, 100000);
+    assert(rc_cbr.buffer_fullness == initial_fullness);
+
     /* Test h264_encoder_set_rc_mode and h264_encoder_set_qp */
     h264_encoder_t *enc = h264_encoder_create(NULL, 1920, 1080, 60, 5000000, PROFILE_BASELINE);
     assert(enc != NULL);

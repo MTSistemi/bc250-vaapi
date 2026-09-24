@@ -9,6 +9,10 @@
 #include <pthread.h>
 #include "va_backend.h"
 
+#ifndef VA_RC_ICQ
+#define VA_RC_ICQ 0x00000040
+#endif
+
 struct thread_test_args {
     VADriverContextP ctx;
     VASurfaceID surface;
@@ -277,7 +281,29 @@ int main(void) {
     assert(encoder_args.error_count == 0);
     printf("[PASS] Concurrent multi-threaded execution verified (100 iterations of filter/encoder race without collision)\n");
 
-    /* 11. Test VAConfigAttribRateControl negotiation (VA_RC_CQP and VA_RC_VBR) */
+    /* 11. Test VAConfigAttribRateControl negotiation (VA_RC_CQP, VA_RC_VBR, and VA_RC_ICQ) */
+    VAConfigAttrib rc_attrib_query = { .type = VAConfigAttribRateControl, .value = 0 };
+    status = ctx.vtable->vaGetConfigAttributes(&ctx, VAProfileH264Main, VAEntrypointEncSlice, &rc_attrib_query, 1);
+    assert(status == VA_STATUS_SUCCESS);
+    assert((rc_attrib_query.value & (VA_RC_CBR | VA_RC_VBR | VA_RC_CQP | VA_RC_ICQ)) == (VA_RC_CBR | VA_RC_VBR | VA_RC_CQP | VA_RC_ICQ));
+
+    VAConfigAttrib icq_attribs[2] = {
+        { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_ICQ }
+    };
+    VAConfigID icq_config_id = VA_INVALID_ID;
+    status = ctx.vtable->vaCreateConfig(&ctx, VAProfileH264Main, VAEntrypointEncSlice, icq_attribs, 2, &icq_config_id);
+    assert(status == VA_STATUS_SUCCESS);
+    VAContextID icq_context_id = VA_INVALID_ID;
+    status = ctx.vtable->vaCreateContext(&ctx, icq_config_id, 1920, 1080, 0, surfaces, 2, &icq_context_id);
+    assert(status == VA_STATUS_SUCCESS);
+    bc250_driver_data *icq_drv_data = (bc250_driver_data *)ctx.pDriverData;
+    assert(icq_drv_data->contexts[icq_context_id].h264_enc != NULL);
+    assert(h264_encoder_get_rc_mode(icq_drv_data->contexts[icq_context_id].h264_enc) == RC_VBR);
+    ctx.vtable->vaDestroyContext(&ctx, icq_context_id);
+    ctx.vtable->vaDestroyConfig(&ctx, icq_config_id);
+    printf("[PASS] Negotiated VA_RC_ICQ config and context creation verified (auto-VBR mapped)\n");
+
     VAConfigAttrib cqp_attribs[2] = {
         { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 },
         { .type = VAConfigAttribRateControl, .value = VA_RC_CQP }
@@ -327,6 +353,8 @@ int main(void) {
     seq_hevc.bits_per_second = 8000000;
     seq_hevc.pic_width_in_luma_samples = 1920;
     seq_hevc.pic_height_in_luma_samples = 1080;
+    seq_hevc.vui_time_scale = 60;
+    seq_hevc.vui_num_units_in_tick = 1;
 
     VABufferID seq_buf_id = VA_INVALID_ID;
     status = ctx.vtable->vaCreateBuffer(&ctx, hevc_context_id, VAEncSequenceParameterBufferType,
@@ -375,6 +403,7 @@ int main(void) {
 
     /* Verify that sequence, picture, and rate control parameters propagated into hevc_enc */
     assert(hevc_encoder_get_gop_size(hevc_c->hevc_enc) == 60);
+    assert(hevc_encoder_get_fps(hevc_c->hevc_enc) == 60);
     assert(hevc_encoder_get_qp(hevc_c->hevc_enc) == 22);
     assert(hevc_encoder_get_bitrate(hevc_c->hevc_enc) == 10000000);
     assert(hevc_c->coded_buf_id == hevc_coded_buf_id);

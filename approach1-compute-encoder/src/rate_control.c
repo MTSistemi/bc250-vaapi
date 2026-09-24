@@ -13,6 +13,14 @@
 #include <math.h>
 #include <time.h>
 
+#if defined(__linux__)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <errno.h>
+extern char *program_invocation_short_name;
+#endif
+
 /*
  * rc_estimate_base_qp - derive a starting QP from the requested bitrate and
  * resolution instead of a hardcoded constant.
@@ -240,46 +248,77 @@ void rc_update_stats(rate_control_t *rc, int bits_used) {
      * from injecting a huge one-shot drain that would slam QP to qp_min;
      * outside those cases it is a no-op. Falls back to the old fixed quota
      * when no timestamp is available yet. See docs/DEVLOG.md §16. */
-    /* TEST-ONLY (BC250_RC_NOMINAL_DRAIN=1): pin the drain to the fixed
-     * per-frame quota by pretending no clock is available, taking the
-     * already-existing fallback path below.
+    /* Wall-clock drain was introduced specifically for live network streaming
+     * (Sunshine / WiVRn) where video packets are delivered across the network
+     * in real-time, and if the compute encoder achieves ~40 fps instead of 60 fps,
+     * network transmission rate matches target_bitrate.
      *
-     * Why this exists: the wall-clock drain makes the encoder's output a
-     * function of how fast it ran, which is correct for live streaming but
-     * destroys byte-exactness as a verification oracle - any optimization
-     * that changes speed also legitimately changes the bitstream, so a
-     * differing md5 no longer distinguishes "faster" from "broken". Setting
-     * this makes output timing-independent so an A/B of a supposedly
-     * output-neutral change can be checked byte-for-byte. Never set in
-     * production: it reintroduces the §16 failure mode where a slow encoder
-     * drains as if it were hitting its target frame rate. */
-    static int nominal_drain = -1;
-    if (nominal_drain < 0) {
-        const char *e = getenv("BC250_RC_NOMINAL_DRAIN");
-        nominal_drain = (e && strcmp(e, "1") == 0) ? 1 : 0;
+     * However, for ANY file recording or offline encoding (OBS Studio recording to disk,
+     * FFmpeg transcoding, GStreamer recording, SimpleScreenRecorder, etc.):
+     * The output media container (MP4, MKV) plays back at the stream's nominal framerate.
+     * If the encoder runs at e.g. 37.5 fps on a 60 fps stream, wall-clock elapsed time
+     * is 26.6ms instead of 16.6ms (1.60x longer). Draining by wall-clock time causes the
+     * leaky bucket to drain 60% faster, making the encoder output 60% larger frames.
+     * When played back at 60 fps, the video file's bitrate balloons by 60% (e.g. 9.0 Mbps
+     * request balloons to 14.4 Mbps in the recorded file!).
+     *
+     * Therefore:
+     * - By default, ALL file recording and video encoding (FFmpeg, OBS, etc.) uses NOMINAL
+     *   per-frame drain (target_bits_per_frame = target_bitrate / framerate), guaranteeing
+     *   exact bitrate conformance and preventing bitrate ballooning.
+     * - Wall-clock drain is ONLY used for live streaming servers (Sunshine, WiVRn) or when
+     *   explicitly requested via BC250_RC_WALLCLOCK_DRAIN=1.
+     * - BC250_RC_NOMINAL_DRAIN=1 can be set to force nominal drain anywhere.
+     */
+    static int wallclock_drain_mode = -1;
+    if (wallclock_drain_mode < 0) {
+        const char *e_nom = getenv("BC250_RC_NOMINAL_DRAIN");
+        if (e_nom && strcmp(e_nom, "1") == 0) {
+            wallclock_drain_mode = 0;
+        } else {
+            const char *e_wc = getenv("BC250_RC_WALLCLOCK_DRAIN");
+            if (e_wc && strcmp(e_wc, "1") == 0) {
+                wallclock_drain_mode = 1;
+            } else {
+#if defined(__linux__)
+                if (program_invocation_short_name &&
+                    (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+                     strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+                     strcmp(program_invocation_short_name, "wivrn") == 0)) {
+                    wallclock_drain_mode = 1;
+                } else {
+                    wallclock_drain_mode = 0;
+                }
+#else
+                wallclock_drain_mode = 0;
+#endif
+            }
+        }
     }
 
-    struct timespec now;
-    uint64_t now_ns = 0;
-    if (!nominal_drain && clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
-        now_ns = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
-    }
+    int64_t drain = rc->target_bits_per_frame;   /* exact per-frame quota for video recording */
+    if (wallclock_drain_mode == 1) {
+        struct timespec now;
+        uint64_t now_ns = 0;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+            now_ns = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+        }
 
-    int64_t drain = rc->target_bits_per_frame;   /* fallback: previous behaviour */
-    if (now_ns != 0 && rc->last_frame_ns != 0 && now_ns > rc->last_frame_ns) {
-        double elapsed = (double)(now_ns - rc->last_frame_ns) / 1e9;
-        /* Clamp to a sane inter-frame window: 1ms (1000fps) .. 250ms (4fps). */
-        if (elapsed < 0.001) elapsed = 0.001;
-        if (elapsed > 0.250) elapsed = 0.250;
-        drain = (int64_t)((double)rc->target_bitrate * elapsed);
+        if (now_ns != 0 && rc->last_frame_ns != 0 && now_ns > rc->last_frame_ns) {
+            double elapsed = (double)(now_ns - rc->last_frame_ns) / 1e9;
+            /* Clamp to a sane inter-frame window: 1ms (1000fps) .. 250ms (4fps). */
+            if (elapsed < 0.001) elapsed = 0.001;
+            if (elapsed > 0.250) elapsed = 0.250;
+            drain = (int64_t)((double)rc->target_bitrate * elapsed);
 
-        /* Diagnostics only: EMA of achieved frame rate. */
-        double inst_fps = 1.0 / elapsed;
-        rc->measured_fps = (rc->measured_fps > 0.0)
-                             ? (rc->measured_fps * 0.95 + inst_fps * 0.05)
-                             : inst_fps;
+            /* Diagnostics only: EMA of achieved frame rate. */
+            double inst_fps = 1.0 / elapsed;
+            rc->measured_fps = (rc->measured_fps > 0.0)
+                                 ? (rc->measured_fps * 0.95 + inst_fps * 0.05)
+                                 : inst_fps;
+        }
+        if (now_ns != 0) rc->last_frame_ns = now_ns;
     }
-    if (now_ns != 0) rc->last_frame_ns = now_ns;
 
     rc->buffer_fullness -= drain;
 
