@@ -782,17 +782,16 @@ static void reconstruct_tb(hevcd_t *d, int c_idx, int x, int y,
           : log2_size == 3 ? d->sf8[mat]
           : log2_size == 4 ? d->sf16[mat] : d->sf32[mat];
     }
-    if (m)
-        hevcd_dequantize_scaled(d->coeff, log2_size, block_qp(d, c_idx),
-                                bd, m);
-    else
-        hevcd_dequantize(d->coeff, log2_size, block_qp(d, c_idx), bd);
+    /* Only where hevcd_read_residual() put something: see nz_pos. */
+    hevcd_dequantize_at(d->coeff, d->nz_pos, d->n_nz, log2_size,
+                        block_qp(d, c_idx), bd, m);
     if (d->transform_skip)
         hevcd_skip_transform(d->coeff, log2_size, bd);
     else
-        hevcd_transform(d->coeff, log2_size,
-                        c_idx == 0 && log2_size == 2
-                        && d->cu.pred_mode == HEVCD_MODE_INTRA, bd);
+        hevcd_transform_box(d->coeff, log2_size,
+                            c_idx == 0 && log2_size == 2
+                            && d->cu.pred_mode == HEVCD_MODE_INTRA, bd,
+                            d->nz_max_x, d->nz_max_y);
     hevcd_add(d->plane[c_idx], d->stride[c_idx], x, y,
               d->coeff, log2_size, bd);
 }

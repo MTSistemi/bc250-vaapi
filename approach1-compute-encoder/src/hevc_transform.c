@@ -17,6 +17,8 @@
  */
 #include "hevc_dec_internal.h"
 
+#include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -35,39 +37,22 @@ static inline int clip_pixel(int v, int bd)
     return v < 0 ? 0 : (v > max ? max : v);
 }
 
-/* 8.6.3. m[x][y] is 16 throughout: a stream with its own quantisation
- * matrices is refused at the parameter set. */
-void hevcd_dequantize(int16_t *coeff, int log2_size, int qp, int bd)
-{
-    const int shift = bd + log2_size - 5;      /* BitDepth + Log2(nTbS) - 5 */
-    const int add = 1 << (shift - 1);
-    const int64_t scale_of = (int64_t)hevcd_level_scale[qp % 6] << (qp / 6);
-    const int count = 1 << (2 * log2_size);
-
-    for (int i = 0; i < count; i++) {
-        if (!coeff[i]) continue;
-        const int64_t v = ((int64_t)coeff[i] * scale_of * 16 + add) >> shift;
-        coeff[i] = (int16_t)clip16((int)(v < -32768 ? -32768
-                                             : (v > 32767 ? 32767 : v)));
-    }
-}
-
-/* The same with a quantisation matrix: m holds the factor of every
- * position, in the block's raster order. A matrix of sixteens is the flat
- * case above, sample for sample. */
-void hevcd_dequantize_scaled(int16_t *coeff, int log2_size, int qp, int bd,
-                             const uint8_t *m)
+/* 8.6.3, over the positions the residual reader wrote and nothing else:
+ * the zeros between them stay zero either way. m holds the factor of every
+ * position in the block's raster order, or is NULL for the flat matrix of
+ * sixteens. */
+void hevcd_dequantize_at(int16_t *coeff, const uint16_t *pos, int n,
+                         int log2_size, int qp, int bd, const uint8_t *m)
 {
     const int shift = bd + log2_size - 5;
     const int add = 1 << (shift - 1);
     const int64_t scale_of = (int64_t)hevcd_level_scale[qp % 6] << (qp / 6);
-    const int count = 1 << (2 * log2_size);
 
-    for (int i = 0; i < count; i++) {
-        if (!coeff[i]) continue;
-        const int64_t v = ((int64_t)coeff[i] * scale_of * m[i] + add) >> shift;
-        coeff[i] = (int16_t)clip16((int)(v < -32768 ? -32768
-                                             : (v > 32767 ? 32767 : v)));
+    for (int i = 0; i < n; i++) {
+        const int p = pos[i];
+        const int64_t v = ((int64_t)coeff[p] * scale_of * (m ? m[p] : 16)
+                           + add) >> shift;
+        coeff[p] = (int16_t)(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
     }
 }
 
@@ -88,11 +73,12 @@ static void line_transform(const int16_t *src, int stride, int32_t *out,
     int val[32];
     int count = 0;
     for (int k = 0; k < n_in; k++) {
+        /* Written every time and kept only when not zero: a branch here
+         * is taken or not at random, which costs more than the stores. */
         const int c = src[k * stride];
-        if (!c) continue;
         val[count] = c;
         row_m[count] = hevcd_dct[k * step];
-        count++;
+        count += (c != 0);
     }
     if (!count) {
         memset(out, 0, (size_t)n * sizeof *out);
@@ -155,6 +141,104 @@ static void dst4(const int16_t *src, int stride, int32_t *out)
     out[3] = 55 * c0 + 29 * c2 - c3;
 }
 
+/* ------------------------------------------------- 4x4, in one go
+ *
+ * A 4x4 block is four lines of four, and SSE2 holds four of anything at
+ * thirty-two bits: each output of a line is two _mm_madd_epi16, one for
+ * inputs 0 and 1 and one for 2 and 3, over four lines at once. A 4x4
+ * transposition between the stages and one at the end, and the whole
+ * block is some forty instructions. The per-line path below was built for
+ * the large blocks and spent most of a 4x4 finding its non-zero inputs.
+ *
+ * m[k][i] is what input k contributes to output i. For the DCT that is
+ * row k * 8 of the 32-point matrix, which is what line_transform() reads;
+ * for the DST it is transMatrix of 8.6.4.2, the same numbers dst4()
+ * multiplies by in factored form. */
+#if defined(__x86_64__) || defined(_M_X64)
+static const int8_t dst4_matrix[4][4] = {
+    { 29,  55,  74,  84 },
+    { 74,  74,   0, -74 },
+    { 84, -29, -74,  55 },
+    { 55, -84,  74, -29 },
+};
+
+/* BC250_HEVC_NOSIMD takes the per-line path instead, so the suites can
+ * still reach it. ⚠️ Atomic: the wavefront rows ask at the same time. */
+static int vector_4x4(void)
+{
+    static _Atomic int answer = -1;
+    int a = atomic_load_explicit(&answer, memory_order_relaxed);
+    if (a < 0) {
+        a = getenv("BC250_HEVC_NOSIMD") ? 0 : 1;
+        atomic_store_explicit(&answer, a, memory_order_relaxed);
+    }
+    return a;
+}
+
+/* One stage. r[k] holds input k of four lines, in its low four lanes;
+ * out[i] comes back with output i of the same four lines, rounded, shifted
+ * and clipped to sixteen bits. */
+static void stage4(const __m128i r[4], const int8_t m[4][4], int add,
+                   int shift, __m128i out[4])
+{
+    const __m128i p01 = _mm_unpacklo_epi16(r[0], r[1]);
+    const __m128i p23 = _mm_unpacklo_epi16(r[2], r[3]);
+    const __m128i a = _mm_set1_epi32(add);
+    const __m128i s = _mm_cvtsi32_si128(shift);
+    for (int i = 0; i < 4; i++) {
+        const __m128i c01 = _mm_set1_epi32(
+            (int32_t)((uint32_t)(uint16_t)m[0][i]
+                      | ((uint32_t)(uint16_t)m[1][i] << 16)));
+        const __m128i c23 = _mm_set1_epi32(
+            (int32_t)((uint32_t)(uint16_t)m[2][i]
+                      | ((uint32_t)(uint16_t)m[3][i] << 16)));
+        __m128i v = _mm_add_epi32(_mm_madd_epi16(p01, c01),
+                                  _mm_madd_epi16(p23, c23));
+        v = _mm_sra_epi32(_mm_add_epi32(v, a), s);
+        out[i] = _mm_packs_epi32(v, v);
+    }
+}
+
+/* Four vectors of four sixteen-bit values, rows into columns. */
+static void transpose4(const __m128i in[4], __m128i out[4])
+{
+    const __m128i a = _mm_unpacklo_epi16(in[0], in[1]);
+    const __m128i b = _mm_unpacklo_epi16(in[2], in[3]);
+    const __m128i lo = _mm_unpacklo_epi32(a, b);
+    const __m128i hi = _mm_unpackhi_epi32(a, b);
+    out[0] = lo;
+    out[1] = _mm_srli_si128(lo, 8);
+    out[2] = hi;
+    out[3] = _mm_srli_si128(hi, 8);
+}
+
+static void transform4_v(int16_t *coeff, bool dst, int add, int shift)
+{
+    int8_t dct[4][4];
+    const int8_t (*m)[4] = dst4_matrix;
+    if (!dst) {
+        for (int k = 0; k < 4; k++)
+            for (int i = 0; i < 4; i++) dct[k][i] = hevcd_dct[k * 8][i];
+        m = (const int8_t (*)[4])dct;
+    }
+
+    /* First stage down the columns: input k is row k of the block, and
+     * each lane is one column. What comes out is the block's rows. */
+    __m128i r[4], t[4], c[4], o[4];
+    for (int k = 0; k < 4; k++)
+        r[k] = _mm_loadl_epi64((const __m128i *)(coeff + 4 * k));
+    stage4(r, m, 64, 7, t);
+
+    /* Second along the rows: turned so that input k is column k and each
+     * lane a row, and turned back. */
+    transpose4(t, c);
+    stage4(c, m, add, shift, o);
+    transpose4(o, r);
+    for (int y = 0; y < 4; y++)
+        _mm_storel_epi64((__m128i *)(coeff + 4 * y), r[y]);
+}
+#endif
+
 /* n values of one line, rounded, shifted and clipped to sixteen bits.
  * _mm_packs_epi32 saturates to exactly the range clip16() clips to. */
 static void store_line(int16_t *o, const int32_t *v, int n, int add, int shift)
@@ -189,6 +273,14 @@ static void store_line(int16_t *o, const int32_t *v, int n, int add, int shift)
  * transposed, one column per row, so the first stage writes it in order. */
 void hevcd_transform(int16_t *coeff, int log2_size, bool dst, int bd)
 {
+    hevcd_transform_box(coeff, log2_size, dst, bd, -2, -2);
+}
+
+/* max_x and max_y bound the coefficients, or are -2 when the caller does
+ * not know and they are to be found here. */
+void hevcd_transform_box(int16_t *coeff, int log2_size, bool dst, int bd,
+                         int max_x, int max_y)
+{
     const int n = 1 << log2_size;
     int16_t tmp[32 * 32];
     int32_t row[32];
@@ -198,6 +290,13 @@ void hevcd_transform(int16_t *coeff, int log2_size, bool dst, int bd)
      * look symmetrical would be wrong. */
     const int shift = 20 - bd;
     const int add = 1 << (shift - 1);
+
+#if defined(__x86_64__) || defined(_M_X64)
+    if (n == 4 && vector_4x4()) {
+        transform4_v(coeff, dst, add, shift);
+        return;
+    }
+#endif
 
     /* The DST exists at 4x4 only, and dst4() makes four values. Said
      * here in so many words, so that neither the loops nor the compiler
@@ -216,14 +315,16 @@ void hevcd_transform(int16_t *coeff, int log2_size, bool dst, int bd)
         return;
     }
 
-    int max_x = -1, max_y = -1;
-    for (int y = 0; y < n; y++) {
-        const int16_t *r = coeff + y * n;
-        int x = n - 1;
-        while (x >= 0 && !r[x]) x--;
-        if (x >= 0) {
-            max_y = y;
-            if (x > max_x) max_x = x;
+    if (max_x < -1 || max_y < -1) {
+        max_x = max_y = -1;
+        for (int y = 0; y < n; y++) {
+            const int16_t *r = coeff + y * n;
+            int x = n - 1;
+            while (x >= 0 && !r[x]) x--;
+            if (x >= 0) {
+                max_y = y;
+                if (x > max_x) max_x = x;
+            }
         }
     }
     if (max_x < 0) {                    /* nothing at all: zero out */

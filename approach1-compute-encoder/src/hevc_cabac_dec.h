@@ -66,13 +66,11 @@ static inline int hevcd_bypass(hevcd_cabac_t *c)
     return h264d_cabac_bypass(c);
 }
 
-/* Several bypass bins, most significant first. */
+/* Several bypass bins, most significant first - in one division, see
+ * h264d_cabac_bypass_n(). */
 static inline uint32_t hevcd_bypass_n(hevcd_cabac_t *c, int n)
 {
-    uint32_t v = 0;
-    while (n-- > 0)
-        v = (v << 1) | (uint32_t)h264d_cabac_bypass(c);
-    return v;
+    return h264d_cabac_bypass_n(c, n);
 }
 
 static inline int hevcd_terminate(hevcd_cabac_t *c)

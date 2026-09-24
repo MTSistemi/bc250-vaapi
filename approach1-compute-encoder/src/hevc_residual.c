@@ -44,6 +44,9 @@ void hevcd_read_residual(hevcd_t *d, int x0, int y0, int log2_size, int c_idx)
 
     const int side = 1 << log2_size;
     memset(d->coeff, 0, (size_t)side * side * sizeof(int16_t));
+    d->n_nz = 0;
+    d->nz_max_x = -1;
+    d->nz_max_y = -1;
 
     d->transform_skip = false;
     if (pps->transform_skip_enabled && !d->cu.transquant_bypass
@@ -193,12 +196,16 @@ void hevcd_read_residual(hevcd_t *d, int x0, int y0, int log2_size, int c_idx)
             n_alto = 15;
         }
 
+        /* ⚠️ Written every time and counted only when significant. Which
+         * way a significance bin goes is the least predictable thing in
+         * the stream, and a branch on it was most of the mispredictions in
+         * the whole decoder. */
         for (int n = n_alto; n > 0; n--) {
             const int inc = map_of[(sy[n] << 2) + sx[n]] + scf_off;
-            if (hevcd_bin(c, HEVCD_CTX_SIGNIFICANT_COEFF_FLAG + inc)) {
-                sig[n_sig++] = (uint8_t)n;
-                implicit_dc = false;
-            }
+            const int b = hevcd_bin(c, HEVCD_CTX_SIGNIFICANT_COEFF_FLAG + inc);
+            sig[n_sig] = (uint8_t)n;
+            n_sig += b;
+            implicit_dc = implicit_dc && !b;
         }
         if (n_alto >= 0) {
             if (implicit_dc) {
@@ -221,16 +228,17 @@ void hevcd_read_residual(hevcd_t *d, int x0, int y0, int log2_size, int c_idx)
         memset(g1, 0, sizeof(g1));
         int first_g1 = -1;
         const int n_g1 = n_sig < 8 ? n_sig : 8;
+        /* 9.3.4.2.6: a one sends the context to zero for good, a zero
+         * moves it on from 1 to 3 and leaves 0 and 3 where they are. As a
+         * table, so that the bin picks the next context without a branch. */
+        static const uint8_t next_g1[2][4] = { { 0, 2, 3, 3 }, { 0, 0, 0, 0 } };
         for (int k = 0; k < n_g1; k++) {
             const int inc = (ctx_set << 2) + greater1_ctx + (c_idx ? 16 : 0);
-            g1[k] = (uint8_t)
+            const int b =
                 hevcd_bin(c, HEVCD_CTX_COEFF_ABS_LEVEL_GREATER1_FLAG + inc);
-            if (g1[k]) {
-                greater1_ctx = 0;
-                if (first_g1 < 0) first_g1 = k;
-            } else if (greater1_ctx > 0 && greater1_ctx < 3) {
-                greater1_ctx++;
-            }
+            g1[k] = (uint8_t)b;
+            first_g1 = (b && first_g1 < 0) ? k : first_g1;
+            greater1_ctx = next_g1[b][greater1_ctx];
         }
         if (first_g1 >= 0)
             g1[first_g1] += (uint8_t)
@@ -272,6 +280,9 @@ void hevcd_read_residual(hevcd_t *d, int x0, int y0, int log2_size, int c_idx)
             const int xc = (x_cg << 2) + sx[n], yc = (y_cg << 2) + sy[n];
             d->coeff[yc * side + xc] =
                 (int16_t)(negative ? -levels[k] : levels[k]);
+            d->nz_pos[d->n_nz++] = (uint16_t)(yc * side + xc);
+            d->nz_max_x = xc > d->nz_max_x ? xc : d->nz_max_x;
+            d->nz_max_y = yc > d->nz_max_y ? yc : d->nz_max_y;
         }
     }
 }

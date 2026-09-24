@@ -239,6 +239,14 @@ typedef struct {
 
     /* One transform block's coefficients, in raster order inside it. */
     int16_t coeff[32 * 32];
+    /* Where the residual reader put a value in coeff, in the order it put
+     * them, and the smallest rectangle from the corner that holds them
+     * all. The dequantiser touches only those and the transform only the
+     * rectangle: each of them used to look for the coefficients again,
+     * one branch per position, and those branches are as unpredictable as
+     * the coefficients. */
+    uint16_t nz_pos[32 * 32];
+    int n_nz, nz_max_x, nz_max_y;
     bool transform_skip;            /* of the block just read */
 
     /* Where the picture is written. The decoder owns these; the harness
@@ -312,11 +320,15 @@ void hevcd_read_residual(hevcd_t *d, int x0, int y0, int log2_size, int c_idx);
 void hevcd_predict_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
                          int mode);
 
-/* 8.6.2 to 8.6.4: the coefficients into a residual, and onto the picture. */
-void hevcd_dequantize(int16_t *coeff, int log2_size, int qp, int bd);
-void hevcd_dequantize_scaled(int16_t *coeff, int log2_size, int qp, int bd,
-                             const uint8_t *m);
+/* 8.6.2 to 8.6.4: the coefficients into a residual, and onto the picture.
+ * Told where the coefficients are: dequantise only the n positions in pos
+ * (m NULL for the flat matrix), and transform knowing that nothing lies
+ * right of max_x or below max_y. hevcd_transform() finds out for itself. */
 void hevcd_transform(int16_t *coeff, int log2_size, bool dst, int bd);
+void hevcd_dequantize_at(int16_t *coeff, const uint16_t *pos, int n,
+                         int log2_size, int qp, int bd, const uint8_t *m);
+void hevcd_transform_box(int16_t *coeff, int log2_size, bool dst, int bd,
+                         int max_x, int max_y);
 void hevcd_skip_transform(int16_t *coeff, int log2_size, int bd);
 void hevcd_add(uint8_t *plane, int stride, int x, int y,
                const int16_t *res, int log2_size,
