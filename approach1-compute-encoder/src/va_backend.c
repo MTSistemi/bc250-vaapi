@@ -158,9 +158,17 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
                 if (entrypoint == VAEntrypointVLD) {
                     attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
                 } else {
-                    /* Advertise CBR, VBR, and CQP. Allows encoders to negotiate
-                     * requested bitrates via VBR/CBR or constant QP via CQP. */
-                    attrib_list[i].value = VA_RC_CBR | VA_RC_VBR | VA_RC_CQP;
+                    /* Default to CBR and VBR. This allows standard encoders (e.g. FFmpeg)
+                     * to automatically negotiate VBR with standard target bitrates
+                     * (e.g. ~4 Mbps H.264 / ~2.2 Mbps HEVC on 1080p), matching Intel/AMD
+                     * hardware encoder behavior and preventing multi-gigabyte file blowups from
+                     * unconstrained CQP defaults. Explicit CQP can be enabled via
+                     * BC250_ENABLE_CQP=1 or direct vaCreateConfig calls. */
+                    unsigned int rc_modes = VA_RC_CBR | VA_RC_VBR;
+                    if (getenv("BC250_ENABLE_CQP")) {
+                        rc_modes |= VA_RC_CQP;
+                    }
+                    attrib_list[i].value = rc_modes;
                 }
                 break;
             case VAConfigAttribEncPackedHeaders:

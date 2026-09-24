@@ -1122,6 +1122,20 @@ int hevcd_prepare_zscan(hevcd_t *d)
     const int w = sps->width >> sps->log2_min_tb;
     const int h = sps->height >> sps->log2_min_tb;
     const size_t serve = (size_t)w * h;
+    const size_t ctbs = (size_t)sps->ctb_count;
+
+    /* ⚠️ Only when something it depends on changed: the picture size, the
+     * two block sizes, and the tile layout through rs_to_ts. Rebuilt for
+     * every picture it was five per cent of a 4K decode. The layout is
+     * compared by content, not by pointer: the parameter sets are
+     * overwritten in place when a stream resends them. */
+    if (d->min_tb_addr_zs && d->n_zs >= serve && d->rs_to_ts
+        && d->zs_rs_to_ts && d->n_zs_rs >= ctbs
+        && d->zs_w == w && d->zs_h == h
+        && d->zs_log2_min_tb == sps->log2_min_tb
+        && d->zs_log2_ctb == sps->log2_ctb
+        && !memcmp(d->zs_rs_to_ts, d->rs_to_ts, ctbs * sizeof(int32_t)))
+        return 0;
 
     if (!d->min_tb_addr_zs || d->n_zs < serve) {
         free(d->min_tb_addr_zs);
@@ -1129,6 +1143,7 @@ int hevcd_prepare_zscan(hevcd_t *d)
         d->n_zs = serve;
         if (!d->min_tb_addr_zs) return -1;
     }
+    d->zs_w = -1;       /* invalid until the table below is complete */
 
     const int diff = sps->log2_ctb - sps->log2_min_tb;
     for (int y = 0; y < h; y++) {
@@ -1146,6 +1161,21 @@ int hevcd_prepare_zscan(hevcd_t *d)
                 a += ((m & x) ? m * m : 0) + ((m & y) ? 2 * m * m : 0);
             }
             d->min_tb_addr_zs[y * w + x] = a;
+        }
+    }
+
+    if (d->rs_to_ts) {
+        if (!d->zs_rs_to_ts || d->n_zs_rs < ctbs) {
+            free(d->zs_rs_to_ts);
+            d->zs_rs_to_ts = malloc(ctbs * sizeof(int32_t));
+            d->n_zs_rs = d->zs_rs_to_ts ? ctbs : 0;
+        }
+        if (d->zs_rs_to_ts) {
+            memcpy(d->zs_rs_to_ts, d->rs_to_ts, ctbs * sizeof(int32_t));
+            d->zs_w = w;
+            d->zs_h = h;
+            d->zs_log2_min_tb = sps->log2_min_tb;
+            d->zs_log2_ctb = sps->log2_ctb;
         }
     }
     return 0;

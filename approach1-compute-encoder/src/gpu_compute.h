@@ -342,6 +342,16 @@ void gpu_compute_destroy_image(gpu_context_t *ctx, gpu_image_t image, gpu_memory
  * unbound. */
 int gpu_compute_get_nv12_layout(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory, gpu_nv12_layout_t *layout);
 
+/* A surface's memory mapped for the CPU to write into, and where its two
+ * planes lie in it. NULL when it cannot be mapped. *unmap says whether the
+ * mapping was made here, and is handed back to gpu_compute_unmap_surface()
+ * when the writing is done - memory the context keeps mapped stays so. */
+uint8_t *gpu_compute_map_surface(gpu_context_t *ctx, gpu_image_t *image,
+                                 gpu_memory_t memory,
+                                 gpu_nv12_layout_t *layout, bool *unmap);
+void gpu_compute_unmap_surface(gpu_context_t *ctx, gpu_memory_t memory,
+                               bool unmap);
+
 /* ⚠️ Despite the name, these two move whatever the image holds: an
  * image created as GPU_IMAGE_P010 moves sixteen-bit samples, byte for
  * byte, with no shift in either direction. `width` is a sample count.

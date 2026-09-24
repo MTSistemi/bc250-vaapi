@@ -141,6 +141,11 @@ typedef struct {
      * unit is a quadtree, so the block above right of a transform block
      * may or may not have come first. */
     int32_t *min_tb_addr_zs;
+    /* What that table was built for - it depends on nothing else - so a
+     * picture like the one before does not build it again. */
+    int zs_w, zs_h, zs_log2_min_tb, zs_log2_ctb;
+    int32_t *zs_rs_to_ts;
+    size_t n_zs_rs;
     /* 6.5.1. The picture in tile scan and back again, and which tile each
      * unit belongs to - that one indexed by TILE-SCAN address, because
      * the walk asks "has the tile changed since the last unit" and the
@@ -278,9 +283,9 @@ int hevcd_wavefront(hevcd_t *d, const hevc_sps_t *sps, const hevc_pps_t *pps,
                     const hevc_slice_t *sl, const uint8_t *base, size_t rest,
                     int init_type);
 
-/* 8.7.2 and 8.7.3, over the whole finished picture, in that order. */
-void hevcd_deblock(hevcd_t *d);
-void hevcd_sao(hevcd_t *d);
+/* 8.7.2 and 8.7.3, over the whole finished picture, in that order, on as
+ * many threads as BC250_HEVC_THREAD or the processor count allows. */
+void hevcd_loop_filters(hevcd_t *d);
 void hevcd_free_filters(hevcd_t *d);
 
 /* 8.5.3.2: what motion one prediction unit ended up with, and 8.5.3.3:
@@ -317,12 +322,40 @@ void hevcd_add(uint8_t *plane, int stride, int x, int y,
                const int16_t *res, int log2_size,
                int bd);
 
-/* 6.5.2: the z-scan address of every smallest transform block. Built once
- * per sequence parameter set. */
+/* 6.5.2: the z-scan address of every smallest transform block. Rebuilt
+ * only when the picture size, the block sizes or the tiles change. */
 int hevcd_prepare_zscan(hevcd_t *d);
 int hevcd_prepare_tiles(hevcd_t *d);
 void hevcd_free_tiles(hevcd_t *d);
-int hevcd_tile_at(const hevcd_t *d, int x, int y);
-int hevcd_slice_at(const hevcd_t *d, int x, int y);
+
+/* Which tile covers the unit at these LUMA coordinates. Used by the
+ * availability rule and by the loop filters, both of which think in
+ * samples rather than in unit addresses.
+ *
+ * ⚠️ Here and inline, with hevcd_slice_at(): the deblocking filter asks
+ * both for every four-sample edge segment, and as calls into another file
+ * the asking cost more than the lookups. */
+static inline int hevcd_tile_at(const hevcd_t *d, int x, int y)
+{
+    /* The common case by far, and worth one branch: with a single tile
+     * every answer is zero and the two map lookups are waste. */
+    if (d->n_tiles <= 1 || !d->tile_of_ts) return 0;
+    const hevc_sps_t *sps = d->sps;
+    const int rs = (y >> sps->log2_ctb) * sps->ctb_width + (x >> sps->log2_ctb);
+    if (rs < 0 || rs >= sps->ctb_count) return 0;
+    return d->tile_of_ts[d->rs_to_ts[rs]];
+}
+
+/* Which slice covers the unit at these LUMA coordinates, or -1 when
+ * none has yet. Same shape as hevcd_tile_at() and asked in the same
+ * places. */
+static inline int hevcd_slice_at(const hevcd_t *d, int x, int y)
+{
+    if (!d->slice_of_ctb) return 0;
+    const hevc_sps_t *sps = d->sps;
+    const int rs = (y >> sps->log2_ctb) * sps->ctb_width + (x >> sps->log2_ctb);
+    if (rs < 0 || rs >= sps->ctb_count) return -1;
+    return d->slice_of_ctb[rs];
+}
 
 #endif /* BC250_HEVC_DEC_INTERNAL_H */

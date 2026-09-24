@@ -76,16 +76,18 @@ void hevcd_dequantize_scaled(int16_t *coeff, int log2_size, int qp, int bd,
  * ⚠️ The matrix row used is k * (32 / n), which is what "the even rows of
  * the even rows" means in practice. Reading hevcd_dct[k] instead would be
  * a 32-point transform truncated, which is a different function. */
-static void line_transform(const int16_t *src, int stride, int32_t *out, int n)
+static void line_transform(const int16_t *src, int stride, int32_t *out,
+                           int n, int n_in)
 {
     const int step = 32 / n;
 
     /* Which inputs are not zero, and which matrix row each one reaches
-     * for. Everything else contributes nothing to any output. */
+     * for. Everything else contributes nothing to any output - and past
+     * n_in the caller already knows every input is zero. */
     const int8_t *row_m[32];
     int val[32];
     int count = 0;
-    for (int k = 0; k < n; k++) {
+    for (int k = 0; k < n_in; k++) {
         const int c = src[k * stride];
         if (!c) continue;
         val[count] = c;
@@ -153,32 +155,90 @@ static void dst4(const int16_t *src, int stride, int32_t *out)
     out[3] = 55 * c0 + 29 * c2 - c3;
 }
 
+/* n values of one line, rounded, shifted and clipped to sixteen bits.
+ * _mm_packs_epi32 saturates to exactly the range clip16() clips to. */
+static void store_line(int16_t *o, const int32_t *v, int n, int add, int shift)
+{
+#if defined(__x86_64__) || defined(_M_X64)
+    if (n >= 8) {
+        const __m128i a = _mm_set1_epi32(add);
+        const __m128i s = _mm_cvtsi32_si128(shift);
+        for (int i = 0; i < n; i += 8) {
+            const __m128i lo = _mm_sra_epi32(_mm_add_epi32(
+                _mm_loadu_si128((const __m128i *)(v + i)), a), s);
+            const __m128i hi = _mm_sra_epi32(_mm_add_epi32(
+                _mm_loadu_si128((const __m128i *)(v + i + 4)), a), s);
+            _mm_storeu_si128((__m128i *)(o + i), _mm_packs_epi32(lo, hi));
+        }
+        return;
+    }
+#endif
+    for (int i = 0; i < n; i++) o[i] = (int16_t)clip16((v[i] + add) >> shift);
+}
+
 /* 8.6.4.2: columns first with a shift of seven, then rows with what is
  * left. Both stages clip to sixteen bits, which the standard says and
- * which matters: the intermediate really can leave the range. */
+ * which matters: the intermediate really can leave the range.
+ *
+ * ⚠️ Most blocks hold a handful of coefficients in one corner. Looking for
+ * them one line at a time cost more than the arithmetic: a 32x32 block
+ * with three coefficients was 2048 positions checked and 2048 values
+ * clipped. So the rectangle that holds coefficients is found first. The
+ * columns outside it transform to zero and are not computed, and the
+ * second stage reads only the columns inside it. The intermediate is kept
+ * transposed, one column per row, so the first stage writes it in order. */
 void hevcd_transform(int16_t *coeff, int log2_size, bool dst, int bd)
 {
     const int n = 1 << log2_size;
     int16_t tmp[32 * 32];
     int32_t row[32];
 
-    for (int x = 0; x < n; x++) {
-        if (dst) dst4(coeff + x, n, row);
-        else     line_transform(coeff + x, n, row, n);
-        for (int y = 0; y < n; y++)
-            tmp[y * n + x] = (int16_t)clip16((row[y] + 64) >> 7);
-    }
-
-    /* ⚠️ Only the second stage moves with the depth. The seven above is
-     * seven at ten bits too: the standard fixes it, and making it look
-     * symmetrical would be wrong. */
+    /* ⚠️ Only the second stage moves with the depth. The seven of the
+     * first is seven at ten bits too: the standard fixes it, and making it
+     * look symmetrical would be wrong. */
     const int shift = 20 - bd;
     const int add = 1 << (shift - 1);
+
+    /* The DST exists at 4x4 only, and dst4() makes four values. Said
+     * here in so many words, so that neither the loops nor the compiler
+     * have to take n on trust. */
+    if (dst && n == 4) {
+        for (int x = 0; x < 4; x++) {
+            dst4(coeff + x, 4, row);
+            for (int y = 0; y < 4; y++)
+                tmp[y * 4 + x] = (int16_t)clip16((row[y] + 64) >> 7);
+        }
+        for (int y = 0; y < 4; y++) {
+            dst4(tmp + y * 4, 1, row);
+            for (int x = 0; x < 4; x++)
+                coeff[y * 4 + x] = (int16_t)clip16((row[x] + add) >> shift);
+        }
+        return;
+    }
+
+    int max_x = -1, max_y = -1;
     for (int y = 0; y < n; y++) {
-        if (dst) dst4(tmp + y * n, 1, row);
-        else     line_transform(tmp + y * n, 1, row, n);
-        for (int x = 0; x < n; x++)
-            coeff[y * n + x] = (int16_t)clip16((row[x] + add) >> shift);
+        const int16_t *r = coeff + y * n;
+        int x = n - 1;
+        while (x >= 0 && !r[x]) x--;
+        if (x >= 0) {
+            max_y = y;
+            if (x > max_x) max_x = x;
+        }
+    }
+    if (max_x < 0) {                    /* nothing at all: zero out */
+        memset(coeff, 0, (size_t)n * n * sizeof *coeff);
+        return;
+    }
+
+    /* tmp[x * n + y] is the first stage's output for column x, row y. */
+    for (int x = 0; x <= max_x; x++) {
+        line_transform(coeff + x, n, row, n, max_y + 1);
+        store_line(tmp + x * n, row, n, 64, 7);
+    }
+    for (int y = 0; y < n; y++) {
+        line_transform(tmp + y, n, row, n, max_x + 1);
+        store_line(coeff + y * n, row, n, add, shift);
     }
 }
 

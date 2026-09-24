@@ -12,9 +12,12 @@
 #include "hevc_dec_internal.h"
 #include "gpu_compute.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
 #endif
@@ -31,8 +34,6 @@ struct hevc_decoder {
     hevc_pps_t pps;
     hevc_slice_t last_one;
     bool is_open;
-    uint8_t *uv_interleave;
-    size_t   uv_interleave_cap;
 };
 
 static void free_img(hevcd_img_t *g)
@@ -624,6 +625,8 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
     const bool tiles = pps->tiles_enabled;
     int progress = 0;
     int substream = 0;      /* how many substream boundaries have passed */
+    /* Asked once, not once per unit: getenv walks the whole environment. */
+    const bool trace = getenv("HEVC_TRACE") != NULL;
 
     /* ⚠️ Tile scan. Without tiles the map is the identity and this is the
      * raster walk it always was. */
@@ -645,10 +648,10 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
          * When a slice does not land, this says where it stopped being
          * right - a unit that consumed implausibly little is where to
          * look, not the one that ran out of data. */
-        if (getenv("HEVC_TRACE")) {
+        if (trace) {
             const long n_read = (long)((d->cabac.ptr - d->cabac.start) * 8
                                       - d->cabac.cache_bits);
-            fprintf(stderr, "ctu ts %d rs %d (%d,%d): %ld bit su %ld" "\n",
+            fprintf(stderr, "ctu ts %d rs %d (%d,%d): %ld bits of %ld" "\n",
                     ts, addr, x, y, n_read, (long)(n - first) * 8);
         }
         if (hevcd_overrun(&d->cabac)) return 3;
@@ -742,10 +745,10 @@ void hevc_decoder_destroy(hevc_decoder_t *h)
     hevcd_free_tiles(d);
     free(d->slice_filter);
     free(d->ct_depth); free(d->intra_mode); free(d->min_tb_addr_zs);
+    free(d->zs_rs_to_ts);
     free(d->qp_y_map); free(d->edges); free(d->no_filter);
     free(d->skip); free(d->cbf_map);
     hevcd_free_filters(d);
-    free(h->uv_interleave);
     free(h);
 }
 
@@ -884,7 +887,7 @@ void hevc_decoder_end_picture(hevc_decoder_t *h)
                    n * sizeof *g->slice_of_ctb);
     }
 
-    if (h->d.slice) { hevcd_deblock(&h->d); hevcd_sao(&h->d); }
+    if (h->d.slice) hevcd_loop_filters(&h->d);
     h->is_open = false;
 }
 
@@ -914,70 +917,164 @@ void hevc_decoder_shift_entry_points(hevc_slice_t *s, const uint8_t *grezzo,
     shift_entry_points(s, grezzo, n_grezzo, first);
 }
 
-/* ⚠️ The surface wants the two chroma planes interleaved, and it is
- * written once, here, rather than plane by plane as the picture is
- * decoded: surface memory is write-combining, which is fast to write
- * straight through and very slow to read back or revisit. */
+/* ------------------------------------------ the picture into the surface
+ *
+ * ⚠️ Written once, straight into the mapped surface, and never read back:
+ * surface memory is write-combining, fast to write straight through and
+ * very slow to read or revisit. The chroma planes are interleaved on the
+ * way, where they used to go through a buffer of their own first - four
+ * megabytes read and written again for every 4K picture.
+ *
+ * And on several threads. At 4K this is twelve megabytes a picture, and on
+ * one thread it came to a quarter of what the driver took over the
+ * decoder alone. */
+
+#define LOAD_BAND 32                /* luma rows per band, sixteen of chroma */
+#define LOAD_MAX_THREAD 8
+
+typedef struct {
+    const hevcd_img_t *g;
+    uint8_t *y, *uv;
+    size_t y_pitch, uv_pitch;
+    int width, height;
+    bool ten;
+    int bands;
+    _Atomic int next;
+} load_job_t;
+
+static void interleave8(uint8_t *o, const uint8_t *a, const uint8_t *b, int n)
+{
+    int x = 0;
+    for (; x + 16 <= n; x += 16) {
+        const __m128i va = _mm_loadu_si128((const __m128i *)(a + x));
+        const __m128i vb = _mm_loadu_si128((const __m128i *)(b + x));
+        _mm_storeu_si128((__m128i *)(o + 2 * x), _mm_unpacklo_epi8(va, vb));
+        _mm_storeu_si128((__m128i *)(o + 2 * x + 16), _mm_unpackhi_epi8(va, vb));
+    }
+    for (; x < n; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
+}
+
+/* P010 keeps its ten bits at the top of each sixteen. */
+static void shift10(uint16_t *o, const uint16_t *s, int n)
+{
+    int x = 0;
+    for (; x + 8 <= n; x += 8)
+        _mm_storeu_si128((__m128i *)(o + x),
+            _mm_slli_epi16(_mm_loadu_si128((const __m128i *)(s + x)), 6));
+    for (; x < n; x++) o[x] = (uint16_t)(s[x] << 6);
+}
+
+static void interleave10(uint16_t *o, const uint16_t *a, const uint16_t *b,
+                         int n)
+{
+    int x = 0;
+    for (; x + 8 <= n; x += 8) {
+        const __m128i va = _mm_slli_epi16(
+            _mm_loadu_si128((const __m128i *)(a + x)), 6);
+        const __m128i vb = _mm_slli_epi16(
+            _mm_loadu_si128((const __m128i *)(b + x)), 6);
+        _mm_storeu_si128((__m128i *)(o + 2 * x), _mm_unpacklo_epi16(va, vb));
+        _mm_storeu_si128((__m128i *)(o + 2 * x + 8), _mm_unpackhi_epi16(va, vb));
+    }
+    for (; x < n; x++) {
+        o[2 * x] = (uint16_t)(a[x] << 6);
+        o[2 * x + 1] = (uint16_t)(b[x] << 6);
+    }
+}
+
+static void load_band(load_job_t *j, int band)
+{
+    const hevcd_img_t *g = j->g;
+    const int y0 = band * LOAD_BAND;
+    const int y1 = y0 + LOAD_BAND < j->height ? y0 + LOAD_BAND : j->height;
+    const int cw = j->width / 2;
+
+    if (!j->ten) {
+        for (int r = y0; r < y1; r++)
+            memcpy(j->y + (size_t)r * j->y_pitch,
+                   g->plane[0] + (size_t)r * g->stride[0], (size_t)j->width);
+        for (int r = y0 / 2; r < y1 / 2; r++)
+            interleave8(j->uv + (size_t)r * j->uv_pitch,
+                        g->plane[1] + (size_t)r * g->stride[1],
+                        g->plane[2] + (size_t)r * g->stride[2], cw);
+        return;
+    }
+
+    /* ⚠️ The strides are sample counts, the pitches byte counts. */
+    for (int r = y0; r < y1; r++)
+        shift10((uint16_t *)(j->y + (size_t)r * j->y_pitch),
+                (const uint16_t *)g->plane[0] + (size_t)r * g->stride[0],
+                j->width);
+    for (int r = y0 / 2; r < y1 / 2; r++)
+        interleave10((uint16_t *)(j->uv + (size_t)r * j->uv_pitch),
+                     (const uint16_t *)g->plane[1] + (size_t)r * g->stride[1],
+                     (const uint16_t *)g->plane[2] + (size_t)r * g->stride[2],
+                     cw);
+}
+
+static void *load_worker(void *arg)
+{
+    load_job_t *j = arg;
+    for (;;) {
+        const int band = atomic_fetch_add_explicit(&j->next, 1,
+                                                   memory_order_relaxed);
+        if (band >= j->bands) break;
+        load_band(j, band);
+    }
+    return NULL;
+}
+
 int hevc_decoder_load(hevc_decoder_t *h, gpu_image_t out, gpu_memory_t mem)
 {
     if (!h->gpu) return 0;                 /* the harness keeps the planes */
     const hevcd_img_t *g = h->d.current;
     if (!g || !g->plane[0]) return -1;
 
-    const int cw = h->width / 2, ch = h->height / 2;
-    const int ten_bit = h->sps.bit_depth_luma > 8;
-    const size_t sample = ten_bit ? 2 : 1;
-    const size_t needed = (size_t)cw * 2 * ch * sample;
+    gpu_context_t *gpu = h->gpu;
+    gpu_nv12_layout_t lay;
+    bool unmap = false;
+    uint8_t *mapped = gpu_compute_map_surface(gpu, &out, mem, &lay, &unmap);
+    if (!mapped) return -1;
 
-    if (h->uv_interleave_cap < needed) {
-        size_t new_cap = needed < 2097152 ? 2097152 : needed;
-        uint8_t *p = realloc(h->uv_interleave, new_cap);
-        if (!p) return -1;
-        h->uv_interleave = p;
-        h->uv_interleave_cap = new_cap;
-    }
-    uint8_t *uv = h->uv_interleave;
+    load_job_t j;
+    memset(&j, 0, sizeof j);
+    j.g = g;
+    j.width = h->width;
+    j.height = h->height;
+    j.ten = h->sps.bit_depth_luma > 8;
+    j.y_pitch = lay.y_pitch;
+    j.uv_pitch = lay.uv_pitch;
+    j.bands = (h->height + LOAD_BAND - 1) / LOAD_BAND;
 
-    if (ten_bit) {
-        /* ⚠️ Every one of these is a sample count, so every offset is
-         * multiplied. The shift into P010's high bits is not here - it
-         * belongs to the upload, which is the part that knows what a
-         * surface format is. */
-        for (int r = 0; r < ch; r++) {
-            const uint16_t *a = (const uint16_t *)g->plane[1]
-                                + (size_t)r * g->stride[1];
-            const uint16_t *b = (const uint16_t *)g->plane[2]
-                                + (size_t)r * g->stride[2];
-            uint16_t *o = (uint16_t *)uv + (size_t)r * cw * 2;
-            for (int x = 0; x < cw; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
-        }
-        return gpu_compute_upload_p010(h->gpu, &out, mem,
-                                      (const uint16_t *)g->plane[0],
-                                      g->stride[0] * 2,
-                                      (const uint16_t *)uv, cw * 4,
-                                      h->width, h->height);
+    /* ⚠️ Both planes have to fit inside the memory the surface was given.
+     * The copy this replaced trusted the layout; a surface smaller than
+     * the stream would have been written past its end. */
+    const size_t row = (size_t)h->width * (j.ten ? 2 : 1);
+    if (h->width <= 0 || h->height <= 1
+        || lay.y_offset + (uint64_t)(h->height - 1) * lay.y_pitch + row
+               > lay.total_size
+        || lay.uv_offset + (uint64_t)(h->height / 2 - 1) * lay.uv_pitch + row
+               > lay.total_size) {
+        gpu_compute_unmap_surface(gpu, mem, unmap);
+        return -1;
     }
+    j.y = mapped + lay.y_offset;
+    j.uv = mapped + lay.uv_offset;
 
-    for (int r = 0; r < ch; r++) {
-        const uint8_t *a = g->plane[1] + (size_t)r * g->stride[1];
-        const uint8_t *b = g->plane[2] + (size_t)r * g->stride[2];
-        uint8_t *o = uv + (size_t)r * cw * 2;
-        int x = 0;
-#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
-        for (; x <= cw - 16; x += 16) {
-            __m128i va = _mm_loadu_si128((const __m128i *)(a + x));
-            __m128i vb = _mm_loadu_si128((const __m128i *)(b + x));
-            __m128i vlo = _mm_unpacklo_epi8(va, vb);
-            __m128i vhi = _mm_unpackhi_epi8(va, vb);
-            _mm_storeu_si128((__m128i *)(o + 2 * x), vlo);
-            _mm_storeu_si128((__m128i *)(o + 2 * x + 16), vhi);
-        }
-#endif
-        for (; x < cw; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
-    }
-    return gpu_compute_upload_nv12(h->gpu, &out, mem,
-                                  g->plane[0], g->stride[0],
-                                  uv, cw * 2, h->width, h->height);
+    const char *s = getenv("BC250_HEVC_THREAD");
+    int want = s ? atoi(s) : (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (want > LOAD_MAX_THREAD) want = LOAD_MAX_THREAD;
+    if (want > j.bands) want = j.bands;
+
+    pthread_t t[LOAD_MAX_THREAD];
+    int alive = 0;
+    for (int i = 1; i < want; i++)
+        if (pthread_create(&t[alive], NULL, load_worker, &j) == 0) alive++;
+    load_worker(&j);
+    for (int i = 0; i < alive; i++) pthread_join(t[i], NULL);
+
+    gpu_compute_unmap_surface(gpu, mem, unmap);
+    return 0;
 }
 
 const char *hevc_decoder_reason(int e)

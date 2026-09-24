@@ -287,39 +287,23 @@ static void drain_output(FILE *f)
 
 
 /* The harness runs the decoder with no GPU context, so the finished
- * picture stays in memory instead of going to a surface. The upload is
+ * picture stays in memory instead of going to a surface. The mapping is
  * still referenced from the object file, so it needs a body to link
  * against; reaching it would mean the null-context path had been lost,
  * which is why it says so rather than returning quietly. */
-int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image,
-                            gpu_memory_t memory,
-                            const uint8_t *y, int ys,
-                            const uint8_t *uv, int uvs, int w, int h);
-int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image,
-                            gpu_memory_t memory,
-                            const uint8_t *y, int ys,
-                            const uint8_t *uv, int uvs, int w, int h)
+uint8_t *gpu_compute_map_surface(gpu_context_t *ctx, gpu_image_t *image,
+                                 gpu_memory_t memory,
+                                 gpu_nv12_layout_t *layout, bool *unmap)
 {
-    (void)ctx; (void)image; (void)memory;
-    (void)y; (void)ys; (void)uv; (void)uvs; (void)w; (void)h;
+    (void)ctx; (void)image; (void)memory; (void)layout; (void)unmap;
     fprintf(stderr, "the harness has no GPU to hand the picture to\n");
     abort();
 }
 
-/* The same, for a ten-bit picture. */
-int gpu_compute_upload_p010(gpu_context_t *ctx, gpu_image_t *image,
-                            gpu_memory_t memory,
-                            const uint16_t *y, int ys,
-                            const uint16_t *uv, int uvs, int w, int h);
-int gpu_compute_upload_p010(gpu_context_t *ctx, gpu_image_t *image,
-                            gpu_memory_t memory,
-                            const uint16_t *y, int ys,
-                            const uint16_t *uv, int uvs, int w, int h)
+void gpu_compute_unmap_surface(gpu_context_t *ctx, gpu_memory_t memory,
+                               bool unmap)
 {
-    (void)ctx; (void)image; (void)memory;
-    (void)y; (void)ys; (void)uv; (void)uvs; (void)w; (void)h;
-    fprintf(stderr, "the harness has no GPU to hand the picture to\n");
-    abort();
+    (void)ctx; (void)memory; (void)unmap;
 }
 
 int main(int argc, char **argv)

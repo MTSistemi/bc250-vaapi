@@ -132,18 +132,6 @@ int hevcd_prepare_tiles(hevcd_t *d)
     return 0;
 }
 
-/* Which slice covers the unit at these LUMA coordinates, or -1 when
- * none has yet. Same shape as hevcd_tile_at() and asked in the same
- * places. */
-int hevcd_slice_at(const hevcd_t *d, int x, int y)
-{
-    if (!d->slice_of_ctb) return 0;
-    const hevc_sps_t *sps = d->sps;
-    const int rs = (y >> sps->log2_ctb) * sps->ctb_width + (x >> sps->log2_ctb);
-    if (rs < 0 || rs >= sps->ctb_count) return -1;
-    return d->slice_of_ctb[rs];
-}
-
 void hevcd_free_tiles(hevcd_t *d)
 {
     free(d->slice_of_ctb); d->slice_of_ctb = NULL;
@@ -153,18 +141,4 @@ void hevcd_free_tiles(hevcd_t *d)
     free(d->tile_of_ts); d->tile_of_ts = NULL;
     d->n_tile_map = 0;
     d->n_tiles = 0;
-}
-
-/* Which tile covers the unit at these LUMA coordinates. Used by the
- * availability rule and by the loop filters, both of which think in
- * samples rather than in unit addresses. */
-int hevcd_tile_at(const hevcd_t *d, int x, int y)
-{
-    /* The common case by far, and worth one branch: with a single tile
-     * every answer is zero and the two map lookups are waste. */
-    if (d->n_tiles <= 1 || !d->tile_of_ts) return 0;
-    const hevc_sps_t *sps = d->sps;
-    const int rs = (y >> sps->log2_ctb) * sps->ctb_width + (x >> sps->log2_ctb);
-    if (rs < 0 || rs >= sps->ctb_count) return 0;
-    return d->tile_of_ts[d->rs_to_ts[rs]];
 }

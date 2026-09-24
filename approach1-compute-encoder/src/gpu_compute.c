@@ -1914,6 +1914,29 @@ int gpu_compute_get_nv12_layout(gpu_context_t *ctx, gpu_image_t *image, gpu_memo
     return 0;
 }
 
+uint8_t *gpu_compute_map_surface(gpu_context_t *ctx, gpu_image_t *image,
+                                 gpu_memory_t memory,
+                                 gpu_nv12_layout_t *layout, bool *unmap)
+{
+    if (!unmap) return NULL;
+    *unmap = false;
+    if (gpu_compute_get_nv12_layout(ctx, image, memory, layout) != 0)
+        return NULL;
+    if (memory.mapped_ptr) return (uint8_t *)memory.mapped_ptr;
+    void *p = NULL;
+    if (vkMapMemory(ctx->device, memory.memory, 0, memory.size, 0, &p)
+        != VK_SUCCESS)
+        return NULL;
+    *unmap = true;
+    return (uint8_t *)p;
+}
+
+void gpu_compute_unmap_surface(gpu_context_t *ctx, gpu_memory_t memory,
+                               bool unmap)
+{
+    if (unmap && ctx) vkUnmapMemory(ctx->device, memory.memory);
+}
+
 /* The ten-bit upload. See gpu_compute.h: the shift into P010's high bits
  * is here, and the plane addressing is whatever Vulkan says it is, asked
  * for through the same query the eight-bit path uses. */

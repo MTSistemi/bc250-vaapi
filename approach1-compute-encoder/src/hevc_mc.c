@@ -17,6 +17,7 @@
  */
 #include "hevc_dec_internal.h"
 
+#include <stdatomic.h>
 #include <string.h>
 
 #define MAX_SIDE 64
@@ -46,11 +47,17 @@ static inline int clip_pixel(int v, int bd)
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 
+/* ⚠️ Atomic: the first inter block of a stream is usually decoded by
+ * several wavefront rows at once, and each of them asks. */
 static int ha_ssse3(void)
 {
-    static int answer = -1;
-    if (answer < 0) answer = __builtin_cpu_supports("ssse3") ? 1 : 0;
-    return answer;
+    static _Atomic int answer = -1;
+    int a = atomic_load_explicit(&answer, memory_order_relaxed);
+    if (a < 0) {
+        a = __builtin_cpu_supports("ssse3") ? 1 : 0;
+        atomic_store_explicit(&answer, a, memory_order_relaxed);
+    }
+    return a;
 }
 
 /* Two consecutive taps, broadcast: the shape _mm_maddubs_epi16 wants,
@@ -404,6 +411,29 @@ static void two_weighted_v(uint8_t *dst, int stride, int w, int h,
     }
 }
 
+/* Two whole-sample predictions averaged. _mm_avg_epu8 is (a + b + 1) >> 1,
+ * which is exactly what 8.5.3.3.4.2 gives two samples taken up to fourteen
+ * bits, added, and brought back down with its rounding. */
+static void average_v(uint8_t *dst, int stride, const uint8_t *a, int sa,
+                      const uint8_t *b, int sb, int w, int h)
+{
+    for (int r = 0; r < h; r++) {
+        const uint8_t *pa = a + (size_t)r * sa;
+        const uint8_t *pb = b + (size_t)r * sb;
+        uint8_t *o = dst + (size_t)r * stride;
+        int c = 0;
+        for (; c + 16 <= w; c += 16)
+            _mm_storeu_si128((__m128i *)(o + c),
+                _mm_avg_epu8(_mm_loadu_si128((const __m128i *)(pa + c)),
+                             _mm_loadu_si128((const __m128i *)(pb + c))));
+        for (; c + 8 <= w; c += 8)
+            _mm_storel_epi64((__m128i *)(o + c),
+                _mm_avg_epu8(_mm_loadl_epi64((const __m128i *)(pa + c)),
+                             _mm_loadl_epi64((const __m128i *)(pb + c))));
+        for (; c < w; c++) o[c] = (uint8_t)((pa[c] + pb[c] + 1) >> 1);
+    }
+}
+
 #endif /* x86-64 */
 
 /* ⚠️ The vector paths are eight bit only. They pack to unsigned bytes,
@@ -414,9 +444,13 @@ static void two_weighted_v(uint8_t *dst, int stride, int w, int h,
 static bool use_vectors(int bd)
 {
 #if defined(__x86_64__) || defined(_M_X64)
-    static int allowed = -1;
-    if (allowed < 0) allowed = getenv("BC250_HEVC_NOSIMD") ? 0 : 1;
-    return allowed && ha_ssse3() && bd == 8;
+    static _Atomic int allowed = -1;
+    int a = atomic_load_explicit(&allowed, memory_order_relaxed);
+    if (a < 0) {
+        a = getenv("BC250_HEVC_NOSIMD") ? 0 : 1;
+        atomic_store_explicit(&allowed, a, memory_order_relaxed);
+    }
+    return a && ha_ssse3() && bd == 8;
 #else
     (void)bd;
     return false;

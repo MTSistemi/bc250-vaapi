@@ -129,6 +129,52 @@ static void FUNC(vert4_16_any)(const int16_t *s, int sp, int w, int h,
 }
 #undef TRY_VECTOR
 
+/* The samples a block reads from a reference picture: where they lie, or a
+ * copy of them with the picture's edges repeated outwards.
+ *
+ * ⚠️ A motion vector may point off the edge of the reference picture, and
+ * legitimately: an object entering the frame was not there before. The
+ * edge sample is repeated outwards rather than the fetch being refused -
+ * but deciding that once per tap, eight times per sample, is what made
+ * this the slowest thing in the decoder. Decide it once per block instead:
+ * either the whole window is inside the picture and it is read where it
+ * lies, or the window is copied out once with its edges repeated and the
+ * copy is read. `border` holds bh rows of `border_stride` samples. */
+static const pixel *FUNC(window)(const pixel *ref_pic, int stride,
+                                 int w_pic, int h_pic,
+                                 int bx, int by, int bw, int bh,
+                                 pixel *border, int border_stride, int *sp)
+{
+    if (bx >= 0 && by >= 0 && bx + bw <= w_pic && by + bh <= h_pic) {
+        *sp = stride;
+        return ref_pic + (size_t)by * stride + bx;
+    }
+    /* The window hangs over an edge. Clamping every sample by itself is
+     * how it was written first and it costs more than the filter that
+     * reads the result: the row is the same for a whole span of columns,
+     * so each output row is a repeat of one sample, a copy of the middle,
+     * and a repeat of the last. */
+    *sp = border_stride;
+    const int left = bx < 0 ? (-bx > bw ? bw : -bx) : 0;
+    const int inside_end = bx + bw > w_pic ? w_pic - bx : bw;
+    const int right = inside_end < left ? left : inside_end;
+    for (int r = 0; r < bh; r++) {
+        int sy = by + r;
+        sy = sy < 0 ? 0 : (sy >= h_pic ? h_pic - 1 : sy);
+        const pixel *ref_row = ref_pic + (size_t)sy * stride;
+        pixel *o = border + (size_t)r * border_stride;
+        /* ⚠️ Samples, not bytes: memset would write the low byte of a
+         * ten-bit sample over half the span, and the memcpy length has to
+         * be multiplied to match. */
+        for (int i = 0; i < left; i++) o[i] = ref_row[0];
+        if (right > left)
+            memcpy(o + left, ref_row + bx + left,
+                   (size_t)(right - left) * sizeof(pixel));
+        for (int i = right; i < bw; i++) o[i] = ref_row[w_pic - 1];
+    }
+    return border;
+}
+
 /* One rectangle of one plane, at a fractional position, into fourteen-bit
  * intermediate values.
  *
@@ -155,46 +201,10 @@ static void FUNC(interpolate)(const pixel *ref_pic, int stride, int w_pic, int h
     const int bx = x - px, by = y - py;
     const int bw = w + tx - 1, bh = h + ty - 1;
 
-    /* ⚠️ A motion vector may point off the edge of the reference picture,
-     * and legitimately: an object entering the frame was not there before.
-     * The edge sample is repeated outwards rather than the fetch being
-     * refused - but deciding that once per tap, eight times per sample,
-     * is what made this the slowest thing in the decoder. Decide it once
-     * per block instead: either the whole window is inside the picture and
-     * the filter reads it where it lies, or the window is copied out once
-     * with its edges repeated and the filter reads the copy. */
-    const pixel *src;
     int sp;
     pixel border[(MAX_SIDE + 7) * (MAX_SIDE + 7)];
-    if (bx >= 0 && by >= 0 && bx + bw <= w_pic && by + bh <= h_pic) {
-        src = ref_pic + (size_t)by * stride + bx;
-        sp = stride;
-    } else {
-        /* The window hangs over an edge. Clamping every sample by itself
-         * is how it was written first and it costs more than the filter
-         * that reads the result: the row is the same for a whole span of
-         * columns, so each output row is a repeat of one sample, a copy
-         * of the middle, and a repeat of the last. */
-        sp = MAX_SIDE + 7;
-        const int left = bx < 0 ? (-bx > bw ? bw : -bx) : 0;
-        const int inside_end = bx + bw > w_pic ? w_pic - bx : bw;
-        const int right = inside_end < left ? left : inside_end;
-        for (int r = 0; r < bh; r++) {
-            int sy = by + r;
-            sy = sy < 0 ? 0 : (sy >= h_pic ? h_pic - 1 : sy);
-            const pixel *ref_row = ref_pic + (size_t)sy * stride;
-            pixel *o = border + (size_t)r * sp;
-            /* ⚠️ Samples, not bytes: memset would write the low byte
-             * of a ten-bit sample over half the span, and the memcpy
-             * length has to be multiplied to match. */
-            for (int i = 0; i < left; i++) o[i] = ref_row[0];
-            if (right > left)
-                memcpy(o + left, ref_row + bx + left,
-                       (size_t)(right - left) * sizeof(pixel));
-            for (int i = right; i < bw; i++) o[i] = ref_row[w_pic - 1];
-        }
-        src = border;
-    }
+    const pixel *src = FUNC(window)(ref_pic, stride, w_pic, h_pic,
+                                    bx, by, bw, bh, border, MAX_SIDE + 7, &sp);
 
     if (!fx && !fy) {
 #if BIT_DEPTH == 8 && (defined(__x86_64__) || defined(_M_X64))
@@ -265,6 +275,21 @@ static void FUNC(two_pred)(pixel *dst, int stride, int w, int h,
         for (int c = 0; c < w; c++)
             dst[r * stride + c] = (pixel)FUNC(clip_pixel)(
                 (a[r * stride_p + c] + b[r * stride_p + c] + add) >> sh);
+}
+
+/* Two whole-sample predictions averaged: what two_pred() makes of them
+ * after the round trip through fourteen bits, without the round trip. */
+static void FUNC(average)(pixel *dst, int stride, const pixel *a, int sa,
+                          const pixel *b, int sb, int w, int h, int bd)
+{
+#if BIT_DEPTH == 8 && (defined(__x86_64__) || defined(_M_X64))
+    if (use_vectors(bd)) { average_v(dst, stride, a, sa, b, sb, w, h); return; }
+#endif
+    (void)bd;
+    for (int r = 0; r < h; r++)
+        for (int c = 0; c < w; c++)
+            dst[(size_t)r * stride + c] = (pixel)
+                ((a[(size_t)r * sa + c] + b[(size_t)r * sb + c] + 1) >> 1);
 }
 
 /* 8.5.3.3.4.3. ⚠️ Used whenever the slice carries a weight table, even
@@ -343,6 +368,51 @@ static void FUNC(predict_inter)(hevcd_t *d, int x0, int y0,
         const int pw = w >> giu, ph = h >> giu;
         const int px = x0 >> giu, py = y0 >> giu;
         const int w_pic = sps->width >> giu, h_pic = sps->height >> giu;
+
+        /* ⚠️ Whole-sample motion and no weights: the prediction is the
+         * reference samples themselves, or the rounded average of two.
+         * 8.5.3.3.4.2 takes them up to fourteen bits and back down again,
+         * and that round trip is exact - (a << 6 + 32) >> 6 is a, and two
+         * of them give (a + b + 1) >> 1 - so it is skipped. Asked per
+         * plane: a luma vector on a whole sample can still land on half a
+         * chroma sample. */
+        if (!weights) {
+            const int frac = plane ? 7 : 3;
+            bool whole = true;
+            for (int l = 0; l < 2; l++)
+                if (usa[l] && ((m->mv[l][0] & frac) || (m->mv[l][1] & frac)))
+                    whole = false;
+            if (whole) {
+                const pixel *src[2] = { NULL, NULL };
+                int sp[2] = { 0, 0 };
+                pixel border[2][MAX_SIDE * MAX_SIDE];
+                for (int l = 0; l < 2; l++) {
+                    if (!usa[l]) continue;
+                    const int i = m->ref_idx[l];
+                    if (i < 0 || i >= d->n_refs[l] || !d->ref_pic[l][i]) return;
+                    const hevcd_img_t *r = d->ref_pic[l][i];
+                    const int steps = plane ? 3 : 2;
+                    src[l] = FUNC(window)((const pixel *)r->plane[plane],
+                                          r->stride[plane], w_pic, h_pic,
+                                          px + (m->mv[l][0] >> steps),
+                                          py + (m->mv[l][1] >> steps),
+                                          pw, ph, border[l], MAX_SIDE, &sp[l]);
+                }
+                pixel *dst = (pixel *)d->plane[plane]
+                             + (size_t)py * d->stride[plane] + px;
+                if (usa[0] && usa[1])
+                    FUNC(average)(dst, d->stride[plane], src[0], sp[0],
+                                  src[1], sp[1], pw, ph, bd);
+                else {
+                    const int l = usa[0] ? 0 : 1;
+                    for (int y = 0; y < ph; y++)
+                        memcpy(dst + (size_t)y * d->stride[plane],
+                               src[l] + (size_t)y * sp[l],
+                               (size_t)pw * sizeof(pixel));
+                }
+                continue;
+            }
+        }
 
         for (int l = 0; l < 2; l++) {
             if (!usa[l]) continue;
