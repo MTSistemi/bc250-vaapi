@@ -24,6 +24,9 @@
  *
  * This file is not part of the driver and is not built into it.
  */
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +35,18 @@
 #include "bitreader.h"
 #include "h264_dec_tables.h"   /* the two zig-zag scans, for the scaling lists */
 #include <time.h>
+
+/* Create for writing with an explicit mode: fopen would ask for 0666
+ * and let the umask decide, which is what CodeQL's
+ * cpp/world-writable-file-creation is about. */
+static FILE *fdopen_w(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) close(fd);
+    return f;
+}
 
 /* Nanoseconds on a clock that does not jump. */
 static uint64_t now_seconds(void)
@@ -485,7 +500,7 @@ int main(int argc, char **argv)
     if (!buf || fread(buf, 1, (size_t)len, fi) != (size_t)len) return 1;
     fclose(fi);
 
-    FILE *fo = fopen(argv[2], "wb");
+    FILE *fo = fdopen_w(argv[2]);
     if (!fo) { perror(argv[2]); return 1; }
 
     h264_decoder_t *dec = NULL;
@@ -836,9 +851,9 @@ int main(int argc, char **argv)
         int n_active[2] = { 0, 0 };
 
         for (int l = 0; l < (slice_type == 1 ? 2 : 1); l++) {
-            int n = sl.num_ref_idx[l];
-            if (n > 32) n = 32;
-            n_active[l] = n;
+            int n_ref = sl.num_ref_idx[l];
+            if (n_ref > 32) n_ref = 32;
+            n_active[l] = n_ref;
 
             if (slice_type == 0) {
                 /* 8.2.4.2.1: descending PicNum, which is the order `refs`

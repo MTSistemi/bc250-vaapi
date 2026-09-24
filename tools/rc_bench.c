@@ -64,6 +64,9 @@
  * produce. Must be set before the first non-CQP rc_update_stats() call -
  * rate_control.c latches the env var into a static on first use.
  */
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +75,18 @@
 #include "encoder_h264.h"
 #include "encoder_h265.h"
 #include "bitstream.h"
+
+/* Create for writing with an explicit mode: fopen would ask for 0666
+ * and let the umask decide, which is what CodeQL's
+ * cpp/world-writable-file-creation is about. */
+static FILE *fdopen_w(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) close(fd);
+    return f;
+}
 
 /* Same generator shape as tools/hevc_host_repro.c, kept local so this file
  * has no dependency on that tool. Only patterns 2/3 (frame-dependent) are
@@ -330,7 +345,7 @@ int main(int argc, char **argv) {
         if (out_prefix[0]) {
             char path[512];
             snprintf(path, sizeof(path), "%s_%u.%s", out_prefix, bitrates[i], !strcmp(codec, "h264") ? "264" : "hevc");
-            dump = fopen(path, "wb");
+            dump = fdopen_w(path);
             if (!dump) { perror(path); return 1; }
         }
 

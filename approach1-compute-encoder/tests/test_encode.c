@@ -3,6 +3,9 @@
  * test_encode.c - End-to-end H.264 bitstream syntax & decode test
  */
 
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -12,6 +15,18 @@
 
 #include "encoder_h264.h"
 #include "bitstream.h"
+
+/* Create for writing with an explicit mode: fopen would ask for 0666
+ * and let the umask decide, which is what CodeQL's
+ * cpp/world-writable-file-creation is about. */
+static FILE *fdopen_w(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) close(fd);
+    return f;
+}
 
 /*
  * Regression test for the Intra16x16 luma DC transpose bug fixed in commit
@@ -305,9 +320,9 @@ int main(void) {
     uint8_t *out_buf = malloc(out_cap);
     assert(out_buf != NULL);
 
-    FILE *f_stream = fopen("bc250_test_stream.h264", "wb");
+    FILE *f_stream = fdopen_w("bc250_test_stream.h264");
     if (!f_stream) {
-        f_stream = fopen("/tmp/bc250_test_stream.h264", "wb");
+        f_stream = fdopen_w("/tmp/bc250_test_stream.h264");
     }
     if (!f_stream) {
         fprintf(stderr, "[test_encode] Warning: could not open output stream file for writing, running in-memory checks\n");
