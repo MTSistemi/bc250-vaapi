@@ -267,8 +267,11 @@ def main():
     ap.add_argument("--tag", default="", help="opaque label echoed back as the 'tag' field")
     args = ap.parse_args()
 
-    text = sys.stdin.read() if args.logfile == "-" else \
-        open(args.logfile, "r", errors="replace").read()
+    if args.logfile == "-":
+        text = sys.stdin.read()
+    else:
+        with open(args.logfile, "r", errors="replace") as fh:
+            text = fh.read()
 
     out = parse(text)
     if args.tag:

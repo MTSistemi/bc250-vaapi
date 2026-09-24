@@ -18,6 +18,9 @@
  * it wrong and every reference list points at the wrong picture, which is
  * why it is worth checking on its own before anything depends on it.
  */
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +29,18 @@
 #include "hevc_ps.h"
 #include "decoder_h265.h"
 #include "hevc_dec_internal.h"
+
+/* Create for writing with an explicit mode: fopen would ask for 0666
+ * and let the umask decide, which is what CodeQL's
+ * cpp/world-writable-file-creation is about. */
+static FILE *fdopen_w(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) close(fd);
+    return f;
+}
 
 static const char *nome_nal(int t)
 {
@@ -365,7 +380,7 @@ int main(int argc, char **argv)
     hevc_decoder_t *dec = hevc_decoder_create(NULL, 0, 0);
     if (!dec) return 2;
     int slices_read = 0, slices_lost = 0, slices_skipped = 0;
-    FILE *fo = output ? fopen(output, "wb") : NULL;
+    FILE *fo = output ? fdopen_w(output) : NULL;
     if (output && !fo) { perror(output); return 2; }
     bool picture_open = false;
     /* The picture being decoded, as the output process will want it.

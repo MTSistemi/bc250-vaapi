@@ -401,26 +401,6 @@ static const struct { uint64_t recip; uint32_t half_denom; } g_hevc_quant_factor
     /* QP 51 */ { 0x00000047dc12ULL, 116736U },
 };
 
-static int32_t dequant_level(int32_t level, int qp) {
-    int per = qp / 6, rem = qp % 6;
-    int64_t val = (int64_t)level * HEVC_FLAT_M * levelScale[rem];
-    val <<= per;
-    val = (val + (1 << (HEVC_BDSHIFT - 1))) >> HEVC_BDSHIFT;
-    return clip_coeff((int32_t)val);
-}
-
-static int32_t quantize_coeff(int32_t coeff_raw, int qp) {
-    int clamped_qp = qp < 0 ? 0 : (qp > 51 ? 51 : qp);
-    uint64_t recip = g_hevc_quant_factors[clamped_qp].recip;
-    uint32_t half_denom = g_hevc_quant_factors[clamped_qp].half_denom;
-    int sign = coeff_raw < 0 ? -1 : 1;
-    uint32_t mag = (uint32_t)(coeff_raw < 0 ? -coeff_raw : coeff_raw);
-    uint64_t num = (uint64_t)mag << HEVC_BDSHIFT;
-    int32_t level = (int32_t)(((num + half_denom) * recip) >> 40);
-    return sign * level;
-}
-
-
 static inline void forward_transform_4x4(const int16_t residual[16], const int16_t M[4][4],
                                          int32_t out[16]) {
 #if defined(__x86_64__) || defined(_M_X64)

@@ -1805,7 +1805,7 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
             }
         }
         if (mapped) {
-            if (buf->data) free(buf->data);
+            free(buf->data);
             buf->data = mapped;
             buf->mapped = 1;
             buf->is_derived = 1;

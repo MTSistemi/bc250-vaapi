@@ -563,7 +563,7 @@ static inline int64_t FUNC(sse)(const pixel *a, uint32_t sa, const pixel *b, uin
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++) {
             int d = (int)a[y * sa + x] - (int)b[y * sb + x];
-            s += d * d;
+            s += (int64_t)d * d;
         }
     return s >> (2 * (BIT_DEPTH - 8));
 }
