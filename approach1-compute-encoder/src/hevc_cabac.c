@@ -130,6 +130,10 @@ static const uint8_t INIT_SKIP_FLAG[3] = { 197, 185, 201 };
 static const uint8_t INIT_PRED_MODE    = 149;
 static const uint8_t INIT_MERGE_FLAG   = 110;
 static const uint8_t INIT_MERGE_IDX    = 122;
+/* Tables 9-20, 9-21 and 9-32, initType 1. */
+static const uint8_t INIT_MVD[2]       = { 140, 198 };
+static const uint8_t INIT_MVP_IDX      = 168;
+static const uint8_t INIT_ROOT_CBF     = 79;
 
 /* ===================== context init formula (Rec. ITU-T H.265 9.3.2.2) === */
 
@@ -169,6 +173,9 @@ void hevc_cabac_reset_contexts(hevc_cabac_t *cb, int slice_qp, int slice_type) {
         cb->ctx[HEVC_CTX_PRED_MODE] = hevc_sbac_init_state(slice_qp, INIT_PRED_MODE);
         cb->ctx[HEVC_CTX_MERGE_FLAG] = hevc_sbac_init_state(slice_qp, INIT_MERGE_FLAG);
         cb->ctx[HEVC_CTX_MERGE_IDX] = hevc_sbac_init_state(slice_qp, INIT_MERGE_IDX);
+        init_bank(&cb->ctx[HEVC_CTX_MVD], INIT_MVD, 2, slice_qp);
+        cb->ctx[HEVC_CTX_MVP_IDX] = hevc_sbac_init_state(slice_qp, INIT_MVP_IDX);
+        cb->ctx[HEVC_CTX_ROOT_CBF] = hevc_sbac_init_state(slice_qp, INIT_ROOT_CBF);
     }
 }
 
@@ -335,6 +342,55 @@ void hevc_cabac_code_merge_idx(hevc_cabac_t *cb, int merge_idx) {
     if (merge_idx < 4) {
         hevc_cabac_encode_bypass(cb, 0);
     }
+}
+
+void hevc_cabac_code_merge_flag(hevc_cabac_t *cb, int merge) {
+    hevc_cabac_encode_bin(cb, HEVC_CTX_MERGE_FLAG, (uint32_t)(merge ? 1 : 0));
+}
+
+/* k-th order Exp-Golomb in bypass bins (9.3.3.6), for abs_mvd_minus2 with
+ * k = 1. */
+static void write_ep_exp_golomb(hevc_cabac_t *cb, uint32_t symbol, uint32_t k) {
+    uint32_t bins = 0;
+    int num_bins = 0;
+    while (symbol >= (1u << k)) {
+        bins = 2 * bins + 1;
+        num_bins++;
+        symbol -= 1u << k;
+        k++;
+    }
+    bins = 2 * bins;
+    num_bins++;
+    bins = (bins << k) | symbol;
+    num_bins += (int)k;
+    hevc_cabac_encode_bypass_bins(cb, bins, num_bins);
+}
+
+/* 7.3.8.9 mvd_coding(): both greater0 flags, both greater1 flags, then per
+ * component the remainder and the sign. */
+void hevc_cabac_code_mvd(hevc_cabac_t *cb, int mvd_x, int mvd_y) {
+    const uint32_t ax = (uint32_t)(mvd_x < 0 ? -mvd_x : mvd_x);
+    const uint32_t ay = (uint32_t)(mvd_y < 0 ? -mvd_y : mvd_y);
+    hevc_cabac_encode_bin(cb, HEVC_CTX_MVD, ax > 0);
+    hevc_cabac_encode_bin(cb, HEVC_CTX_MVD, ay > 0);
+    if (ax > 0) hevc_cabac_encode_bin(cb, HEVC_CTX_MVD + 1, ax > 1);
+    if (ay > 0) hevc_cabac_encode_bin(cb, HEVC_CTX_MVD + 1, ay > 1);
+    if (ax > 0) {
+        if (ax > 1) write_ep_exp_golomb(cb, ax - 2, 1);
+        hevc_cabac_encode_bypass(cb, mvd_x < 0);
+    }
+    if (ay > 0) {
+        if (ay > 1) write_ep_exp_golomb(cb, ay - 2, 1);
+        hevc_cabac_encode_bypass(cb, mvd_y < 0);
+    }
+}
+
+void hevc_cabac_code_mvp_idx(hevc_cabac_t *cb, int idx) {
+    hevc_cabac_encode_bin(cb, HEVC_CTX_MVP_IDX, (uint32_t)(idx ? 1 : 0));
+}
+
+void hevc_cabac_code_rqt_root_cbf(hevc_cabac_t *cb, int cbf) {
+    hevc_cabac_encode_bin(cb, HEVC_CTX_ROOT_CBF, (uint32_t)(cbf ? 1 : 0));
 }
 
 void hevc_cabac_code_split_cu_flag(hevc_cabac_t *cb, int bin, int ctx_inc) {

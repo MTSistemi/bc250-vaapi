@@ -87,7 +87,10 @@ extern "C" {
 #define HEVC_CTX_PRED_MODE  125   /* 1 context: inter (0) vs intra (1) */
 #define HEVC_CTX_MERGE_FLAG 126   /* 1 context: merge_flag */
 #define HEVC_CTX_MERGE_IDX  127   /* 1 context: merge_idx bin 0 */
-#define HEVC_NUM_CTX        128
+#define HEVC_CTX_MVD        128   /* 2 contexts: abs_mvd_greater0_flag, abs_mvd_greater1_flag */
+#define HEVC_CTX_MVP_IDX    130   /* 1 context: mvp_l0_flag */
+#define HEVC_CTX_ROOT_CBF   131   /* 1 context: rqt_root_cbf */
+#define HEVC_NUM_CTX        132
 
 typedef struct {
     /* Output sink: a plain bit-level bitstream_t (bitstream.h/.c, the same
@@ -149,6 +152,18 @@ void hevc_cabac_code_pred_mode_flag(hevc_cabac_t *cb, int pred_mode);
 
 /* merge_idx for skip CU (ITU-T H.265 7.3.8.6): bin 0 coded with context 0. */
 void hevc_cabac_code_merge_idx(hevc_cabac_t *cb, int merge_idx);
+
+/* The inter prediction unit of a P-slice CU (7.3.8.6 and 7.3.8.9):
+ * merge_flag, the motion vector difference (in quarter samples) and
+ * mvp_l0_flag. There is one reference picture, so no ref_idx_l0, and no
+ * inter_pred_idc in a P-slice. */
+void hevc_cabac_code_merge_flag(hevc_cabac_t *cb, int merge);
+void hevc_cabac_code_mvd(hevc_cabac_t *cb, int mvd_x, int mvd_y);
+void hevc_cabac_code_mvp_idx(hevc_cabac_t *cb, int idx);
+
+/* rqt_root_cbf of an inter CU that is not a 2Nx2N merge (7.3.8.5): whether
+ * any residual follows at all. */
+void hevc_cabac_code_rqt_root_cbf(hevc_cabac_t *cb, int cbf);
 
 /* split_cu_flag: ctx_inc = (left neighbor CU coded at a depth greater than
  * `depth`) + (above neighbor CU coded at a depth greater than `depth`),
