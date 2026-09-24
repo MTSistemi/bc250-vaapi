@@ -157,6 +157,10 @@ static const uint8_t INIT_MERGE_IDX    = 122;
 static const uint8_t INIT_MVD[2]       = { 140, 198 };
 static const uint8_t INIT_MVP_IDX      = 168;
 static const uint8_t INIT_ROOT_CBF     = 79;
+/* Tables 9-14 and 9-26: split_transform_flag and coded_sub_block_flag,
+ * rows as the others here - P-slice first. */
+static const uint8_t INIT_TRANS_SUBDIV[2][3] = { { 124, 138, 94 }, { 153, 138, 138 } };
+static const uint8_t INIT_SIG_CG[2][4] = { { 121, 140, 61, 154 }, { 91, 171, 134, 141 } };
 
 /* ===================== context init formula (Rec. ITU-T H.265 9.3.2.2) === */
 
@@ -190,6 +194,8 @@ void hevc_cabac_reset_contexts(hevc_cabac_t *cb, int slice_qp, int slice_type) {
     init_bank(&cb->ctx[HEVC_CTX_LAST_Y], INIT_LAST[type_idx], 18, slice_qp);
     init_bank(&cb->ctx[HEVC_CTX_ONE_FLAG], INIT_ONE_FLAG[type_idx], 24, slice_qp);
     init_bank(&cb->ctx[HEVC_CTX_ABS_FLAG], INIT_ABS_FLAG[type_idx], 6, slice_qp);
+    init_bank(&cb->ctx[HEVC_CTX_TRANS_SUBDIV], INIT_TRANS_SUBDIV[type_idx], 3, slice_qp);
+    init_bank(&cb->ctx[HEVC_CTX_SIG_CG], INIT_SIG_CG[type_idx], 4, slice_qp);
 
     if (slice_type == 1) {
         init_bank(&cb->ctx[HEVC_CTX_SKIP_FLAG], INIT_SKIP_FLAG, 3, slice_qp);
@@ -419,6 +425,10 @@ void hevc_cabac_code_mvp_idx(hevc_cabac_t *cb, int idx) {
     hevc_cabac_encode_bin(cb, HEVC_CTX_MVP_IDX, (uint32_t)(idx ? 1 : 0));
 }
 
+void hevc_cabac_code_split_transform_flag(hevc_cabac_t *cb, int split, int log2_size) {
+    hevc_cabac_encode_bin(cb, HEVC_CTX_TRANS_SUBDIV + 5 - log2_size, (uint32_t)(split ? 1 : 0));
+}
+
 void hevc_cabac_code_rqt_root_cbf(hevc_cabac_t *cb, int cbf) {
     hevc_cabac_encode_bin(cb, HEVC_CTX_ROOT_CBF, (uint32_t)(cbf ? 1 : 0));
 }
@@ -596,5 +606,162 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
             base_level = 2;
             idx++;
         } while (idx < num_nonzero);
+    }
+}
+
+/* ===================== residual_coding() for one 8x8 TU ===================== */
+
+/* The four 4x4 sub-blocks of an 8x8 block in diagonal scan order, as
+ * yS * 2 + xS: (0,0), (0,1), (1,0), (1,1) - 6.5.3 for a 2x2 array. */
+static const uint8_t g_hevc_sb_scan2x2[4] = { 0, 2, 1, 3 };
+
+/* last_sig_coeff_*_prefix group and the first position of each group,
+ * positions 0..7 (Table 9-4's binarization, 9.3.3.2). */
+static const uint8_t g_hevc_last_group8[8] = { 0, 1, 2, 3, 4, 4, 5, 5 };
+static const uint8_t g_hevc_last_min8[6] = { 0, 1, 2, 3, 4, 6 };
+
+/* One 8x8 transform block, diagonal scan - every inter luma block at this
+ * size. `coeff` is raster, coeff[y * 8 + x]. Written from 7.3.8.11 and
+ * 9.3.4.2.4-9.3.4.2.7 directly. */
+void hevc_cabac_code_residual_8x8(hevc_cabac_t *cb, const int16_t coeff[64], int is_luma) {
+    const uint8_t *scan = g_hevc_scan4x4[0];
+    int last_n = -1;
+    for (int n = 63; n >= 0; n--) {
+        const int sb = g_hevc_sb_scan2x2[n >> 4], p = scan[n & 15];
+        const int x = (sb & 1) * 4 + (p & 3), y = (sb >> 1) * 4 + (p >> 2);
+        if (coeff[y * 8 + x]) { last_n = n; break; }
+    }
+    if (last_n < 0) return;
+
+    /* last_sig_coeff_x/y: both prefixes, then both suffixes. For 8x8 the
+     * prefix contexts are offset 3 (luma) or 15 (chroma), shifted by 1. */
+    {
+        const int sb = g_hevc_sb_scan2x2[last_n >> 4], p = scan[last_n & 15];
+        const int pos[2] = { (sb & 1) * 4 + (p & 3), (sb >> 1) * 4 + (p >> 2) };
+        const int off = is_luma ? 3 : 15;
+        for (int i = 0; i < 2; i++) {
+            const int bank = i == 0 ? HEVC_CTX_LAST_X : HEVC_CTX_LAST_Y;
+            const int prefix = g_hevc_last_group8[pos[i]];
+            for (int b = 0; b < prefix; b++) hevc_cabac_encode_bin(cb, bank + off + (b >> 1), 1);
+            if (prefix < 5) hevc_cabac_encode_bin(cb, bank + off + (prefix >> 1), 0);
+        }
+        for (int i = 0; i < 2; i++) {
+            const int prefix = g_hevc_last_group8[pos[i]];
+            if (prefix > 3)
+                hevc_cabac_encode_bypass_bins(cb, (uint32_t)(pos[i] - g_hevc_last_min8[prefix]),
+                                              (prefix >> 1) - 1);
+        }
+    }
+
+    const int last_sb = last_n >> 4;
+    uint8_t csbf[2][2] = { { 0, 0 }, { 0, 0 } };   /* [yS][xS] */
+    const int one_base = HEVC_CTX_ONE_FLAG + (is_luma ? 0 : 16);
+    const int abs_base = HEVC_CTX_ABS_FLAG + (is_luma ? 0 : 4);
+    const int sig_base = HEVC_CTX_SIG_FLAG + (is_luma ? 0 : 27);
+    const int cg_base = HEVC_CTX_SIG_CG + (is_luma ? 0 : 2);
+    int c1_prev = 1;   /* greater1Ctx left by the previous sub-block */
+
+    for (int i = last_sb; i >= 0; i--) {
+        const int sb = g_hevc_sb_scan2x2[i], xs = sb & 1, ys = sb >> 1;
+        int16_t lv[16];
+        int any = 0;
+        for (int n = 0; n < 16; n++) {
+            const int p = scan[n];
+            lv[n] = coeff[(ys * 4 + (p >> 2)) * 8 + xs * 4 + (p & 3)];
+            any |= lv[n];
+        }
+        const int right = xs < 1 ? csbf[ys][xs + 1] : 0;
+        const int below = ys < 1 ? csbf[ys + 1][xs] : 0;
+
+        /* coded_sub_block_flag: coded between the last and the first. */
+        int infer_dc = 0;
+        if (i < last_sb && i > 0) {
+            hevc_cabac_encode_bin(cb, cg_base + ((right | below) ? 1 : 0), any ? 1 : 0);
+            csbf[ys][xs] = (uint8_t)(any ? 1 : 0);
+            if (!any) continue;
+            infer_dc = 1;
+        } else {
+            csbf[ys][xs] = 1;
+        }
+
+        /* sig_coeff_flag, from the position before the last one down. */
+        const int prev_csbf = right | (below << 1);
+        const int start = i == last_sb ? (last_n & 15) - 1 : 15;
+        int16_t absv[16];
+        uint32_t signs = 0;
+        int num = 0;
+        if (i == last_sb) {
+            const int v = lv[last_n & 15];
+            absv[num++] = (int16_t)(v < 0 ? -v : v);
+            signs = (uint32_t)(v < 0);
+        }
+        for (int n = start; n >= 0; n--) {
+            const int v = lv[n];
+            if (n == 0 && infer_dc) {
+                /* inferred 1: this sub-block is coded and nothing else in
+                 * it was. */
+                absv[num++] = (int16_t)(v < 0 ? -v : v);
+                signs = (signs << 1) | (uint32_t)(v < 0);
+                break;
+            }
+            const int p = scan[n], xp = p & 3, yp = p >> 2;
+            int sig;
+            if (sb == 0 && p == 0) {
+                sig = 0;
+            } else {
+                switch (prev_csbf) {
+                case 0: sig = (xp + yp == 0) ? 2 : (xp + yp < 3) ? 1 : 0; break;
+                case 1: sig = yp == 0 ? 2 : (yp == 1 ? 1 : 0); break;
+                case 2: sig = xp == 0 ? 2 : (xp == 1 ? 1 : 0); break;
+                default: sig = 2; break;
+                }
+                if (is_luma) {
+                    if (sb != 0) sig += 3;
+                    sig += 9;              /* 8x8, diagonal scan */
+                } else {
+                    sig += 9;              /* 8x8 chroma */
+                }
+            }
+            hevc_cabac_encode_bin(cb, sig_base + sig, v != 0);
+            if (v) {
+                absv[num++] = (int16_t)(v < 0 ? -v : v);
+                signs = (signs << 1) | (uint32_t)(v < 0);
+                infer_dc = 0;
+            }
+        }
+        if (!num) continue;
+
+        /* coeff_abs_level_greater1_flag / greater2_flag. */
+        int ctx_set = (i == 0 || !is_luma) ? 0 : 2;
+        if (c1_prev == 0) ctx_set++;
+        int c1 = 1, first_c2 = -1;
+        const int n1 = num < 8 ? num : 8;
+        for (int k = 0; k < n1; k++) {
+            const int g1 = absv[k] > 1;
+            hevc_cabac_encode_bin(cb, one_base + ctx_set * 4 + c1, (uint32_t)g1);
+            if (g1) {
+                c1 = 0;
+                if (first_c2 < 0) first_c2 = k;
+            } else if (c1 > 0 && c1 < 3) {
+                c1++;
+            }
+        }
+        c1_prev = c1;
+        if (first_c2 >= 0)
+            hevc_cabac_encode_bin(cb, abs_base + ctx_set, absv[first_c2] > 2);
+
+        hevc_cabac_encode_bypass_bins(cb, signs, num);
+
+        /* coeff_abs_level_remaining. */
+        uint32_t rice = 0;
+        int first_coeff2 = 1;
+        for (int k = 0; k < num; k++) {
+            const int base = (k < 8 ? 2 : 1) | first_coeff2;
+            if (absv[k] >= base) {
+                write_coef_remain_exp_golomb(cb, (uint32_t)(absv[k] - base), rice);
+                if (absv[k] > (3 << rice) && rice < 4) rice++;
+            }
+            if (absv[k] >= 2) first_coeff2 = 0;
+        }
     }
 }

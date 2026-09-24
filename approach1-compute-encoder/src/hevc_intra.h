@@ -146,6 +146,13 @@ void hevc_transform_quant_4x4_10(const int16_t residual[16], int qp, int use_dst
 void hevc_dequant_itransform_4x4_10(const int16_t coeff[16], int qp, int use_dst,
                                      int16_t residual_out[16]);
 
+/* 8x8, for inter luma: DCT-II only, at either depth - `qp` is Qp' as
+ * above, `bit_depth` 8 or 10. */
+void hevc_transform_quant_8x8(const int16_t residual[64], int qp, int bit_depth,
+                               int16_t coeff_out[64]);
+void hevc_dequant_itransform_8x8(const int16_t coeff[64], int qp, int bit_depth,
+                                  int16_t residual_out[64]);
+
 /* So that code compiled once per bit depth can name either set with the
  * decoder's FUNC(): FUNC(hevc_predict_4x4) is this at eight bits and the
  * _10 function at ten. */

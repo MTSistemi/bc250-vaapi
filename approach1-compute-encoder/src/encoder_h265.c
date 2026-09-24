@@ -209,7 +209,7 @@ static size_t write_vps(uint8_t *buf, size_t buf_size, int bit_depth) {
 }
 
 static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_t coded_h,
-                         uint32_t real_w, uint32_t real_h, int level_idc, int bit_depth) {
+                         uint32_t real_w, uint32_t real_h, int level_idc, int bit_depth, int tu8) {
     uint8_t rbsp[256];
     bitstream_t bs;
     bs_init(&bs, rbsp, sizeof(rbsp));
@@ -247,8 +247,11 @@ static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_
     bs_write_ue(&bs, 0); /* log2_min_luma_coding_block_size_minus3 -> MinCb = 8 */
     bs_write_ue(&bs, 1); /* log2_diff_max_min_coding_block_size -> Ctb = 16 */
     bs_write_ue(&bs, 0); /* log2_min_luma_transform_block_size_minus2 -> MinTb = 4 */
-    bs_write_ue(&bs, 0); /* log2_diff_max_min_transform_block_size -> MaxTb = MinTb = 4 */
-    bs_write_ue(&bs, 0); /* max_transform_hierarchy_depth_inter */
+    /* With 8x8 transforms, MaxTb is 8 and an inter CU's transform tree may
+     * split once: split_transform_flag is coded and chooses. Intra NxN
+     * splits to 4x4 regardless (IntraSplitFlag). */
+    bs_write_ue(&bs, tu8 ? 1 : 0); /* log2_diff_max_min_transform_block_size */
+    bs_write_ue(&bs, tu8 ? 1 : 0); /* max_transform_hierarchy_depth_inter */
     bs_write_ue(&bs, 0); /* max_transform_hierarchy_depth_intra (IntraSplitFlag adds +1 -> MaxTrafoDepth=1) */
 
     bs_write1(&bs, 0); /* scaling_list_enabled_flag */
@@ -377,6 +380,8 @@ struct hevc_encoder {
     uint8_t *cu_depth;
     /* Whole-CTU skips: on unless BC250_HEVC_CU16=0. */
     bool cu16;
+    /* 8x8 transforms for inter CUs: on unless BC250_HEVC_TU8=0. */
+    int tu8;
     int16_t *mv_x_map;
     int16_t *mv_y_map;
     uint32_t last_frame_sad;
@@ -560,6 +565,8 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     {
         const char *e = getenv("BC250_HEVC_CU16");
         enc->cu16 = !(e && strcmp(e, "0") == 0);
+        e = getenv("BC250_HEVC_TU8");
+        enc->tu8 = !(e && strcmp(e, "0") == 0);
     }
     enc->mv_x_map = calloc(num_cus, sizeof(int16_t));
     enc->mv_y_map = calloc(num_cus, sizeof(int16_t));
@@ -1413,7 +1420,7 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
                             encoder->coded_width, encoder->coded_height,
                             encoder->width, encoder->height,
                             hevc_pick_level_idc(encoder->coded_width, encoder->coded_height),
-                            encoder->bit_depth);
+                            encoder->bit_depth, encoder->tu8);
         total += write_pps(encoder->scratch_out + total, encoder->scratch_out_cap - total, encoder->qp,
                            encoder->wpp);
     }

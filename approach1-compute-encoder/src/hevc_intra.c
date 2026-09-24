@@ -526,6 +526,24 @@ void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
  */
 #define HEVC_BDSHIFT_10 7
 
+/* floor((mag << shift + denom / 2) / denom) without a division per
+ * coefficient: one reciprocal per block, m = ceil(2^48 / denom), and a
+ * 128-bit product. Exact, since the numerator stays below 2^27 and the
+ * denominator below 2^21, and 48 >= 27 + 21. */
+static inline uint64_t quant_recip(uint64_t denom)
+{
+    return (((uint64_t)1 << 48) + denom - 1) / denom;
+}
+
+static inline int64_t quant_level(uint64_t num, uint64_t denom, uint64_t recip)
+{
+    uint64_t q = (uint64_t)(((unsigned __int128)(num + denom / 2) * recip) >> 48);
+    /* The ceiling can put the product one over at an exact multiple's
+     * edge; one comparison puts it back. */
+    if (q * denom > num + denom / 2) q--;
+    return (int64_t)q;
+}
+
 static void forward_transform_4x4_10(const int16_t residual[16], const int16_t M[4][4],
                                      int32_t out[16]) {
     int32_t tmp[4][4];
@@ -579,10 +597,11 @@ void hevc_transform_quant_4x4_10(const int16_t residual[16], int qp, int use_dst
     /* The algebraic inverse of the dequantizer below, rounded to nearest -
      * the eight-bit path's reciprocal table does the same division. */
     const uint64_t denom = (uint64_t)(HEVC_FLAT_M * levelScale[q % 6]) << (q / 6);
+    const uint64_t recip = quant_recip(denom);
     for (int i = 0; i < 16; i++) {
         const int32_t v = raw[i];
         const uint64_t mag = (uint64_t)(v < 0 ? -(int64_t)v : v);
-        int64_t level = (int64_t)(((mag << HEVC_BDSHIFT_10) + denom / 2) / denom);
+        int64_t level = quant_level(mag << HEVC_BDSHIFT_10, denom, recip);
         if (level > 32767) level = 32767;
         coeff_out[i] = (int16_t)(v < 0 ? -level : level);
     }
@@ -605,4 +624,129 @@ void hevc_dequant_itransform_4x4_10(const int16_t coeff[16], int qp, int use_dst
         dq[i] = (int16_t)(val > 32767 ? 32767 : (val < -32768 ? -32768 : val));
     }
     inverse_transform_4x4_10(dq, use_dst ? DST4 : DCT4, residual_out);
+}
+
+/* ===================== 8x8 (inter luma) ===================== */
+
+/* 8.6.4.2's transMatrix for nTbS = 8: rows 0, 4, 8 ... 28 of the 32-point
+ * matrix. */
+static const int16_t DCT8[8][8] = {
+    { 64,  64,  64,  64,  64,  64,  64,  64 },
+    { 89,  75,  50,  18, -18, -50, -75, -89 },
+    { 83,  36, -36, -83, -83, -36,  36,  83 },
+    { 75, -18, -89, -50,  50,  89,  18, -75 },
+    { 64, -64, -64,  64,  64, -64, -64,  64 },
+    { 50, -89,  18,  75, -75, -18,  89, -50 },
+    { 36, -83,  83, -36, -36,  83, -83,  36 },
+    { 18, -50,  75, -89,  89, -75,  50, -18 },
+};
+
+/* One 8-point DCT, forward and inverse, by even and odd halves - the same
+ * integer products as the matrix, so the same results, with about half of
+ * the multiplications. `s` is the stride between the eight inputs. */
+static inline void dct8_fwd(const int32_t *x, int s, int32_t y[8])
+{
+    int32_t e[4], o[4];
+    for (int k = 0; k < 4; k++) {
+        e[k] = x[k * s] + x[(7 - k) * s];
+        o[k] = x[k * s] - x[(7 - k) * s];
+    }
+    const int32_t ee0 = e[0] + e[3], eo0 = e[0] - e[3];
+    const int32_t ee1 = e[1] + e[2], eo1 = e[1] - e[2];
+    y[0] = 64 * ee0 + 64 * ee1;
+    y[4] = 64 * ee0 - 64 * ee1;
+    y[2] = 83 * eo0 + 36 * eo1;
+    y[6] = 36 * eo0 - 83 * eo1;
+    y[1] = 89 * o[0] + 75 * o[1] + 50 * o[2] + 18 * o[3];
+    y[3] = 75 * o[0] - 18 * o[1] - 89 * o[2] - 50 * o[3];
+    y[5] = 50 * o[0] - 89 * o[1] + 18 * o[2] + 75 * o[3];
+    y[7] = 18 * o[0] - 50 * o[1] + 75 * o[2] - 89 * o[3];
+}
+
+static inline void dct8_inv(const int32_t *x, int s, int32_t y[8])
+{
+    int32_t o[4];
+    for (int k = 0; k < 4; k++)
+        o[k] = DCT8[1][k] * x[1 * s] + DCT8[3][k] * x[3 * s]
+             + DCT8[5][k] * x[5 * s] + DCT8[7][k] * x[7 * s];
+    const int32_t eo0 = 83 * x[2 * s] + 36 * x[6 * s];
+    const int32_t eo1 = 36 * x[2 * s] - 83 * x[6 * s];
+    const int32_t ee0 = 64 * x[0] + 64 * x[4 * s];
+    const int32_t ee1 = 64 * x[0] - 64 * x[4 * s];
+    const int32_t e[4] = { ee0 + eo0, ee1 + eo1, ee1 - eo1, ee0 - eo0 };
+    for (int k = 0; k < 4; k++) {
+        y[k] = e[k] + o[k];
+        y[k + 4] = e[3 - k] - o[3 - k];
+    }
+}
+
+/* The forward transform is the encoder's to choose. Its shifts are HM's
+ * for 8x8 - log2(8) + BitDepth - 9 after the columns, 9 after the rows -
+ * so that the quantizer below, the exact inverse of the dequantizer,
+ * gives the same levels a residual would get at 4x4. `qp` is Qp', the
+ * QP plus QpBdOffset. */
+void hevc_transform_quant_8x8(const int16_t residual[64], int qp, int bit_depth,
+                               int16_t coeff_out[64]) {
+    int any = 0;
+    for (int i = 0; i < 64; i++) any |= residual[i];
+    if (!any) {
+        memset(coeff_out, 0, 64 * sizeof(int16_t));
+        return;
+    }
+    const int s1 = 3 + bit_depth - 9, s2 = 9;
+    int32_t tmp[8][8], in[64], col[8];
+    for (int i = 0; i < 64; i++) in[i] = residual[i];
+    for (int c = 0; c < 8; c++) {
+        dct8_fwd(in + c, 8, col);
+        for (int i = 0; i < 8; i++) tmp[i][c] = (col[i] + (1 << (s1 - 1))) >> s1;
+    }
+    const int q = qp < 0 ? 0 : (qp > 63 ? 63 : qp);
+    const int bd_shift = bit_depth + 3 - 5;
+    const uint64_t denom = (uint64_t)(HEVC_FLAT_M * levelScale[q % 6]) << (q / 6);
+    const uint64_t recip = quant_recip(denom);
+    for (int i = 0; i < 8; i++) {
+        int32_t row[8];
+        dct8_fwd(tmp[i], 1, row);
+        for (int j = 0; j < 8; j++) {
+            const int32_t v = (row[j] + (1 << (s2 - 1))) >> s2;
+            const uint64_t mag = (uint64_t)(v < 0 ? -(int64_t)v : v);
+            int64_t level = quant_level(mag << bd_shift, denom, recip);
+            if (level > 32767) level = 32767;
+            coeff_out[i * 8 + j] = (int16_t)(v < 0 ? -level : level);
+        }
+    }
+}
+
+/* The decoder's side, exactly: 8.6.2 scaling with the flat list, then
+ * 8.6.4.2 - columns, (e + 64) >> 7 clipped to sixteen bits, rows,
+ * (g + rnd) >> (20 - BitDepth). */
+void hevc_dequant_itransform_8x8(const int16_t coeff[64], int qp, int bit_depth,
+                                  int16_t residual_out[64]) {
+    int any = 0;
+    for (int i = 0; i < 64; i++) any |= coeff[i];
+    if (!any) {
+        memset(residual_out, 0, 64 * sizeof(int16_t));
+        return;
+    }
+    const int q = qp < 0 ? 0 : (qp > 63 ? 63 : qp);
+    const int bd_shift = bit_depth + 3 - 5;
+    const int64_t scale = ((int64_t)HEVC_FLAT_M * levelScale[q % 6]) << (q / 6);
+    int16_t d[64];
+    for (int i = 0; i < 64; i++) {
+        int64_t v = ((int64_t)coeff[i] * scale + (1 << (bd_shift - 1))) >> bd_shift;
+        d[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+    }
+    int32_t din[64], g[8][8], col[8];
+    for (int i = 0; i < 64; i++) din[i] = d[i];
+    for (int c = 0; c < 8; c++) {
+        dct8_inv(din + c, 8, col);
+        for (int r = 0; r < 8; r++) g[r][c] = clip_coeff((col[r] + 64) >> 7);
+    }
+    const int s2 = 20 - bit_depth;
+    for (int r = 0; r < 8; r++) {
+        int32_t row[8];
+        dct8_inv(g[r], 1, row);
+        for (int c = 0; c < 8; c++)
+            residual_out[r * 8 + c] = (int16_t)clip_coeff((row[c] + (1 << (s2 - 1))) >> s2);
+    }
 }

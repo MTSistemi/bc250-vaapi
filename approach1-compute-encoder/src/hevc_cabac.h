@@ -90,7 +90,9 @@ extern "C" {
 #define HEVC_CTX_MVD        128   /* 2 contexts: abs_mvd_greater0_flag, abs_mvd_greater1_flag */
 #define HEVC_CTX_MVP_IDX    130   /* 1 context: mvp_l0_flag */
 #define HEVC_CTX_ROOT_CBF   131   /* 1 context: rqt_root_cbf */
-#define HEVC_NUM_CTX        132
+#define HEVC_CTX_TRANS_SUBDIV 132 /* 3 contexts: split_transform_flag, 5 - log2TrafoSize */
+#define HEVC_CTX_SIG_CG     135   /* 4 contexts: coded_sub_block_flag, 0-1 luma, 2-3 chroma */
+#define HEVC_NUM_CTX        139
 
 typedef struct {
     /* Output sink: a plain bit-level bitstream_t (bitstream.h/.c, the same
@@ -177,6 +179,13 @@ void hevc_cabac_code_merge_idx(hevc_cabac_t *cb, int merge_idx);
 void hevc_cabac_code_merge_flag(hevc_cabac_t *cb, int merge);
 void hevc_cabac_code_mvd(hevc_cabac_t *cb, int mvd_x, int mvd_y);
 void hevc_cabac_code_mvp_idx(hevc_cabac_t *cb, int idx);
+
+/* split_transform_flag of a transform tree node of size 1 << log2_size. */
+void hevc_cabac_code_split_transform_flag(hevc_cabac_t *cb, int split, int log2_size);
+
+/* residual_coding() for one 8x8 transform block in diagonal scan, with at
+ * least one nonzero coefficient: coeff[y * 8 + x]. */
+void hevc_cabac_code_residual_8x8(hevc_cabac_t *cb, const int16_t coeff[64], int is_luma);
 
 /* rqt_root_cbf of an inter CU that is not a 2Nx2N merge (7.3.8.5): whether
  * any residual follows at all. */

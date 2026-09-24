@@ -570,7 +570,10 @@ static inline int64_t FUNC(sse)(const pixel *a, uint32_t sa, const pixel *b, uin
 
 /* An inter CU's residual, quantized, and what it reconstructs to. */
 typedef struct {
+    int tu8;             /* one 8x8 luma transform instead of four 4x4 */
     int16_t coeff_y[4][16];
+    int16_t coeff_y8[64];
+    int cbf_y8;
     int16_t coeff_cb[16], coeff_cr[16];
     int cbf_y[4], cbf_cb, cbf_cr;
     pixel rec_y[64], rec_cb[16], rec_cr[16];
@@ -580,7 +583,7 @@ typedef struct {
 
 static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
                                  const pixel py[64], const pixel pcb[16], const pixel pcr[16],
-                                 FUNC(inter_res_t) *r)
+                                 int tu8, FUNC(inter_res_t) *r)
 {
     const int qp = enc->qp;
     const uint32_t cw = enc->coded_width, ccw = cw / 2;
@@ -589,10 +592,33 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
     const pixel *src_cb = (const pixel *)enc->src_cb + (size_t)cy * ccw + cx;
     const pixel *src_cr = (const pixel *)enc->src_cr + (size_t)cy * ccw + cx;
     r->bits = 0;
+    r->tu8 = tu8;
+    r->cbf_y8 = 0;
+    memset(r->cbf_y, 0, sizeof(r->cbf_y));
 
-    /* Four 4x4 luma transforms: an 8x8 CU splits down to the 4x4 maximum
-     * transform size, and inter luma takes the DCT, not the DST. */
-    for (int pu = 0; pu < 4; pu++) {
+    if (tu8) {
+        /* One 8x8 transform over the whole CU. */
+        int16_t res[64], rres[64];
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+                res[y * 8 + x] = (int16_t)(src_y[y * cw + x] - py[y * 8 + x]);
+        hevc_transform_quant_8x8(res, qp + QP_BD_OFFSET, BIT_DEPTH, r->coeff_y8);
+        for (int i = 0; i < 64; i++) r->cbf_y8 |= r->coeff_y8[i] != 0;
+        if (r->cbf_y8) {
+            hevc_dequant_itransform_8x8(r->coeff_y8, qp + QP_BD_OFFSET, BIT_DEPTH, rres);
+            for (int q = 0; q < 4; q++) {
+                int16_t c16[16];
+                for (int k = 0; k < 16; k++)
+                    c16[k] = r->coeff_y8[((q >> 1) * 4 + (k >> 2)) * 8 + (q & 1) * 4 + (k & 3)];
+                r->bits += coeff_bits(c16);
+            }
+        }
+        for (int i = 0; i < 64; i++)
+            r->rec_y[i] = r->cbf_y8 ? FUNC(clip_sample)(py[i] + rres[i]) : py[i];
+    }
+
+    /* Four 4x4 luma transforms, and inter luma takes the DCT, not the DST. */
+    for (int pu = 0; !tu8 && pu < 4; pu++) {
         const int ox = pu_off_x[pu], oy = pu_off_y[pu];
         int16_t res[16], rres[16];
         for (int y = 0; y < 4; y++)
@@ -640,7 +666,8 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
 
 static inline int FUNC(inter_any_cbf)(const FUNC(inter_res_t) *r)
 {
-    return r->cbf_y[0] | r->cbf_y[1] | r->cbf_y[2] | r->cbf_y[3] | r->cbf_cb | r->cbf_cr;
+    return r->cbf_y[0] | r->cbf_y[1] | r->cbf_y[2] | r->cbf_y[3] | r->cbf_y8
+         | r->cbf_cb | r->cbf_cr;
 }
 
 /* SAD of the CU at an integer displacement that keeps it inside the
@@ -752,8 +779,24 @@ static void FUNC(write_back_inter)(hevc_encoder_t *enc, int cu_x, int cu_y,
  * luma blocks (the maximum transform size here), chroma flags at the root,
  * chroma data after the fourth luma block. Luma blocks of an inter CU are
  * always scanned diagonally. */
-static void FUNC(emit_inter_residual)(hevc_cabac_t *cab, const FUNC(inter_res_t) *r)
+static void FUNC(emit_inter_residual)(const hevc_encoder_t *enc, hevc_cabac_t *cab,
+                                      const FUNC(inter_res_t) *r)
 {
+    /* With 8x8 transforms allowed, the CU's transform tree says whether it
+     * splits. */
+    if (enc->tu8) hevc_cabac_code_split_transform_flag(cab, !r->tu8, 3);
+    if (r->tu8) {
+        hevc_cabac_code_cbf_chroma(cab, r->cbf_cb, 0);
+        hevc_cabac_code_cbf_chroma(cab, r->cbf_cr, 0);
+        /* ⚠️ 7.3.8.8: at the root of an inter CU with neither chroma flag
+         * set, cbf_luma is not coded - it is 1. The callers never get here
+         * with nothing to code. */
+        if (r->cbf_cb || r->cbf_cr) hevc_cabac_code_cbf_luma(cab, r->cbf_y8, 0);
+        if (r->cbf_y8) hevc_cabac_code_residual_8x8(cab, r->coeff_y8, 1);
+        if (r->cbf_cb) hevc_cabac_code_residual_4x4(cab, r->coeff_cb, 0, 0);
+        if (r->cbf_cr) hevc_cabac_code_residual_4x4(cab, r->coeff_cr, 0, 0);
+        return;
+    }
     hevc_cabac_code_cbf_chroma(cab, r->cbf_cb, 0);
     hevc_cabac_code_cbf_chroma(cab, r->cbf_cr, 0);
     for (int pu = 0; pu < 4; pu++) {
@@ -832,14 +875,14 @@ static void FUNC(emit_cu)(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int 
         hevc_cabac_code_merge_idx(cab, d->merge_idx);
         /* rqt_root_cbf is not coded for a 2Nx2N merge: it is 1, and the
          * residual is there - an empty one would have been a skip. */
-        FUNC(emit_inter_residual)(cab, &d->res);
+        FUNC(emit_inter_residual)(enc, cab, &d->res);
     } else {
         hevc_cabac_code_merge_flag(cab, 0);
         hevc_cabac_code_mvd(cab, d->mvd.x, d->mvd.y);
         hevc_cabac_code_mvp_idx(cab, d->mvp_idx);
         const int root = FUNC(inter_any_cbf)(&d->res);
         hevc_cabac_code_rqt_root_cbf(cab, root);
-        if (root) FUNC(emit_inter_residual)(cab, &d->res);
+        if (root) FUNC(emit_inter_residual)(enc, cab, &d->res);
     }
 }
 
@@ -916,10 +959,19 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
     memcpy(cd.res.rec_cr, pcr, sizeof(pcr));
     TRY(CU_SKIP, FUNC(pred_dist)(enc, cu_x, cu_y, py, pcb, pcr), cand[best_merge]);
 
-    /* Merge with its residual - unless there is none, which is the skip. */
-    FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, &cd.res);
-    if (FUNC(inter_any_cbf)(&cd.res))
-        TRY(CU_MERGE, cd.res.dist, cand[best_merge]);
+    /* Merge with its residual - unless there is none, which is the skip -
+     * as four 4x4 transforms and as one 8x8. */
+    {
+        FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, 0, &cd.res);
+        if (enc->tu8) {
+            FUNC(inter_res_t) r8;
+            FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, 1, &r8);
+            if (r8.dist * 256 + enc->lambda_sse_q8 * r8.bits < cd.res.dist * 256 + enc->lambda_sse_q8 * cd.res.bits)
+                cd.res = r8;
+        }
+        if (FUNC(inter_any_cbf)(&cd.res))
+            TRY(CU_MERGE, cd.res.dist, cand[best_merge]);
+    }
 
     /* A searched vector, coded against the better AMVP predictor: with its
      * residual, and without it. */
@@ -949,12 +1001,22 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
         cd.mvp_idx = mvp_idx;
         cd.mvd.x = (int16_t)(mv.x - mvp[mvp_idx].x);
         cd.mvd.y = (int16_t)(mv.y - mvp[mvp_idx].y);
-        FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, &cd.res);
-        const bool coded = FUNC(inter_any_cbf)(&cd.res);
-        TRY(CU_AMVP, cd.res.dist, mv);
+        bool coded = false;
+        {
+            FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, 0, &cd.res);
+            if (enc->tu8) {
+                FUNC(inter_res_t) r8;
+                FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, 1, &r8);
+                if (r8.dist * 256 + enc->lambda_sse_q8 * r8.bits < cd.res.dist * 256 + enc->lambda_sse_q8 * cd.res.bits)
+                    cd.res = r8;
+            }
+            coded = FUNC(inter_any_cbf)(&cd.res) != 0;
+            TRY(CU_AMVP, cd.res.dist, mv);
+        }
         if (coded) {
             /* The same vector with no residual at all. */
             memset(cd.res.cbf_y, 0, sizeof(cd.res.cbf_y));
+            cd.res.cbf_y8 = 0;
             cd.res.cbf_cb = cd.res.cbf_cr = 0;
             memcpy(cd.res.rec_y, py, sizeof(py));
             memcpy(cd.res.rec_cb, pcb, sizeof(pcb));
