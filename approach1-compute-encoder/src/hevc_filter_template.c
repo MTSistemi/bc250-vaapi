@@ -48,6 +48,12 @@ static bool FUNC(untouchable)(const hevcd_t *d, int x, int y)
 static void FUNC(filter_luma)(pixel *base, int forward, int giu,
                         int beta, int tc, bool keep_p, bool keep_q)
 {
+#if BIT_DEPTH == 8 && (defined(__x86_64__) || defined(_M_X64))
+    if (sao_vector()) {
+        filter_luma_ssse3(base, forward, giu, beta, tc, keep_p, keep_q);
+        return;
+    }
+#endif
 #define P(k, i) ((int)base[(i) * giu - ((k) + 1) * forward])
 #define Q(k, i) ((int)base[(i) * giu + (k) * forward])
 #define WRITE_P(k, i, v) \
@@ -195,12 +201,6 @@ static int FUNC(tc_di)(const hevcd_t *d, const hevcd_slice_filter_t *f,
     return hevcd_tc[q] << (d->sps->bit_depth_luma - 8);
 }
 
-/* Is the edge on this side of an 8x8 cell one the filter may cross. */
-static bool FUNC(edge)(const hevcd_t *d, int x, int y, int which)
-{
-    return (d->edges[(y >> 3) * d->edges_stride + (x >> 3)] & which) != 0;
-}
-
 /* 8.7.2.4. Two, one, or nothing at all.
  *
  * Two means an intra block is involved and the step across the edge is
@@ -275,22 +275,44 @@ static int FUNC(strength)(const hevcd_t *d, int xp, int yp, int xq, int yq,
  * luma edge writes three rows either side of itself and reads four, and
  * the next edge is eight rows on, so no two edges in different bands
  * touch the same row - and the chroma edges, sixteen luma rows apart,
- * keep the same distance on their own grid. */
-static void FUNC(one_direction)(hevcd_t *d, bool vertical, int y0, int y1)
+ * keep the same distance on their own grid.
+ *
+ * Walked one 8x8 cell of the edge map at a time. A cell's edge is two
+ * four-sample segments, and almost everything asked about a segment has
+ * the same answer for both: the tile, the slice and its filter settings
+ * (coding tree blocks are at least 16 and aligned), the quantiser and
+ * whether either side is lossless (coding blocks are at least 8). Only the
+ * boundary strength is per segment - motion is stored per 4x4. The
+ * segments of one pass never touch each other, so the order they are
+ * filtered in changes nothing.
+ *
+ * Always inlined, with `vertical` a constant at both call sites, so each
+ * direction gets a loop of its own without the other's arithmetic. */
+static inline __attribute__((always_inline))
+void FUNC(one_direction)(hevcd_t *d, bool vertical, int y0, int y1)
 {
     const hevc_sps_t *sps = d->sps;
     const int forward_l = vertical ? 1 : d->stride[0];
     const int giu_l = vertical ? d->stride[0] : 1;
     const int which = vertical ? 1 : 2;
+    const int tu_bit = vertical ? 4 : 8;
+    const bool tiles_matter = !d->pps->loop_filter_across_tiles
+                              && d->n_tiles > 1;
+    pixel *const luma = (pixel *)d->plane[0];
     if (y1 > sps->height) y1 = sps->height;
 
-    for (int y = y0; y < y1; y += vertical ? 4 : 8)
-        for (int x = 0; x < sps->width; x += vertical ? 8 : 4) {
-            /* The picture's own border is never an edge, and neither is a
-             * position the coding tree never put a block boundary at. */
-            if (vertical ? x == 0 : y == 0) continue;
-            if (!FUNC(edge)(d, x, y, which)) continue;
+    for (int cy = y0 >> 3; (cy << 3) < y1; cy++) {
+        const uint8_t *erow = d->edges + (size_t)cy * d->edges_stride;
+        const int y = cy << 3;
+        /* The picture's own top border is never an edge. */
+        if (!vertical && y == 0) continue;
 
+        for (int cx = vertical ? 1 : 0; cx < d->edges_stride; cx++) {
+            /* Nor is a position the coding tree never put a block boundary
+             * at - which is most of them. */
+            const int e = erow[cx];
+            if (!(e & which)) continue;
+            const int x = cx << 3;
             const int xp = vertical ? x - 1 : x;
             const int yp = vertical ? y : y - 1;
 
@@ -299,8 +321,7 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical, int y0, int y1)
              * independently and neither knows what the other chose, so
              * smoothing between them invents detail rather than removing
              * it. */
-            if (!d->pps->loop_filter_across_tiles
-                && hevcd_tile_at(d, xp, yp) != hevcd_tile_at(d, x, y))
+            if (tiles_matter && hevcd_tile_at(d, xp, yp) != hevcd_tile_at(d, x, y))
                 continue;
 
             /* ⚠️ The same for a slice boundary, and the same reason: the
@@ -311,49 +332,59 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical, int y0, int y1)
             if (!fq->across_slices
                 && hevcd_slice_at(d, xp, yp) != hevcd_slice_at(d, x, y))
                 continue;
-            const int bs = d->mvf
-                ? FUNC(strength)(d, xp, yp, x, y,
-                        (d->edges[(y >> 3) * d->edges_stride + (x >> 3)]
-                         & (vertical ? 4 : 8)) != 0)
-                : 2;
-            if (!bs) continue;
-            const int qp = (FUNC(qp_di)(d, x, y) + FUNC(qp_di)(d, xp, yp) + 1) >> 1;
-            const int beta = FUNC(beta_di)(d, fq, qp);
-            const int tc_l = FUNC(tc_di)(d, fq, qp, bs);
+
             const bool keep_p = FUNC(untouchable)(d, xp, yp);
             const bool keep_q = FUNC(untouchable)(d, x, y);
             if (keep_p && keep_q) continue;
+            const int qp = (FUNC(qp_di)(d, x, y) + FUNC(qp_di)(d, xp, yp) + 1) >> 1;
+            const int beta = FUNC(beta_di)(d, fq, qp);
+            const bool transform_edge = (e & tu_bit) != 0;
 
-            FUNC(filter_luma)((pixel *)d->plane[0]
-                        + (size_t)y * d->stride[0] + x,
-                        forward_l, giu_l, beta, tc_l,
-                        keep_p, keep_q);
+            for (int s = 0; s < 2; s++) {
+                const int sx = vertical ? x : x + 4 * s;
+                const int sy = vertical ? y + 4 * s : y;
+                if (vertical ? sy >= y1 : sx >= sps->width) break;
+                const int sxp = vertical ? sx - 1 : sx;
+                const int syp = vertical ? sy : sy - 1;
 
-            /* ⚠️ Chroma is filtered on its own grid, which is eight chroma
-             * samples and therefore sixteen luma ones. Filtering it
-             * wherever luma is filtered doubles the edges it touches and
-             * softens the picture in a way no reference decoder does. */
-            if (bs != 2) continue;
-            if (vertical ? (x & 15) : (y & 15)) continue;
-            if (vertical ? (y & 7) : (x & 7)) continue;
+                const int bs = d->mvf
+                    ? FUNC(strength)(d, sxp, syp, sx, sy, transform_edge)
+                    : 2;
+                if (!bs) continue;
+                const int tc_l = FUNC(tc_di)(d, fq, qp, bs);
 
-            for (int c = 1; c < 3; c++) {
-                const int off = c == 1 ? d->pps->cb_qp_offset
-                                       : d->pps->cr_qp_offset;
-                const int tc = hevcd_tc[FUNC(clip)(FUNC(qp_chroma)(FUNC(clip)(qp + off,
-                                                                   0, 57))
-                                                 + 2 + fq->tc_offset,
-                                                 0, 53)]
-                               << (d->sps->bit_depth_chroma - 8);
-                if (!tc) continue;
-                const int forward_c = vertical ? 1 : d->stride[c];
-                const int giu_c = vertical ? d->stride[c] : 1;
-                FUNC(filter_chroma)((pixel *)d->plane[c]
-                             + (size_t)(y / 2) * d->stride[c]
-                             + x / 2, forward_c, giu_c, tc,
-                             keep_p, keep_q);
+                FUNC(filter_luma)(luma + (size_t)sy * d->stride[0] + sx,
+                                  forward_l, giu_l, beta, tc_l,
+                                  keep_p, keep_q);
+
+                /* ⚠️ Chroma is filtered on its own grid, which is eight
+                 * chroma samples and therefore sixteen luma ones. Filtering
+                 * it wherever luma is filtered doubles the edges it touches
+                 * and softens the picture in a way no reference decoder
+                 * does. */
+                if (bs != 2) continue;
+                if (vertical ? (sx & 15) : (sy & 15)) continue;
+                if (vertical ? (sy & 7) : (sx & 7)) continue;
+
+                for (int c = 1; c < 3; c++) {
+                    const int off = c == 1 ? d->pps->cb_qp_offset
+                                           : d->pps->cr_qp_offset;
+                    const int tc = hevcd_tc[FUNC(clip)(FUNC(qp_chroma)(FUNC(clip)(qp + off,
+                                                                       0, 57))
+                                                     + 2 + fq->tc_offset,
+                                                     0, 53)]
+                                   << (d->sps->bit_depth_chroma - 8);
+                    if (!tc) continue;
+                    const int forward_c = vertical ? 1 : d->stride[c];
+                    const int giu_c = vertical ? d->stride[c] : 1;
+                    FUNC(filter_chroma)((pixel *)d->plane[c]
+                                 + (size_t)(sy / 2) * d->stride[c]
+                                 + sx / 2, forward_c, giu_c, tc,
+                                 keep_p, keep_q);
+                }
             }
         }
+    }
 }
 
 /* 8.7.2 over one coding tree block row, one direction.
@@ -365,7 +396,9 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical, int y0, int y1)
 static void FUNC(deblock_row)(hevcd_t *d, bool vertical, int ry)
 {
     const int l = d->sps->log2_ctb;
-    FUNC(one_direction)(d, vertical, ry << l, (ry + 1) << l);
+    /* Two calls with constants, so that each is its own specialised loop. */
+    if (vertical) FUNC(one_direction)(d, true, ry << l, (ry + 1) << l);
+    else          FUNC(one_direction)(d, false, ry << l, (ry + 1) << l);
 }
 
 /* ------------------------------------------------- sample adaptive offset */

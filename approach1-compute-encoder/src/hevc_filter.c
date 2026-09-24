@@ -91,6 +91,185 @@ static void sao_edge_row_ssse3(uint8_t *out, const uint8_t *cur,
         out[x] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
     }
 }
+/* The luma deblocking filter of 8.7.2.5.3 to 8.7.2.5.7, one four-line
+ * segment, eight bits.
+ *
+ * The eight samples across the edge of each of the four lines go into
+ * eight vectors, p3 to q3, one line per lane. For a horizontal edge the
+ * lines are columns and each vector is four bytes of one row; for a
+ * vertical edge the lines are rows, and the four rows of eight bytes are
+ * transposed on the way in and back on the way out.
+ *
+ * The decisions stay scalar and read lanes 0 and 3, exactly the two lines
+ * the standard looks at. The filters themselves run on all four lanes,
+ * with a mask for the weak filter's per-line "is the step small enough".
+ * Every value that goes back is clipped to 0..255 by _mm_packus_epi16,
+ * which is clip_pixel() at eight bits.
+ *
+ * ⚠️ All the arithmetic is sixteen-bit and none of it can overflow: the
+ * largest sum, 8 * 255 + 4, and 9 * 255 + 3 * 255 + 8 in the weak delta,
+ * are far inside it. The shifts of values that can be negative are
+ * arithmetic, as the scalar C is. */
+#define LOAD32(p) ({ uint32_t w_; memcpy(&w_, (p), 4); (int)w_; })
+
+__attribute__((target("ssse3")))
+static void filter_luma_ssse3(uint8_t *base, int forward, int giu,
+                              int beta, int tc, bool keep_p, bool keep_q)
+{
+    const __m128i zero = _mm_setzero_si128();
+    __m128i p3, p2, p1, p0, q0, q1, q2, q3;
+    const bool rows = (forward == 1);       /* a vertical edge */
+
+    if (rows) {
+        const __m128i r0 = _mm_loadl_epi64((const __m128i *)(base - 4));
+        const __m128i r1 = _mm_loadl_epi64((const __m128i *)(base + giu - 4));
+        const __m128i r2 = _mm_loadl_epi64((const __m128i *)(base + 2 * giu - 4));
+        const __m128i r3 = _mm_loadl_epi64((const __m128i *)(base + 3 * giu - 4));
+        /* Columns of four bytes: x - 4 to x - 1 in lo, x to x + 3 in hi. */
+        const __m128i a = _mm_unpacklo_epi8(r0, r1);
+        const __m128i b = _mm_unpacklo_epi8(r2, r3);
+        const __m128i lo = _mm_unpacklo_epi16(a, b);
+        const __m128i hi = _mm_unpackhi_epi16(a, b);
+        const __m128i c01 = _mm_unpacklo_epi8(lo, zero);
+        const __m128i c23 = _mm_unpackhi_epi8(lo, zero);
+        const __m128i c45 = _mm_unpacklo_epi8(hi, zero);
+        const __m128i c67 = _mm_unpackhi_epi8(hi, zero);
+        p3 = c01; p2 = _mm_srli_si128(c01, 8);
+        p1 = c23; p0 = _mm_srli_si128(c23, 8);
+        q0 = c45; q1 = _mm_srli_si128(c45, 8);
+        q2 = c67; q3 = _mm_srli_si128(c67, 8);
+    } else {
+#define ROW(k) _mm_unpacklo_epi8(_mm_cvtsi32_si128(LOAD32(base + (k) * forward)), zero)
+        p3 = ROW(-4); p2 = ROW(-3); p1 = ROW(-2); p0 = ROW(-1);
+        q0 = ROW(0);  q1 = ROW(1);  q2 = ROW(2);  q3 = ROW(3);
+#undef ROW
+    }
+
+    /* 8.7.2.5.3: the decision, from lines 0 and 3. */
+    const __m128i dpv = _mm_abs_epi16(_mm_add_epi16(
+        _mm_sub_epi16(p2, _mm_add_epi16(p1, p1)), p0));
+    const __m128i dqv = _mm_abs_epi16(_mm_add_epi16(
+        _mm_sub_epi16(q2, _mm_add_epi16(q1, q1)), q0));
+    const int dp0 = _mm_extract_epi16(dpv, 0), dp3 = _mm_extract_epi16(dpv, 3);
+    const int dq0 = _mm_extract_epi16(dqv, 0), dq3 = _mm_extract_epi16(dqv, 3);
+    const int dpq0 = dp0 + dq0, dpq3 = dp3 + dq3;
+    if (dpq0 + dpq3 >= beta) return;
+
+    const int dp = dp0 + dp3, dq = dq0 + dq3;
+    const int threshold = (5 * tc + 1) >> 1;
+    const __m128i flat = _mm_add_epi16(_mm_abs_epi16(_mm_sub_epi16(p3, p0)),
+                                       _mm_abs_epi16(_mm_sub_epi16(q0, q3)));
+    const __m128i step = _mm_abs_epi16(_mm_sub_epi16(p0, q0));
+    const bool strong =
+        2 * dpq0 < (beta >> 2) && _mm_extract_epi16(flat, 0) < (beta >> 3)
+        && _mm_extract_epi16(step, 0) < threshold
+        && 2 * dpq3 < (beta >> 2) && _mm_extract_epi16(flat, 3) < (beta >> 3)
+        && _mm_extract_epi16(step, 3) < threshold;
+
+    __m128i np2 = p2, np1 = p1, np0 = p0, nq0 = q0, nq1 = q1, nq2 = q2;
+    if (strong) {
+        /* 8.7.2.5.7: three samples each side, each held within 2 tC. */
+        const __m128i tc2 = _mm_set1_epi16((int16_t)(2 * tc));
+        const __m128i two = _mm_set1_epi16(2), four = _mm_set1_epi16(4);
+#define HOLD(v, x) _mm_min_epi16(_mm_max_epi16((v), _mm_sub_epi16((x), tc2)), \
+                                 _mm_add_epi16((x), tc2))
+        const __m128i p0q0 = _mm_add_epi16(p0, q0);
+        if (!keep_p) {
+            np0 = HOLD(_mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(
+                      _mm_add_epi16(p2, q1), _mm_add_epi16(
+                      _mm_add_epi16(p1, p1), _mm_add_epi16(p0q0, p0q0))), four), 3), p0);
+            np1 = HOLD(_mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(
+                      _mm_add_epi16(p2, p1), p0q0), two), 2), p1);
+            np2 = HOLD(_mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(
+                      _mm_add_epi16(_mm_add_epi16(p3, p3), _mm_add_epi16(
+                      _mm_add_epi16(p2, p2), p2)), _mm_add_epi16(p1, p0q0)), four), 3), p2);
+        }
+        if (!keep_q) {
+            nq0 = HOLD(_mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(
+                      _mm_add_epi16(p1, q2), _mm_add_epi16(
+                      _mm_add_epi16(q1, q1), _mm_add_epi16(p0q0, p0q0))), four), 3), q0);
+            nq1 = HOLD(_mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(
+                      _mm_add_epi16(q2, q1), p0q0), two), 2), q1);
+            nq2 = HOLD(_mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(
+                      _mm_add_epi16(_mm_add_epi16(q3, q3), _mm_add_epi16(
+                      _mm_add_epi16(q2, q2), q2)), _mm_add_epi16(q1, p0q0)), four), 3), q2);
+        }
+#undef HOLD
+    } else {
+        /* 8.7.2.5.7, the weak filter: one sample each side on every line
+         * whose step is small enough, a second on a side flat enough. */
+        const bool touch_p1 = dp < ((beta + (beta >> 1)) >> 3);
+        const bool touch_q1 = dq < ((beta + (beta >> 1)) >> 3);
+        const __m128i tcv = _mm_set1_epi16((int16_t)tc);
+        const __m128i ntc = _mm_set1_epi16((int16_t)-tc);
+        const __m128i one = _mm_set1_epi16(1);
+        __m128i delta = _mm_srai_epi16(_mm_add_epi16(_mm_sub_epi16(
+            _mm_mullo_epi16(_mm_sub_epi16(q0, p0), _mm_set1_epi16(9)),
+            _mm_mullo_epi16(_mm_sub_epi16(q1, p1), _mm_set1_epi16(3))),
+            _mm_set1_epi16(8)), 4);
+        const __m128i ok = _mm_cmplt_epi16(_mm_abs_epi16(delta),
+                                           _mm_set1_epi16((int16_t)(10 * tc)));
+        delta = _mm_min_epi16(_mm_max_epi16(delta, ntc), tcv);
+#define PICK_OK(v, x) _mm_or_si128(_mm_and_si128(ok, (v)), _mm_andnot_si128(ok, (x)))
+        if (!keep_p) {
+            np0 = PICK_OK(_mm_add_epi16(p0, delta), p0);
+            if (touch_p1) {
+                const __m128i htc = _mm_set1_epi16((int16_t)(tc >> 1));
+                const __m128i nhtc = _mm_set1_epi16((int16_t)-(tc >> 1));
+                __m128i d1 = _mm_srai_epi16(_mm_add_epi16(_mm_sub_epi16(
+                    _mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(p2, p0), one), 1),
+                    p1), delta), 1);
+                d1 = _mm_min_epi16(_mm_max_epi16(d1, nhtc), htc);
+                np1 = PICK_OK(_mm_add_epi16(p1, d1), p1);
+            }
+        }
+        if (!keep_q) {
+            nq0 = PICK_OK(_mm_sub_epi16(q0, delta), q0);
+            if (touch_q1) {
+                const __m128i htc = _mm_set1_epi16((int16_t)(tc >> 1));
+                const __m128i nhtc = _mm_set1_epi16((int16_t)-(tc >> 1));
+                __m128i d1 = _mm_srai_epi16(_mm_sub_epi16(_mm_sub_epi16(
+                    _mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(q2, q0), one), 1),
+                    q1), delta), 1);
+                d1 = _mm_min_epi16(_mm_max_epi16(d1, nhtc), htc);
+                nq1 = PICK_OK(_mm_add_epi16(q1, d1), q1);
+            }
+        }
+#undef PICK_OK
+    }
+
+    if (rows) {
+        /* Back into rows: columns 0-3 and 4-7 as bytes, each a 4x4 block
+         * stored column by column, turned by one shuffle, and the two
+         * halves of every row put side by side. */
+        const __m128i left = _mm_packus_epi16(_mm_unpacklo_epi64(p3, np2),
+                                              _mm_unpacklo_epi64(np1, np0));
+        const __m128i right = _mm_packus_epi16(_mm_unpacklo_epi64(nq0, nq1),
+                                               _mm_unpacklo_epi64(nq2, q3));
+        const __m128i turn = _mm_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13,
+                                           2, 6, 10, 14, 3, 7, 11, 15);
+        const __m128i tl = _mm_shuffle_epi8(left, turn);
+        const __m128i tr = _mm_shuffle_epi8(right, turn);
+        const __m128i r01 = _mm_unpacklo_epi32(tl, tr);
+        const __m128i r23 = _mm_unpackhi_epi32(tl, tr);
+        _mm_storel_epi64((__m128i *)(base - 4), r01);
+        _mm_storel_epi64((__m128i *)(base + giu - 4), _mm_srli_si128(r01, 8));
+        _mm_storel_epi64((__m128i *)(base + 2 * giu - 4), r23);
+        _mm_storel_epi64((__m128i *)(base + 3 * giu - 4), _mm_srli_si128(r23, 8));
+        return;
+    }
+#define STORE_ROW(k, v) do { \
+        const int w_ = _mm_cvtsi128_si32(_mm_packus_epi16((v), (v))); \
+        memcpy(base + (k) * forward, &w_, 4); } while (0)
+    if (!keep_p) {
+        STORE_ROW(-3, np2); STORE_ROW(-2, np1); STORE_ROW(-1, np0);
+    }
+    if (!keep_q) {
+        STORE_ROW(0, nq0); STORE_ROW(1, nq1); STORE_ROW(2, nq2);
+    }
+#undef STORE_ROW
+}
+#undef LOAD32
 #endif
 
 #define BIT_DEPTH 8
