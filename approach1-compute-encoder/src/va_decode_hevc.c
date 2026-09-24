@@ -69,7 +69,9 @@ struct bc250_hevc_job {
  * predicts from the ones before it. The point is not decoding pictures at
  * the same time but letting the application prepare the next one - parse
  * it, fill its buffers - while this one decodes. */
-#define ASYNC_DEPTH 4
+/* Queued or running: one per decode thread and two waiting, so that a
+ * thread finishing a picture always finds the next one ready. */
+#define ASYNC_DEPTH (HEVC_DECODER_FRAMES + 2)
 struct bc250_hevc_async;
 struct decode_worker {
     struct bc250_hevc_async *a;

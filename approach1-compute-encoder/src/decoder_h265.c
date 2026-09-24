@@ -22,15 +22,16 @@
 #include <emmintrin.h>
 #endif
 
-/* ⚠️ Four more than the sixteen a stream may keep: a picture being decoded
- * holds its own slot and those it reads until it is done, and with two in
- * flight a slot the newer one no longer names may still be read by the
- * older. */
-#define IMG_SLOTS 24
+/* ⚠️ More than the sixteen a stream may keep: a picture being decoded
+ * holds its own slot and those it reads until its frame starts the next
+ * one, and with several in flight a slot the newest no longer names may
+ * still be read by an older one. Four per frame covers its own slot and
+ * the references a picture can drop at a time. */
+#define IMG_SLOTS (16 + 4 * HEVC_DECODER_FRAMES)
 
 /* One picture being decoded: everything that belongs to a picture while it
  * is decoded - the maps, the parameter sets, the slice header, the threads
- * - so that two can be decoded at once. The pictures themselves, and the
+ * - so that several can be decoded at once. The pictures themselves, and the
  * references between them, are the decoder's. */
 typedef struct {
     hevcd_t d;

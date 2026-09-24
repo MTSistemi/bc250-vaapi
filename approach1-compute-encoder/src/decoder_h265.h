@@ -23,7 +23,7 @@
 typedef struct hevc_decoder hevc_decoder_t;
 
 /* How many pictures one decoder can have in flight at once. */
-#define HEVC_DECODER_FRAMES 2
+#define HEVC_DECODER_FRAMES 3
 
 /* `gpu` may be NULL: without it the decoder keeps the planes and a caller
  * reads them with hevc_decoder_plane(). */
@@ -79,7 +79,7 @@ const char *hevc_decoder_reason(int e);
  * functions above are frame 0 of these.
  *
  * A picture is begun, sliced, ended and loaded on frame k, 0 <= k <
- * HEVC_DECODER_FRAMES; two frames may be in any of those at the same time,
+ * HEVC_DECODER_FRAMES; the frames may each be in any of those at once,
  * on different threads. ⚠️ Pictures are BEGUN in decoding order, one
  * after the other, each after hevc_decoder_set_references() for it -
  * nothing else of two pictures needs ordering. `refs` are the reference
