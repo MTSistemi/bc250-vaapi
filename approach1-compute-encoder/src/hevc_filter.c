@@ -269,6 +269,63 @@ static void filter_luma_ssse3(uint8_t *base, int forward, int giu,
     }
 #undef STORE_ROW
 }
+/* 8.7.2.5.5, the chroma filter, one four-line segment at eight bits: one
+ * sample each side, no decision. p1, p0, q0 and q1 of the four lines go
+ * into four vectors, one line per lane - four bytes of one row each for a
+ * horizontal edge, a 4x4 block of bytes turned by one shuffle for a
+ * vertical one, which turns it back too - and _mm_packus_epi16 does the
+ * clip to 0..255. */
+__attribute__((target("ssse3")))
+static void filter_chroma_ssse3(uint8_t *base, int forward, int giu, int tc,
+                                bool keep_p, bool keep_q)
+{
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i turn = _mm_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13,
+                                       2, 6, 10, 14, 3, 7, 11, 15);
+    const bool rows = (forward == 1);       /* a vertical edge */
+    __m128i p1, p0, q0, q1;
+
+    if (rows) {
+        /* Four rows of x - 2 .. x + 1, then one column per four bytes. */
+        const __m128i block = _mm_shuffle_epi8(_mm_setr_epi32(
+            LOAD32(base - 2), LOAD32(base + giu - 2),
+            LOAD32(base + 2 * giu - 2), LOAD32(base + 3 * giu - 2)), turn);
+        const __m128i lo = _mm_unpacklo_epi8(block, zero);
+        const __m128i hi = _mm_unpackhi_epi8(block, zero);
+        p1 = lo; p0 = _mm_srli_si128(lo, 8);
+        q0 = hi; q1 = _mm_srli_si128(hi, 8);
+    } else {
+#define ROW(k) _mm_unpacklo_epi8(_mm_cvtsi32_si128(LOAD32(base + (k) * forward)), zero)
+        p1 = ROW(-2); p0 = ROW(-1); q0 = ROW(0); q1 = ROW(1);
+#undef ROW
+    }
+
+    __m128i delta = _mm_srai_epi16(_mm_add_epi16(_mm_sub_epi16(_mm_add_epi16(
+        _mm_slli_epi16(_mm_sub_epi16(q0, p0), 2), p1), q1), _mm_set1_epi16(4)), 3);
+    delta = _mm_min_epi16(_mm_max_epi16(delta, _mm_set1_epi16((int16_t)-tc)),
+                          _mm_set1_epi16((int16_t)tc));
+    const __m128i np0 = keep_p ? p0 : _mm_add_epi16(p0, delta);
+    const __m128i nq0 = keep_q ? q0 : _mm_sub_epi16(q0, delta);
+
+    if (rows) {
+        const __m128i out = _mm_shuffle_epi8(
+            _mm_packus_epi16(_mm_unpacklo_epi64(p1, np0),
+                             _mm_unpacklo_epi64(nq0, q1)), turn);
+        /* Row i is bytes 4i .. 4i + 3: p1, p0, q0, q1 of that row. */
+        int r_[4];
+        _mm_storeu_si128((__m128i *)r_, out);
+        for (int i = 0; i < 4; i++) memcpy(base + i * giu - 2, &r_[i], 4);
+        return;
+    }
+    if (!keep_p) {
+        const int w_ = _mm_cvtsi128_si32(_mm_packus_epi16(np0, np0));
+        memcpy(base - forward, &w_, 4);
+    }
+    if (!keep_q) {
+        const int w_ = _mm_cvtsi128_si32(_mm_packus_epi16(nq0, nq0));
+        memcpy(base, &w_, 4);
+    }
+}
 #undef LOAD32
 #endif
 
@@ -293,8 +350,9 @@ static void filter_luma_ssse3(uint8_t *base, int forward, int giu,
  *
  *   0. the vertical edges      - 8.7.2 filters all of them first,
  *   1. the horizontal edges    - and these read what stage 0 wrote,
- *   2. the copy SAO reads      - the whole deblocked picture,
- *   3. SAO                     - which reads the copy around each block.
+ *   2. what SAO reads across   - the deblocked rows and columns at the
+ *                                block borders,
+ *   3. SAO                     - which reads those around each block.
  *
  * Inside a stage the rows are independent (see one_direction() for why
  * the horizontal edges are), so the rows are simply handed out in order.
@@ -425,6 +483,9 @@ void hevcd_free_filters(hevcd_t *d)
     free(d->sao);
     d->sao = NULL;
     d->n_sao = 0;
-    for (int c = 0; c < 3; c++) { free(d->copy_of[c]); d->copy_of[c] = NULL; }
-    d->n_copy = 0;
+    for (int c = 0; c < 3; c++) {
+        free(d->sao_lines[c]);
+        d->sao_lines[c] = NULL;
+        d->n_sao_lines[c] = 0;
+    }
 }

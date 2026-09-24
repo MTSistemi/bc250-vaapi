@@ -208,8 +208,13 @@ typedef struct {
      * filter touched them, so it cannot read the plane it is writing. */
     hevcd_sao_t *sao;
     size_t n_sao;
-    uint8_t *copy_of[3];
-    size_t n_copy;
+    /* ⚠️ Not the whole deblocked picture, only what an edge offset reads
+     * from outside its own block: per plane, the first and the last row of
+     * every coding tree block row and the first and the last column of
+     * every coding tree block column, as the deblocking filter left them.
+     * See sao_copy_row(). */
+    uint8_t *sao_lines[3];
+    size_t n_sao_lines[3];
     size_t n_ct_depth, n_intra_mode, n_zs, n_qp, n_no_filter, n_skip;
     int min_pu_width, min_pu_height;
 

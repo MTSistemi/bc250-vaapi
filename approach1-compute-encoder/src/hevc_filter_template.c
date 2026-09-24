@@ -150,6 +150,12 @@ static void FUNC(filter_luma)(pixel *base, int forward, int giu,
 static void FUNC(filter_chroma)(pixel *base, int forward, int giu, int tc,
                          bool keep_p, bool keep_q)
 {
+#if BIT_DEPTH == 8 && (defined(__x86_64__) || defined(_M_X64))
+    if (sao_vector()) {
+        filter_chroma_ssse3(base, forward, giu, tc, keep_p, keep_q);
+        return;
+    }
+#endif
     for (int i = 0; i < 4; i++) {
         pixel *p1 = base + i * giu - 2 * forward;
         pixel *p0 = base + i * giu - forward;
@@ -479,6 +485,26 @@ static bool FUNC(sao_neighbours_free)(const hevcd_t *d, int rx, int ry)
     return true;
 }
 
+/* Where the kept borders of plane c lie in sao_lines[c]. `which` is 0 for
+ * the first row of coding tree block row `index`, 1 for its last row, 2
+ * for the first column of block column `index`, 3 for its last column.
+ * Rows are indexed by x, columns by y, both in the plane's own samples. */
+static pixel *FUNC(sao_line)(hevcd_t *d, int c, int which, int index)
+{
+    const int giu = c ? 1 : 0;
+    const size_t w = (size_t)(d->sps->width >> giu);
+    const size_t h = (size_t)(d->sps->height >> giu);
+    const size_t rows = (size_t)d->sps->ctb_height;
+    const size_t cols = (size_t)d->sps->ctb_width;
+    pixel *base = (pixel *)d->sao_lines[c];
+    switch (which) {
+    case 0:  return base + (size_t)index * w;
+    case 1:  return base + rows * w + (size_t)index * w;
+    case 2:  return base + 2 * rows * w + (size_t)index * h;
+    default: return base + 2 * rows * w + cols * h + (size_t)index * h;
+    }
+}
+
 /* `plain` says sao_lossy_only() held, `open` that sao_neighbours_free()
  * did too. With them the loops below ask nothing per sample but the
  * picture border, and that is worked out once as the loop bounds. */
@@ -497,7 +523,6 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
     const int bd = c ? d->sps->bit_depth_chroma : d->sps->bit_depth_luma;
     const int stride = d->stride[c];
     pixel *plane = (pixel *)d->plane[c];
-    const pixel *before = (const pixel *)d->copy_of[c];
 
     if (s->kind[c] == 1) {
         /* By band: the range of a sample is cut into thirty-two bands and
@@ -536,6 +561,41 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
     const int ax = FUNC(sao_dx)[cl][0], ay = FUNC(sao_dy)[cl][0];
     const int bx = FUNC(sao_dx)[cl][1], by = FUNC(sao_dy)[cl][1];
 
+    /* The block as the deblocking filter left it, with a ring of one
+     * sample around it: the inside from the plane, which nothing has
+     * written since, the ring from the borders sao_copy_row() kept -
+     * the neighbouring blocks may have had their own offsets applied
+     * already. Only the ring positions inside the picture are filled,
+     * and only those are ever read. B(x, y) is the sample at picture
+     * coordinates (x, y), for x0 - 1 <= x <= x1 and y0 - 1 <= y <= y1. */
+    pixel ring[(64 + 2) * (64 + 2)];
+    const int rs = side + 2;
+    const pixel *const bb = ring + rs + 1;
+#define B(x, y) bb[(ptrdiff_t)((y) - y0) * rs + ((x) - x0)]
+    for (int y = y0; y < y1; y++)
+        memcpy(ring + (size_t)(y - y0 + 1) * rs + 1, plane + (size_t)y * stride + x0,
+               (size_t)(x1 - x0) * sizeof(pixel));
+    {
+        const int xl = x0 > 0 ? x0 - 1 : 0;
+        const int xr = x1 < w ? x1 : w - 1;
+        if (y0 > 0)
+            memcpy(ring + (xl - x0 + 1), FUNC(sao_line)(d, c, 1, ry - 1) + xl,
+                   (size_t)(xr - xl + 1) * sizeof(pixel));
+        if (y1 < h)
+            memcpy(ring + (size_t)(y1 - y0 + 1) * rs + (xl - x0 + 1),
+                   FUNC(sao_line)(d, c, 0, ry + 1) + xl,
+                   (size_t)(xr - xl + 1) * sizeof(pixel));
+        if (x0 > 0) {
+            const pixel *col = FUNC(sao_line)(d, c, 3, rx - 1);
+            for (int y = y0; y < y1; y++) ring[(size_t)(y - y0 + 1) * rs] = col[y];
+        }
+        if (x1 < w) {
+            const pixel *col = FUNC(sao_line)(d, c, 2, rx + 1);
+            for (int y = y0; y < y1; y++)
+                ring[(size_t)(y - y0 + 1) * rs + (x1 - x0 + 1)] = col[y];
+        }
+    }
+
     if (plain && open) {
         /* A sample whose neighbour would be outside the picture is left
          * alone, and the neighbours are one sample away: that is the first
@@ -553,21 +613,21 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
         const int8_t table[16] = { s->off[c][0], s->off[c][1], 0,
                                    s->off[c][2], s->off[c][3] };
         for (int y = ys; y < ye; y++) {
-            const pixel *cur = before + (size_t)y * stride;
-            const pixel *pa = before + (size_t)(y + ay) * stride + ax;
-            const pixel *pb = before + (size_t)(y + by) * stride + bx;
-            pixel *out = plane + (size_t)y * stride;
+            /* All three from column xs on. */
+            const pixel *cur = &B(xs, y);
+            const pixel *pa = &B(xs + ax, y + ay);
+            const pixel *pb = &B(xs + bx, y + by);
+            pixel *out = plane + (size_t)y * stride + xs;
 #if BIT_DEPTH == 8 && (defined(__x86_64__) || defined(_M_X64))
             if (sao_vector()) {
-                sao_edge_row_ssse3(out + xs, cur + xs, pa + xs, pb + xs,
-                                   xe - xs, table);
+                sao_edge_row_ssse3(out, cur, pa, pb, xe - xs, table);
                 continue;
             }
 #endif
-            for (int x = xs; x < xe; x++) {
-                const int v = cur[x];
-                const int idx = 2 + FUNC(sign)(v - pa[x]) + FUNC(sign)(v - pb[x]);
-                out[x] = (pixel)FUNC(clip_pixel)(v + table[idx]);
+            for (int i = 0; i < xe - xs; i++) {
+                const int v = cur[i];
+                const int idx = 2 + FUNC(sign)(v - pa[i]) + FUNC(sign)(v - pb[i]);
+                out[i] = (pixel)FUNC(clip_pixel)(v + table[idx]);
             }
         }
         return;
@@ -604,9 +664,9 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
                 }
             }
 
-            const int v = before[(size_t)y * stride + x];
-            int idx = 2 + FUNC(sign)(v - before[(size_t)(y + ay) * stride + x + ax])
-                        + FUNC(sign)(v - before[(size_t)(y + by) * stride + x + bx]);
+            const int v = B(x, y);
+            int idx = 2 + FUNC(sign)(v - B(x + ax, y + ay))
+                        + FUNC(sign)(v - B(x + bx, y + by));
             /* Table 8-x: the five cases are renumbered so that "neither up
              * nor down" lands on zero, which is the one with no offset. */
             if (idx <= 2) idx = (idx == 2) ? 0 : idx + 1;
@@ -614,11 +674,11 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
             plane[(size_t)y * stride + x] = (pixel)
                 FUNC(clip_pixel)(v + s->off[c][idx - 1]);
         }
+#undef B
 }
 
-/* Is there any offset to apply in this picture, and somewhere to keep
- * the picture as the deblocking filter left it. The copy itself is made
- * a row at a time by sao_copy_row(), so that it is split up too. */
+/* Is there any offset to apply in this picture, and somewhere to keep the
+ * block borders as the deblocking filter left them. */
 static bool FUNC(sao_prepare)(hevcd_t *d)
 {
     if (!d->sao || !d->plane[0]) return false;
@@ -628,42 +688,59 @@ static bool FUNC(sao_prepare)(hevcd_t *d)
         serve = d->sao[i].kind[0] || d->sao[i].kind[1] || d->sao[i].kind[2];
     if (!serve) return false;
 
-    const size_t measure[3] = { d->n_planes, d->n_planes / 4, d->n_planes / 4 };
     for (int c = 0; c < 3; c++) {
-        if (!d->copy_of[c] || d->n_copy < d->n_planes) {
-            free(d->copy_of[c]);
-            d->copy_of[c] = malloc(measure[c]);
-            if (!d->copy_of[c]) { d->n_copy = 0; return false; }
+        const int giu = c ? 1 : 0;
+        const size_t w = (size_t)(d->sps->width >> giu);
+        const size_t h = (size_t)(d->sps->height >> giu);
+        const size_t need = (2 * (size_t)d->sps->ctb_height * w
+                             + 2 * (size_t)d->sps->ctb_width * h) * sizeof(pixel);
+        if (!d->sao_lines[c] || d->n_sao_lines[c] < need) {
+            free(d->sao_lines[c]);
+            d->sao_lines[c] = malloc(need);
+            d->n_sao_lines[c] = d->sao_lines[c] ? need : 0;
+            if (!d->sao_lines[c]) return false;
         }
     }
-    d->n_copy = d->n_planes;
     return true;
 }
 
-/* The rows of one coding tree block row, in all three planes, into the
- * copy the edge offset reads. */
+/* The borders of one coding tree block row, in all three planes: its
+ * first and last rows whole, and the first and last column of each block
+ * in it. Everything an edge offset elsewhere will read of this row. */
 static void FUNC(sao_copy_row)(hevcd_t *d, int ry)
 {
-    const size_t measure[3] = { d->n_planes, d->n_planes / 4, d->n_planes / 4 };
     const int l = d->sps->log2_ctb;
     for (int c = 0; c < 3; c++) {
         const int giu = c ? 1 : 0;
-        const int h = d->sps->height >> giu;
-        const int y0 = (ry << l) >> giu;
-        int y1 = ((ry + 1) << l) >> giu;
-        if (y1 > h) y1 = h;
+        const int w = d->sps->width >> giu, h = d->sps->height >> giu;
+        const int side = 1 << (l - giu);
+        const int y0 = ry * side;
+        const int y1 = y0 + side < h ? y0 + side : h;
         if (y0 >= y1) continue;
-        const size_t row = (size_t)d->stride[c] * sizeof(pixel);
-        size_t end = (size_t)y1 * row;
-        if (end > measure[c]) end = measure[c];
-        const size_t begin = (size_t)y0 * row;
-        if (begin < end)
-            memcpy(d->copy_of[c] + begin, d->plane[c] + begin, end - begin);
+        const pixel *plane = (const pixel *)d->plane[c];
+        const int stride = d->stride[c];
+        memcpy(FUNC(sao_line)(d, c, 0, ry), plane + (size_t)y0 * stride,
+               (size_t)w * sizeof(pixel));
+        memcpy(FUNC(sao_line)(d, c, 1, ry), plane + (size_t)(y1 - 1) * stride,
+               (size_t)w * sizeof(pixel));
+        for (int rx = 0; rx < d->sps->ctb_width; rx++) {
+            const int x0 = rx * side;
+            if (x0 >= w) break;
+            const int x1 = x0 + side < w ? x0 + side : w;
+            pixel *first = FUNC(sao_line)(d, c, 2, rx);
+            pixel *last = FUNC(sao_line)(d, c, 3, rx);
+            for (int y = y0; y < y1; y++) {
+                const pixel *row = plane + (size_t)y * stride;
+                first[y] = row[x0];
+                last[y] = row[x1 - 1];
+            }
+        }
     }
 }
 
-/* 8.7.3 over one coding tree block row. It reads only the copy and writes
- * only its own blocks, so rows run in any order once the copy is whole. */
+/* 8.7.3 over one coding tree block row. It reads its own blocks and the
+ * kept borders and writes only its own blocks, so rows run in any order
+ * once every border is kept. */
 static void FUNC(sao_row)(hevcd_t *d, int ry)
 {
     for (int rx = 0; rx < d->sps->ctb_width; rx++) {
