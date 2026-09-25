@@ -1242,6 +1242,15 @@ static size_t maybe_append_filler_hevc(hevc_encoder_t *encoder, size_t total_wri
     }
 
     uint32_t target_bytes = (encoder->rc.target_bits_per_frame + 7) / 8;
+    /* With the rate model the stream's account decides, the way a real
+     * buffer would: fill only what brings the debt back to zero. Filling
+     * every small picture up to one picture's budget, while the large ones
+     * stay large, put CBR 4-9% over its bitrate (and 34-57% with the old
+     * loop). */
+    if (encoder->rc.model) {
+        const double want = (double)encoder->rc.target_bits_per_frame - encoder->rc.debt;
+        target_bytes = want > 0.0 ? (uint32_t)(want / 8.0) : 0;
+    }
     if (target_bytes <= total_written) {
         return total_written;
     }
