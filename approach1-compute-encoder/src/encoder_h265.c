@@ -513,6 +513,12 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
      */
     rc_init(&enc->rc, qp_pinned ? RC_CQP : RC_LOW_LATENCY, bitrate,
             (double)enc->fps, width, height);
+    /* QP from a model of what pictures cost (rate_control.c), unless
+     * BC250_HEVC_RC_MODEL=0 asks for the old buffer-feedback loop. */
+    {
+        const char *m = getenv("BC250_HEVC_RC_MODEL");
+        enc->rc.model = !(m && strcmp(m, "0") == 0);
+    }
     if (qp_pinned) {
         enc->rc.current_qp = enc->qp;
         enc->rc.base_qp = enc->qp;
@@ -1273,7 +1279,8 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
 
     /* In VBR/CBR/LOW_LATENCY mode, update QP via rate control model */
     if (encoder->rc.mode != RC_CQP) {
-        int target_qp = rc_get_frame_qp(&encoder->rc, is_idr ? 0 : encoder->last_frame_sad);
+        int target_qp = encoder->rc.model ? rc_model_frame_qp(&encoder->rc, is_idr)
+                                          : rc_get_frame_qp(&encoder->rc, is_idr ? 0 : encoder->last_frame_sad);
         if (target_qp >= 1 && target_qp <= 51) {
             encoder->qp = target_qp;
         }
@@ -1531,6 +1538,7 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
 
     if (real_coded > 0 && encoder->rc.mode != RC_CQP) {
         rc_update_stats(&encoder->rc, (int)(real_coded * 8));
+        if (encoder->rc.model) rc_model_frame_coded(&encoder->rc, is_idr, encoder->qp, (int)(real_coded * 8));
     }
 
     /* Update reference buffers for subsequent P-frames */
