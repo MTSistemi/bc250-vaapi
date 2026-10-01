@@ -57,15 +57,10 @@
  * hevc_intra.c and hevc_cabac.c respectively - see those files.
  *
  * The one piece of the existing GPU/Vulkan infrastructure this file DOES
- * reuse unmodified is gpu_compute_download_nv12() - the real, already-
- * uploaded picture is read back from the GPU surface into host memory once
- * per frame, exactly the way va_backend.c's own CPU-side surface access
- * (bc250_MapBuffer et al) already does, and the existing
- * gpu_compute_begin_picture/dispatch_encode/end_picture/sync() sequence is
- * still called first (with its result discarded) purely to preserve the
- * exact same Vulkan image layout transitions and fence/staging-buffer
- * bookkeeping the rest of this driver (va_backend.c's EndPicture) already
- * depends on - see that call site's comment below.
+ * reuse is gpu_compute_download_nv12(): the picture is read back from the
+ * surface into host memory once per frame, the way va_backend.c's own
+ * CPU-side surface access (bc250_MapBuffer et al) does. The GPU does no
+ * other work for this encoder - see hevc_encoder_encode_frame().
  */
 
 #include "encoder_h265.h"
@@ -74,8 +69,6 @@
 #include "hevc_cabac.h"
 #include "hevc_intra.h"
 #include "hevc_inter.h"
-#include "dynamic_governor.h"
-#include "cpu_simd_me.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -415,10 +408,6 @@ struct hevc_encoder {
     int16_t *mv_y_map;
     uint32_t last_frame_sad;
 
-    /* GPU compute motion vector readback for acceleration */
-    gpu_mv_t *gpu_mvs;
-    uint32_t num_gpu_mvs;
-
     /* Real per-4x4-luma-PU intra mode, for MPM derivation - one entry per
      * 4x4 position, persistent scratch (positional availability checks
      * gate every read, so stale cross-frame content is never read - see
@@ -467,14 +456,6 @@ struct hevc_encoder {
     size_t   slice_buf_cap;
     uint8_t *scratch_out;
     size_t   scratch_out_cap;
-
-    /* Dynamic asymmetric CPU/GPU load balancing governor & SIMD ME config */
-    dynamic_governor_t governor;
-    /* Frames the governor has told us to keep off the GPU, counted so one
-     * in every step_down_hysteresis can go anyway and bring back a
-     * measurement. See hevc_encoder_encode_frame(). */
-    uint32_t governor_skips;
-    cpu_simd_me_config_t me_cfg;
 
     /* libx265 CPU fallback encoder */
     hevc_x265_t *x265;
@@ -676,24 +657,18 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     enc->scratch_out_cap = luma_size + 131072;
     enc->scratch_out = malloc(enc->scratch_out_cap);
 
-    size_t num_mbs = (size_t)enc->width_ctu * enc->height_ctu;
-    enc->gpu_mvs = calloc(num_mbs, sizeof(gpu_mv_t));
-
     if (!enc->src_y || !enc->src_cb || !enc->src_cr ||
         !enc->recon_y || !enc->recon_cb || !enc->recon_cr ||
         !enc->prev_recon_y || !enc->prev_recon_cb || !enc->prev_recon_cr ||
         !enc->cu_skip_map || !enc->cu_is_inter || !enc->cu_depth || !enc->mv_x_map || !enc->mv_y_map ||
         !enc->luma_mode_map || !enc->dl_y || !enc->dl_uv ||
-        !enc->slice_rbsp || !enc->scratch_out || !enc->gpu_mvs ||
+        !enc->slice_rbsp || !enc->scratch_out ||
         !enc->hpel[0] || !enc->hpel[1] || !enc->hpel[2] || !enc->hpel[3] || !enc->hpel_tmp ||
         !enc->row_buf || !enc->row_len || !enc->row_sad || !enc->row_ctx || !enc->row_progress ||
         !enc->row_buf[enc->height_ctu - 1]) {
         hevc_encoder_destroy(enc);
         return NULL;
     }
-
-    dynamic_governor_init(&enc->governor);
-    cpu_simd_me_config_init(&enc->me_cfg, width, height);
 
     const char *hevc_backend = getenv("BC250_HEVC_BACKEND");
     if (hevc_backend && (strcmp(hevc_backend, "x265") == 0 || strcmp(hevc_backend, "cpu") == 0)) {
@@ -837,9 +812,12 @@ int hevc_encoder_get_bit_depth(const hevc_encoder_t *encoder)
     return encoder ? encoder->bit_depth : 8;
 }
 
+/* The encoder gives the GPU no work, so there is nothing for a governor to
+ * move off it: the tier is always the first. */
 int hevc_encoder_get_governor_tier(const hevc_encoder_t *encoder)
 {
-    return encoder ? (int)dynamic_governor_get_tier(&encoder->governor) : 0;
+    (void)encoder;
+    return 0;
 }
 
 void hevc_encoder_destroy(hevc_encoder_t *encoder)
@@ -858,7 +836,6 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     for (int i = 0; i < encoder->num_slices; i++) free(encoder->slice_buf[i]);
     free(encoder->slice_rbsp);
     free(encoder->scratch_out);
-    free(encoder->gpu_mvs);
     for (int i = 0; i < 4; i++) free(encoder->hpel[i]);
     if (encoder->row_buf)
         for (uint32_t r = 0; r < encoder->height_ctu; r++) free(encoder->row_buf[r]);
@@ -1668,7 +1645,6 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
 {
     if (!encoder || !output_buf) return -1;
 
-    encoder->num_gpu_mvs = 0;
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
     const bool ten_bit = encoder->bit_depth > 8;
 
@@ -1722,57 +1698,16 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
         if ((input_surface.format == GPU_IMAGE_P010) != ten_bit) return -1;
         if (fit_to_surface(encoder, input_surface.width, input_surface.height) != 0) return -1;
 
-        /* ⚠️ The governor's tiers mean something narrower here than in the
-         * H.264 encoder. The GPU's only job in this one is the motion
-         * search, so there is no reduced-search dispatch to fall back on:
-         * tiers 0 and 1 both run it, and tiers 2 and 3 do not run it at
-         * all. Not running it is already a complete fallback - the CPU
-         * search is what happens when num_gpu_mvs stays at zero, which is
-         * exactly the state an I frame is in. */
-        const governor_tier_t tier = dynamic_governor_get_tier(&encoder->governor);
-        bool use_gpu_me = (tier < GOV_TIER_2_CPU_OFFLOAD);
-
-        /* ⚠️ Not at ten bits. The motion search shader reads eight-bit
-         * luma, and all this encoder takes from it is the hint that a block
-         * has not moved; the CPU makes that decision on its own without it,
-         * which is what every I frame does anyway. */
-        if (ten_bit) use_gpu_me = false;
-
-        /* ⚠️ And that search is also the only thing that measures the GPU.
-         * Skipping it leaves the governor with no new latency, so the
-         * moving average never decays and the encoder would stay on the
-         * CPU for the rest of the stream. One frame in every
-         * step_down_hysteresis goes to the GPU anyway, purely to bring
-         * back a reading. */
-        if (!use_gpu_me && !ten_bit) {
-            const uint32_t every = encoder->governor.step_down_hysteresis;
-            encoder->governor_skips++;
-            use_gpu_me = every && (encoder->governor_skips % every == 0);
-        }
-
-        /* Run lightweight subgroup-accelerated GPU motion estimation on P-frames (~0.4ms) */
-        if (!is_idr && encoder->has_ref && use_gpu_me) {
-            gpu_compute_begin_picture(gpu_ctx, input_surface);
-            gpu_compute_dispatch_me_only(gpu_ctx, input_surface, (int)encoder->width, (int)encoder->height);
-            gpu_compute_end_picture(gpu_ctx);
-            gpu_compute_sync(gpu_ctx);
-            dynamic_governor_update(&encoder->governor,
-                                    gpu_compute_get_last_latency_ms(gpu_ctx));
-
-            void *mv_data = NULL;
-            size_t mv_size = 0;
-            if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0 && mv_data) {
-                size_t max_bytes = (size_t)encoder->width_ctu * encoder->height_ctu * sizeof(gpu_mv_t);
-                size_t copy_bytes = (mv_size < max_bytes) ? mv_size : max_bytes;
-                memcpy(encoder->gpu_mvs, mv_data, copy_bytes);
-                encoder->num_gpu_mvs = (uint32_t)(copy_bytes / sizeof(gpu_mv_t));
-            }
-        } else if (tier == GOV_TIER_3_FAILOVER && !is_idr && encoder->has_ref) {
-            /* One skipped frame is the whole emergency. Step back down so
-             * the next frame tries the GPU again instead of waiting for a
-             * measurement that can only come from trying. */
-            dynamic_governor_notify_failover_handled(&encoder->governor);
-        }
+        /* No motion search on the GPU. It used to run on every P picture,
+         * and the encoder waited for it, but nothing has read its vectors
+         * since the encoder searches with the real predictor on the CPU:
+         * the stream is the same to the byte without it. Through VA on a
+         * BC-250 that wait was 3 ms of the 22 a 1080p picture took, and
+         * under a game holding the GPU it can be the 16 ms the fence wait
+         * is bounded to. A picture written by the GPU (VideoProc) is
+         * complete when it gets here: gpu_compute_video_proc() waits for
+         * its own work, and an exported surface is waited for in
+         * va_backend.c before the encode. */
 
         /* The pitches are in bytes, and a P010 row is two bytes a sample. */
         const int pitch = (int)encoder->width * (ten_bit ? 2 : 1);
@@ -1800,8 +1735,6 @@ int hevc_encoder_encode_raw(hevc_encoder_t *encoder,
                             uint8_t *output_buf, size_t output_size)
 {
     if (!encoder || !output_buf || !y_plane || !uv_plane) return -1;
-
-    encoder->num_gpu_mvs = 0;
 
     /* A row is `width` samples; at ten bits a sample is two bytes. */
     const size_t row = (size_t)encoder->width * (encoder->bit_depth > 8 ? 2 : 1);

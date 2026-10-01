@@ -2644,19 +2644,44 @@ static void copy_from_wc_avx2(uint8_t *dst, const uint8_t *src, size_t n) {
 }
 #endif
 
-static void copy_from_wc(uint8_t *dst, const uint8_t *src, size_t n) {
+static int wc_has_avx2(void) {
 #if defined(__x86_64__) || defined(_M_X64)
-    static int ha_avx2 = -1;
-    if (ha_avx2 < 0) ha_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
-    if (ha_avx2) { copy_from_wc_avx2(dst, src, n); return; }
+    return __builtin_cpu_supports("avx2") ? 1 : 0;
+#else
+    return 0;
 #endif
+}
+
+static void copy_from_wc(uint8_t *dst, const uint8_t *src, size_t n, int avx2) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (avx2) { copy_from_wc_avx2(dst, src, n); return; }
+#endif
+    (void)avx2;
     memcpy(dst, src, n);
+}
+
+/* Even with MOVNTDQA one core reads WC memory at about 1.5 GB/s: what limits
+ * it is the core's handful of fill buffers, not the memory. A 1080p picture
+ * took 2 ms that way, a tenth of the whole HEVC encode through VA. Every
+ * core brings its own fill buffers, so the rows are split between threads. */
+#define WC_COPY_THREADS 8
+
+static void copy_plane_from_wc(uint8_t *dst, int dst_pitch,
+                               const uint8_t *src, VkDeviceSize src_pitch,
+                               size_t row, int rows) {
+    const int avx2 = wc_has_avx2();
+#ifdef _OPENMP
+    const int threads = rows >= 256 ? WC_COPY_THREADS : 1;
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int r = 0; r < rows; r++)
+        copy_from_wc(dst + (size_t)r * dst_pitch, src + (size_t)r * src_pitch, row, avx2);
 }
 
 /* Public wrapper: the H.264 path's shadow_copy() reads the same kind of
  * write-combining staging memory and was paying the same price. */
 void gpu_compute_copy_from_wc(void *dst, const void *src, size_t n) {
-    copy_from_wc((uint8_t *)dst, (const uint8_t *)src, n);
+    copy_from_wc((uint8_t *)dst, (const uint8_t *)src, n, wc_has_avx2());
 }
 
 int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
@@ -2693,15 +2718,10 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
       * chroma one is half as wide and twice as deep. */
     const size_t row = (size_t)width * (image->format == GPU_IMAGE_P010 ? 2 : 1);
 
-    const uint8_t *src_y = mapped + layout_y.offset;
-    for (int r = 0; r < height; r++) {
-        copy_from_wc(y_plane + (size_t)r * y_pitch, src_y + (size_t)r * layout_y.rowPitch, row);
-    }
-
-    const uint8_t *src_uv = mapped + uv_offset + layout_uv.offset;
-    for (int r = 0; r < height / 2; r++) {
-        copy_from_wc(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, row);
-    }
+    copy_plane_from_wc(y_plane, y_pitch, mapped + layout_y.offset, layout_y.rowPitch,
+                       row, height);
+    copy_plane_from_wc(uv_plane, uv_pitch, mapped + uv_offset + layout_uv.offset,
+                       layout_uv.rowPitch, row, height / 2);
 
     if (needs_unmap) {
         vkUnmapMemory(ctx->device, memory.memory);

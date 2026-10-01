@@ -1260,14 +1260,6 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
     starts[n_starts++] = mvp[1];
     for (int i = 0; i < 5; i++) starts[n_starts++] = cand[i];
     starts[n_starts].x = 0; starts[n_starts].y = 0; n_starts++;
-    {
-        const uint32_t ctu = ((uint32_t)cuy / 2) * enc->width_ctu + ((uint32_t)cux / 2);
-        if (enc->num_gpu_mvs > 0 && ctu < enc->num_gpu_mvs) {
-            starts[n_starts].x = (int16_t)enc->gpu_mvs[ctu].mvx;
-            starts[n_starts].y = (int16_t)enc->gpu_mvs[ctu].mvy;
-            n_starts++;
-        }
-    }
     int mvp_idx = 0;
     int64_t me_cost;
     uint32_t me_sad;
