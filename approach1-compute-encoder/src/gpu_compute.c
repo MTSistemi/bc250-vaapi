@@ -11,6 +11,7 @@
  * src/ uses the functions _GNU_SOURCE redefines (strerror_r, basename). */
 #define _GNU_SOURCE
 #include "gpu_compute.h"
+#include "worker_pool.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1737,6 +1738,8 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
 }
 
 void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
+    worker_pool_destroy(ctx->copy_pool);
+    ctx->copy_pool = NULL;
     if (!ctx->device) return;
 
     vkDeviceWaitIdle(ctx->device);
@@ -2666,16 +2669,25 @@ static void copy_from_wc(uint8_t *dst, const uint8_t *src, size_t n, int avx2) {
  * core brings its own fill buffers, so the rows are split between threads. */
 #define WC_COPY_THREADS 8
 
-static void copy_plane_from_wc(uint8_t *dst, int dst_pitch,
-                               const uint8_t *src, VkDeviceSize src_pitch,
-                               size_t row, int rows) {
-    const int avx2 = wc_has_avx2();
-#ifdef _OPENMP
-    const int threads = rows >= 256 ? WC_COPY_THREADS : 1;
-#pragma omp parallel for schedule(static) num_threads(threads)
-#endif
-    for (int r = 0; r < rows; r++)
-        copy_from_wc(dst + (size_t)r * dst_pitch, src + (size_t)r * src_pitch, row, avx2);
+typedef struct {
+    uint8_t *dst[2];
+    int dst_pitch[2];
+    const uint8_t *src[2];
+    VkDeviceSize src_pitch[2];
+    size_t row;
+    int rows_y;
+    int avx2;
+} wc_copy_job_t;
+
+/* Rows [begin, end) of the luma plane and then of the chroma one, counted
+ * as one run of rows. */
+static void copy_rows_from_wc(void *arg, int begin, int end) {
+    const wc_copy_job_t *j = arg;
+    for (int r = begin; r < end; r++) {
+        const int p = r >= j->rows_y, pr = p ? r - j->rows_y : r;
+        copy_from_wc(j->dst[p] + (size_t)pr * j->dst_pitch[p],
+                     j->src[p] + (size_t)pr * j->src_pitch[p], j->row, j->avx2);
+    }
 }
 
 /* Public wrapper: the H.264 path's shadow_copy() reads the same kind of
@@ -2718,10 +2730,20 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
       * chroma one is half as wide and twice as deep. */
     const size_t row = (size_t)width * (image->format == GPU_IMAGE_P010 ? 2 : 1);
 
-    copy_plane_from_wc(y_plane, y_pitch, mapped + layout_y.offset, layout_y.rowPitch,
-                       row, height);
-    copy_plane_from_wc(uv_plane, uv_pitch, mapped + uv_offset + layout_uv.offset,
-                       layout_uv.rowPitch, row, height / 2);
+    wc_copy_job_t job = {
+        .dst = { y_plane, uv_plane }, .dst_pitch = { y_pitch, uv_pitch },
+        .src = { mapped + layout_y.offset, mapped + uv_offset + layout_uv.offset },
+        .src_pitch = { layout_y.rowPitch, layout_uv.rowPitch },
+        .row = row, .rows_y = height, .avx2 = wc_has_avx2(),
+    };
+    const int rows = height + height / 2;
+    if (height >= 256 && atomic_exchange(&ctx->copy_busy, 1) == 0) {
+        if (!ctx->copy_pool) ctx->copy_pool = worker_pool_create(WC_COPY_THREADS);
+        worker_pool_for(ctx->copy_pool, rows, 32, copy_rows_from_wc, &job, WC_COPY_THREADS);
+        atomic_store(&ctx->copy_busy, 0);
+    } else {
+        copy_rows_from_wc(&job, 0, rows);
+    }
 
     if (needs_unmap) {
         vkUnmapMemory(ctx->device, memory.memory);
