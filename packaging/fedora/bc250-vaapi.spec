@@ -41,6 +41,11 @@ BuildRequires:  glslang
 %if %{with x264}
 BuildRequires:  pkgconfig(x264)
 %endif
+# HEVC through libx265, which also comes from RPM Fusion.
+%bcond_without x265
+%if %{with x265}
+BuildRequires:  pkgconfig(x265)
+%endif
 
 Requires:       libva
 Requires:       libdrm

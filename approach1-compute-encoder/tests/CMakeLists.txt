@@ -96,3 +96,12 @@ if(X264_FOUND)
     target_link_libraries(test_x264 PRIVATE bc250_drv_video ${X264_LINK_LIBRARIES} ${Vulkan_LIBRARIES} ${LIBVA_LIBRARIES} ${DRM_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} m)
     add_test(NAME X264BackendTest COMMAND test_x264)
 endif()
+
+# The libx265 backend, when the driver was built with it.
+if(X265_FOUND)
+    add_executable(test_x265 test_x265.c)
+    target_include_directories(test_x265 PRIVATE ../src ${X265_INCLUDE_DIRS})
+    target_link_libraries(test_x265 PRIVATE bc250_drv_video ${X265_LINK_LIBRARIES} ${Vulkan_LIBRARIES} ${LIBVA_LIBRARIES} ${DRM_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} m)
+    add_test(NAME X265BackendTest COMMAND test_x265)
+endif()
+

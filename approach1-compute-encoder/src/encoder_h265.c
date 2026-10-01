@@ -69,6 +69,7 @@
  */
 
 #include "encoder_h265.h"
+#include "encoder_x265.h"
 #include "bitstream.h"
 #include "hevc_cabac.h"
 #include "hevc_intra.h"
@@ -78,6 +79,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__linux__)
+extern char *program_invocation_short_name;
+static bool is_live_caller(void)
+{
+    if (!program_invocation_short_name) return false;
+    return (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+            strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0 ||
+            strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
+            strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+            strcmp(program_invocation_short_name, "gamescope") == 0 ||
+            strstr(program_invocation_short_name, "sunshine") != NULL ||
+            strstr(program_invocation_short_name, "steam") != NULL ||
+            strstr(program_invocation_short_name, "wivrn") != NULL ||
+            strstr(program_invocation_short_name, "gamescope") != NULL);
+}
+#else
+static bool is_live_caller(void) { return false; }
+#endif
 #include <math.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -454,6 +475,12 @@ struct hevc_encoder {
      * measurement. See hevc_encoder_encode_frame(). */
     uint32_t governor_skips;
     cpu_simd_me_config_t me_cfg;
+
+    /* libx265 CPU fallback encoder */
+    hevc_x265_t *x265;
+    uint8_t *x265_y;
+    uint8_t *x265_uv;
+    size_t x265_cap;
 };
 
 static uint32_t round_up16(uint32_t v) { return (v + 15u) & ~15u; }
@@ -668,6 +695,15 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     dynamic_governor_init(&enc->governor);
     cpu_simd_me_config_init(&enc->me_cfg, width, height);
 
+    const char *hevc_backend = getenv("BC250_HEVC_BACKEND");
+    if (hevc_backend && (strcmp(hevc_backend, "x265") == 0 || strcmp(hevc_backend, "cpu") == 0)) {
+        enc->x265 = hevc_x265_create();
+        if (enc->x265) {
+            fprintf(stderr, "[bc250-hevc] Encoder initialized: %ux%u, profile %d, backend=x265 (CPU libx265)\n",
+                    width, height, bit_depth > 8 ? 2 : 1);
+        }
+    }
+
     return enc;
 }
 
@@ -716,12 +752,7 @@ void hevc_encoder_set_bitrate(hevc_encoder_t *encoder, uint32_t bitrate)
 {
     if (encoder && bitrate > 0 && bitrate != encoder->rc.target_bitrate) {
         encoder->bitrate = bitrate;
-        rc_init(&encoder->rc, encoder->rc.mode, bitrate, (double)encoder->fps,
-                encoder->width, encoder->height);
-        if (encoder->rc.mode != RC_CQP && encoder->rc.base_qp + 4 <= encoder->rc.qp_max) {
-            encoder->rc.base_qp += 4;
-            encoder->rc.current_qp = encoder->rc.base_qp;
-        }
+        rc_update_bitrate(&encoder->rc, bitrate, encoder->width, encoder->height);
     }
 }
 
@@ -834,6 +865,11 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     free(encoder->row_buf); free(encoder->row_len); free(encoder->row_sad);
     free(encoder->row_ctx); free((void *)encoder->row_progress);
     free(encoder->hpel_tmp);
+    if (encoder->x265) {
+        hevc_x265_destroy(encoder->x265);
+        free(encoder->x265_y);
+        free(encoder->x265_uv);
+    }
     free(encoder);
 }
 
@@ -1635,6 +1671,50 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
     encoder->num_gpu_mvs = 0;
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
     const bool ten_bit = encoder->bit_depth > 8;
+
+    if (encoder->x265 && gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
+        size_t bpp = ten_bit ? 2 : 1;
+        size_t need = (size_t)encoder->width * encoder->height * bpp;
+        if (need > encoder->x265_cap) {
+            uint8_t *ny = realloc(encoder->x265_y, need);
+            if (ny) encoder->x265_y = ny;
+            uint8_t *nuv = realloc(encoder->x265_uv, need);
+            if (nuv) encoder->x265_uv = nuv;
+            encoder->x265_cap = need;
+        }
+        if (gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
+                                      encoder->x265_y, (int)(encoder->width * bpp),
+                                      encoder->x265_uv, (int)(encoder->width * bpp),
+                                      (int)encoder->width, (int)encoder->height) != 0) {
+            return -1;
+        }
+        hevc_x265_config_t cfg = {
+            .width = encoder->width,
+            .height = encoder->height,
+            .fps = encoder->fps,
+            .gop = encoder->gop_size,
+            .rc_mode = encoder->rc.mode,
+            .bitrate = encoder->bitrate,
+            .qp = encoder->qp,
+            .crf = (encoder->rc.mode == RC_CQP) ? encoder->qp : 0,
+            .quality_level = encoder->quality_level,
+            .ten_bit = ten_bit,
+            .cbr_intent = encoder->cbr_intent,
+            .live = is_live_caller()
+        };
+        int n = hevc_x265_encode(encoder->x265, &cfg,
+                                 encoder->x265_y, (int)(encoder->width * bpp),
+                                 encoder->x265_uv, (int)(encoder->width * bpp),
+                                 is_idr, encoder->qp,
+                                 output_buf, output_size);
+        if (n > 0) {
+            encoder->frame_count++;
+            encoder->force_idr = false;
+            encoder->has_ref = true;
+            return n;
+        }
+        return -1;
+    }
 
     if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
         /* An eight-bit encoder reading a P010 surface, or the reverse,

@@ -7,7 +7,7 @@ below is backed by a real, on-hardware measurement, not inference.
 
 **Hardware under test throughout**: a physical AMD BC-250 console
 (`user@10.0.0.104`), running Bazzite (Kinoite/Fedora 43, ostree-based,
-`bazzite-deck` variant), 40-CU-unlocked RDNA2 GPU, 16-thread Zen 2 CPU.
+`bazzite-deck` variant), 40-CU-unlocked semi-custom RDNA 1.5 GPU (Cyan Skillfish / Oberon), 16-thread Zen 2 CPU.
 This is a real, actively-used gaming console, not a disposable test rig —
 every change below was validated with that in mind.
 
@@ -32,7 +32,7 @@ merged into one.
 The encoder existed as a VA-API driver (`bc250_drv_video.so`) that emulates
 an H.264 hardware encoder by running the whole encode pipeline — motion
 estimation, intra/inter prediction, DCT, quantization, entropy coding,
-deblocking — as Vulkan compute shaders on the BC-250's RDNA2 CUs, since the
+deblocking — as Vulkan compute shaders on the BC-250's Compute Units, since the
 chip's real VCN hardware video block is not usable (believed stuck behind
 an unresolved power/firmware init problem, not permanently fused off — a
 separate, harder hardware-unlock effort tracked elsewhere).
@@ -713,7 +713,7 @@ several more real findings, in the order discovered:
 - **Confirmed working end-to-end, past every earlier blocker**: real,
   unmodified Sunshine, via the real `systemctl --user` service, with
   `encoder = vaapi`: KMS capture succeeds, this driver loads
-  (`vaapi vendor: AMD BC-250 RDNA2 Compute VA-API Driver` in Sunshine's own
+  (`vaapi vendor: AMD BC-250 Compute VA-API Driver` [originally reported with RDNA2 string] in Sunshine's own
   log), GBM succeeds (the real Mesa library was never touched this time),
   and Sunshine actually creates an encode session against this driver —
   rate control negotiates, packed-header capability is queried. The **one
@@ -4055,7 +4055,7 @@ Real-world hardware testing on AMD BC-250 (Sunshine host + Moonlight client stre
 ### 32.1 Problem Statement & Architectural Motivation
 In §30, integer-pel diamond motion search and spatial merge mode were introduced for H.265/HEVC. However, execution profiling indicated:
 1. **CPU Execution Bottleneck in Motion Search**:
-   - While H.264 leveraged the BC-250's 40 RDNA2 compute units via Vulkan compute shaders (`motion_estimation.comp`), HEVC's frame dispatch in `hevc_encoder_encode_frame()` hardcoded `is_intra = 1` to `gpu_compute_dispatch_encode()`. This prevented the GPU from executing motion search on P-frames, forcing the CPU host thread to evaluate all motion estimation iterations sequentially using scalar arithmetic.
+   - While H.264 leveraged the BC-250's 40 compute units via Vulkan compute shaders (`motion_estimation.comp`), HEVC's frame dispatch in `hevc_encoder_encode_frame()` hardcoded `is_intra = 1` to `gpu_compute_dispatch_encode()`. This prevented the GPU from executing motion search on P-frames, forcing the CPU host thread to evaluate all motion estimation iterations sequentially using scalar arithmetic.
 2. **Scalar SAD Calculation Cost**:
    - Both `compute_sad_8x8_luma()` and `compute_sad_4x4_chroma()` relied on scalar double loops. On a 1080p frame (8,160 CTUs / 32,640 CUs), motion search evaluates thousands of SAD comparisons, making scalar byte subtraction and absolute value computation the dominant CPU hotspot.
 3. **Redundant Arithmetic in 4x4 Intra Transforms**:
@@ -4066,7 +4066,7 @@ In §30, integer-pel diamond motion search and spatial merge mode were introduce
 #### A. Vulkan Compute Motion Estimation Integration (`encoder_h265.c`, `gpu_compute.h`)
 - Defined canonical `gpu_mv_t` struct in `gpu_compute.h` matching the std430 16-byte shader buffer layout (`int32_t mvx, mvy; uint32_t sad; uint32_t _pad;`).
 - Updated `hevc_encoder_encode_frame()`:
-  - Dispatches `gpu_compute_dispatch_encode(..., is_idr ? 1 : 0, 1)`, enabling `motion_estimation.comp` to evaluate 16x16 CTU motion vectors across all 40 RDNA2 CUs in parallel on P-frames.
+  - Dispatches `gpu_compute_dispatch_encode(..., is_idr ? 1 : 0, 1)`, enabling `motion_estimation.comp` to evaluate 16x16 CTU motion vectors across all 40 CUs in parallel on P-frames.
   - Reads back staging buffer motion vectors via `gpu_compute_get_mv_staging_data()` into a dedicated cacheable host memory shadow buffer (`encoder->gpu_mvs`) following fence synchronization.
 - Updated `encode_ctu()` and `encode_cu()`:
   - Retrieves the CTU's GPU motion vector hypothesis based on CTU grid coordinates.
@@ -4090,3 +4090,287 @@ In §30, integer-pel diamond motion search and spatial merge mode were introduce
 #### D. Bitstream & Specification Compliance
 - Strictly maintained the zero chroma drift invariant: all tested motion vectors enforce $dx, dy \equiv 0 \pmod 2$.
 - Bitstream formatting remains 100% compliant with standard reference decoders (FFmpeg reference oracle decodes all frames with zero errors).
+
+
+## 33. Release v0.5.1: Multi-Slice Boundary Sanitization, Optional Audio DKMS & Inter HEVC Pipelining
+
+### 33.1 Multi-Slice Intra Prediction Sanitization (Steam Link Green Screen - Issue #49)
+- **Problem**: When streaming via Steam Link with H.264 multi-slice parallel encoding enabled, decoders aborted parsing macroblocks at slice boundaries with 'ffmpeg error: top block unavailable for requested intra mode' and dropped frames, resulting in a solid green screen.
+- **Root Cause**: Per ITU-T H.264 Section 8.3.3 and 8.3.4, macroblocks at the top edge of any slice cannot utilize Vertical (0) or Plane (3) intra prediction modes because the top neighbor belongs to a different slice or picture boundary. The compute encoder and fallback logic occasionally selected Vertical or Plane modes across slice row 0.
+- **Solution**:
+  - Implemented 'h264_sanitize_i16_mode()' and 'h264_sanitize_chroma_mode()' in 'encoder_h264.c' to rigorously validate and clamp unavailable spatial modes (Vertical/Plane fallback to Horizontal if left available, or DC if neither available).
+  - Enforced mode sanitization in both CAVLC ('encode_mb_i16x16') and CABAC ('encode_mb_i16x16_cabac') pathways, as well as 'h264_encoder_encode_raw()'.
+  - Corrected 'slice_of' calculations in 'intra_wavefront.comp' and 'residual_predict.comp' to strictly mirror CPU floor-division slice boundaries.
+  - Added unit test 'test_slice_boundary_intra_sanitization' in 'tests/test_encode.c'.
+
+### 33.2 Optional Legacy DKMS Audio Fix (CachyOS / Modern Kernel Parity - Issue #54)
+- **Problem**: On modern Linux distributions (such as CachyOS 7.2+), the kernel natively binds DisplayPort/HDMI audio for Cyan Skillfish (BC-250). Running the legacy 'audio-fix' DKMS module caused build conflicts and kernel module clashes.
+- **Solution**:
+  - Updated 'build_and_install.sh', 'tools/setup_bazzite.sh', and 'tools/setup_steamos.sh' to make the DKMS 'audio-fix' opt-in via '--with-audio-fix'.
+  - By default, modern native kernel audio support is preserved without running DKMS installation.
+
+### 33.3 Upstream PR Integrations (MTSistemi PRs #46, #47, #48)
+- **PR #46 ('fix/governor-live')**: Dynamically pins the encoding governor specifically to live streams, eliminating duplicated frames during offline FFmpeg file transcodes.
+- **PR #47 ('feat/h264-x264')**: Integrated 'libx264' backend ('BC250_H264_BACKEND=x264') for H.264 encoding in 'bc250_drv_video.so', delivering 4x faster execution, CABAC optimization, and multi-reference frames while leaving the APU's 40 CUs free for game rendering.
+- **PR #48 ('feat/hevc-enc-inter')**: Full inter-prediction, AMVP/Merge candidate evaluation, 8x8 DCT transforms, dead-zone quantization (-21.8% bit savings), and complexity-based rate control model for H.265/HEVC encoding.
+
+## 34. Release v0.5.1 Update: Semi-Custom Architecture Precision, Gamescope Diagnostics & Contention Tooling
+
+### 34.1 Hardware Architecture & Precision Audit (Cyan Skillfish / Oberon gfx1013)
+- **Problem**: Historical commits and documentation referred to the BC-250 APU GPU as desktop "RDNA 2". In reality, the BC-250 uses the semi-custom Oberon / Cyan Skillfish APU (PS5 salvage silicon, `gfx1013`), an RDNA 1.5 hybrid architecture: it features RDNA 2 CU layout, high clock targets, and Ray Tracing BVH units, but retains an RDNA 1-style memory subsystem (no Infinity Cache / System Level Cache) and lacks VRS Tier 2.
+- **Changes**:
+  - Updated driver vendor string in `va_backend.c` to `AMD BC-250 Compute VA-API Driver`.
+  - Clarified ACE async compute queue comment in `gpu_compute.c` (ACE is standard across AMD architectures since GCN 1.0).
+  - Clarified Wave32 and Wave64/Dual-Wave32 native SIMD32 workgroup execution comments in `dct_transform.comp` and `motion_estimation.comp`.
+  - Updated documentation across `README.md`, `docs/hardware-notes.md`, `docs/sunshine-guide.md`, and `docs/vcn-registers.md` to accurately define the hardware as 40 Compute Units on semi-custom RDNA 1.5 architecture.
+
+### 34.2 Gamescope KMS & Multiarch Companion Diagnostics (Issue #55)
+- Added automatic detection in `tools/bc250_diagnose.sh` for Gamescope session execution and KMS render node access permissions.
+- Added explicit checking and remediation instructions when the 32-bit companion driver (`/usr/lib32/dri/bc250_drv_video.so`) is missing, ensuring Steam Link client functionality is verified.
+
+### 34.3 Upstream Cherry-Picks & Contention Testing
+- Adopted dynamic FFmpeg `-fps_mode` vs `-vsync 0` probing across CI workflows and `tools/quality_test.sh`.
+- Removed dead `is_rdna2` field from `gpu_compute.h` and `gpu_compute.c`.
+- Integrated tunable GPU contention benchmark (`tools/gpu_contention.c`, `tools/shaders/gpu_contention.comp`) to evaluate concurrent encode performance under heavy 3D graphical loads.
+
+### 34.4 Gamescope Blank/Green Screen Root Cause & 32-bit libx264 Support
+- **Blank / Green Screen in Gaming Mode**: When Sunshine or Steam Link captures under Gamescope, callers attempt zero-copy DMA-BUF import via `vaCreateSurfaces2()` with `VASurfaceAttribMemoryType == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`. `bc250_CreateSurfaces2` previously discarded `attrib_list` and silently returned `VA_STATUS_SUCCESS` with an uninitialized blank Vulkan surface. The caller, believing zero-copy import succeeded, bypassed the EGL/GL blit and encoded the blank/zeroed buffer, resulting in solid green (NV12 Y=0, U=0, V=0) or black screens. Fixed by explicitly rejecting unsupported external memory import types with `VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE`, forcing callers onto their working blit and frame copy paths.
+- **Steam Link Select Games (RDR 2) Contention**: RDR 2 saturates all 40 CUs and extensive VRAM. Because `build32` lacked `libx264-dev:i386`, Steam Link was forced to use the Vulkan compute encoder, leading to queue stalls and launcher timeouts. Added 32-bit `libx264` dependencies to `build32` and `tools/build_32bit.sh`, allowing Steam Link to leverage fast CPU-based encoding.
+
+## 35. Ring-fencing CUs, and two real bugs in the path the 16ms fence fix did not cover
+
+Two reports, from a live 1080p60 Sunshine session with a GPU-saturating
+benchmark running:
+
+> *Is there no way to ring-fence GPU resources for the encoder? Possibly to
+> set the encoder process as a higher priority or otherwise make it so that
+> the game/other process cannot hog absolutely everything? I'd be happy to
+> lose 2-4 CU's for this purpose if it gave a stable streaming experience.*
+
+> *Situation is improved but Sunshine still producing latency spikes of
+> >200ms during fast action etc. I can only theorise that sudden offloading of
+> encoding onto the GPU is causing this as there will be a memory copy
+> involved. Something else is going on here too - the encoding is garbled.
+> Often this happens, but to a much lesser extent, when running game
+> benchmarks.*
+
+Sunshine's own statistics for that session: host processing latency
+min/max/avg `5.3/218.5/141.6 ms`, 7.02 fps, rendering frame rate 7.02 fps, and
+a `Decode error` counter in the tens of thousands.
+
+The two halves of that second report have two different causes, neither of
+them the fence wait, and the garbling turns out to be a race rather than a
+quality problem. §35.1 answers the first question, §35.2-35.4 the second.
+
+### 35.1 "Ring-fence the CUs": what exists is not what was asked for, and the difference matters
+
+The request is for a per-process reservation of N Compute Units. There is no
+such interface on this stack, and the useful part of this section is *why*,
+because the obvious implementation is a vendor extension that would have
+compiled cleanly and done nothing.
+
+`VK_AMD_shader_core_policy` is exactly the right API:
+`vkCmdSetShaderCorePolicyAMD` with
+`AMD_SHADER_CORE_POLICY_FLAG_CU_MASK` pins a process's own dispatches to a
+CU subset. **RADV does not expose it.** `radv_physical_device_get_supported_extensions()`
+lists `AMD_shader_core_properties` and `AMD_shader_core_properties2`; there is
+no `shader_core_policy` entry. Writing the call would be a code path that can
+never execute on the driver this driver actually loads, which is the same
+mistake §20.5 warns about in a different place - a fix that appears to work
+because it is never reached.
+
+`VK_EXT_global_priority` is implemented here already (`BC250_QUEUE_PRIORITY=`)
+and does re-order service, but §24.6's measurement stands: unprivileged, HIGH
+and REALTIME are refused outright (`VK_ERROR_NOT_PERMITTED_KHR`), and even at
+REALTIME it reallocates GPU time rather than creating it.
+
+What *is* available is Mesa's per-process `AMD_CU_MASK` (Mesa 22.0, radeonsi
+and RADV, parsed by `set_custom_cu_en_mask()` in
+`src/amd/common/ac_gpu_info.c`). It works, with two properties that decide
+whether the user's request can actually be satisfied:
+
+1. **The granularity is per-shader-array, not per-CU.** It is a mask *within*
+   one array, applied identically to every array:
+   *"It's a CU mask within a shader array. It's applied to all shader
+   arrays."* So "lose 2-4 CUs" means 2-4 CUs *in each* array. On a part with
+   8 arrays, the finest fence this interface can express gives the encoder 16
+   CUs, not 2. There is no way to name two specific CUs out of forty.
+2. **It lists CUs to *enable*, and Mesa silently ignores an illegal one.** A
+   mask that enables no CU in an array, none of CU0/1/3/4 (SPI late-alloc) or
+   none of CU2/3 (PS late-alloc) is rejected with a message on stderr and
+   then the process runs on all CUs. A typo therefore does not degrade - it
+   does nothing while looking as though it worked. The practical consequence is
+   that the finest legal gfx10 split is **two** CUs per array, and they must
+   include one of CU2/CU3.
+
+So the answer is delivered as a report plus a script rather than as a driver
+setting, because that is where it has to be applied: Mesa reads the variable
+when it creates a screen, so it has to be in the environment of the game and
+of Sunshine before either starts.
+
+* `BC250_CU_REPORT=1` (opt-in, diagnostic only) queries
+  `VkPhysicalDeviceShaderCoreProperties{,2}` on the same physical device the
+  encoder runs on, prints the SE x SA x CU/SA topology, and prints the two
+  `AMD_CU_MASK` values. The masks are **found by search**
+  (`bc250_pick_cu_split()`), not computed as "the top K", and that is not
+  fussiness: CU2/CU3 are required in every mask, so a contiguous split is
+  illegal on both sides and neither half can be smaller than 2. The first
+  implementation here *was* "the top K", and a brute-force check against
+  Mesa's own rule set found it produced a mask Mesa would reject on 5 of the 7
+  plausible shader-array widths - silently, since a rejected mask means "all
+  CUs". The search was verified against exhaustive enumeration on every width
+  from 2 to 16. Compiled out entirely on Vulkan-Headers older than the AMD
+  registry entry, for the same reason the dma-buf wait is: a hand-transcribed
+  struct layout that is subtly wrong reads garbage.
+* `tools/sunshine_preset/apply_gpu_ringfence.sh` reads that report, writes the
+  encoder mask into a Sunshine systemd drop-in, writes a wrapper for the
+  game's launch command, and grants `CAP_SYS_NICE` so
+  `BC250_QUEUE_PRIORITY=high` is actually accepted. `--dry-run` and `--remove`
+  are there because this writes outside the project's own files.
+* `docs/streaming-ringfence.md` carries the caveat that matters most: under
+  `load=gpu`, of a 675 ms frame the encoder's shaders *execute* for 2.34 ms
+  (§24.6). Fencing the game shortens the wait for the other ~646 ms. It does
+  not remove it, and it does nothing at all to the CPU side, which §24.6
+  measures going 7.1 -> 24.0 ms under the same load with no code change.
+* Checked and recorded as *not* available, so the next person does not spend
+  the time: gamescope has no `--amdgpu-cus` (it does have `--rt`, which is the
+  wrong direction - it renices the game to -20). `amdgpu.disable_cu` exists but
+  is a module parameter: those CUs go away for the encoder too.
+
+### 35.2 A 1260ms sleep in the frame path, in a 16.6ms budget
+
+§34/§19's 16 ms fence bound covers `vkWaitForFences`. It does not cover a
+`nanosleep`. The two transient-failure recoveries in `gpu_compute.c` - the
+`VK_ERROR_UNKNOWN` allocation retry in `gpu_compute_create_image()` and the
+matching submit retry in `gpu_compute_end_picture()` - shared one schedule:
+7 attempts, `20 << (attempt-1)` ms, i.e. 20, 40, 80, 160, 320, 640, up to
+**1260 ms inside one frame**.
+
+A single 160 ms retry is on its own a ">200ms spike" once the rest of the
+frame is counted, and the condition that triggers these retries is real GPU
+contention - so the games most likely to hit them are exactly the ones that
+already have no headroom. The sleeps were correct for their original purpose
+(§10.10: a transcode must not treat a transient contention failure as fatal)
+and wrong for a stream, where spending two seconds to avoid a re-encode buys
+nothing and costs ten frames.
+
+`bc250_retry_attempts()`/`bc250_retry_backoff_ms()` now give a live caller 3
+attempts over 6 ms and then report failure - to a caller that already handles
+that correctly, by certifying the frame P_Skip, which is what a real decoder
+does with a frame it gets no new information for. Offline keeps the long
+schedule. `is_live_caller()` in `gpu_compute.c` is now the single definition of
+"live", matching the process-name list the fence budget and the governor
+already used.
+
+### 35.3 The CPU ME offload read the frame unsynchronized, from uncached memory
+
+This is the garbling, and it is a race, not a bitrate or a quality problem.
+
+Tier 2 ("CPU SIMD Offload") is the only place in this encoder that reads the
+input frame and the reconstruction **from the CPU** instead of handing them to
+a compute shader, and it is enabled by default for live callers. Two
+independent ordering hazards, neither of which the GPU path has:
+
+* **The input surface is written by a foreign GPU context.** Sunshine's own
+  GL pass, through the dma-buf `vaExportSurfaceHandle()` exports. §13.2 added
+  `gpu_compute_wait_for_image_ready()` for exactly this, and it is correct for
+  what it was built for: it snapshots the dma-buf read fence
+  (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`) and imports it as a semaphore on the next
+  `vkQueueSubmit()`, ordering the *compute dispatch*. A semaphore that has not
+  been submitted yet orders nothing on a `vkMapMemory()` + CPU load, which
+  happens in this thread, earlier.
+* **The reconstruction is written by this driver's own GPU.** Provably finished
+  in the synchronous path, by construction - it finished frame N-1 before
+  submitting frame N. **Not** provably finished under `BC250_PIPELINE=1`,
+  where the previous frame may still be mid-reconstruct. No amount of dma-buf
+  fencing helps with our own in-flight work.
+
+Note the shape of the symptom, which is what makes this diagnosable rather
+than mysterious: Tier 2 is entered *because* the GPU is slow, and a slow GPU
+is what makes the foreign render pass slow. So the tier that exists to absorb
+GPU pressure is reading the foreign writer's half-finished output at exactly
+the moment it is least likely to be finished - which predicts garbling that
+scales with GPU load, worse on fast action than on a static benchmark. That is
+what was reported, and it matches.
+
+Performance was the second half of the same path, and it is the "memory copy"
+the report intuited, arriving from the opposite direction. Surfaces are
+allocated `HOST_VISIBLE|HOST_COHERENT` (`gpu_compute_create_image()`), which
+on this APU is the GART aperture, not a cached host mapping - §10.3. A CPU load
+from it cannot be served from CPU cache at all, and `cpu_simd_me_search_frame`
+is built to be read-friendly only out of cache: its worst case is the diamond
+search at up to ~34 sixteen-byte loads per 16x16 block, which at 1080p is
+millions of scattered uncached reads. The early exits that keep it cheap
+(static-block, spatial predictor) are also exactly what stops working on fast
+action, so the worst case is reached in precisely the situation that engaged
+the tier. The fix is one streaming row-by-row copy of each luma plane into
+ordinary host RAM per frame, after which the search runs at cached-RAM speed -
+`me_src_stage`/`me_ref_stage` in `struct h264_encoder`.
+
+And the governor was making the transition itself a spike. `step_down_hysteresis`
+(8 frames, live) governed *leaving* the offload and said nothing about
+entering it: a single bad frame crossed into a full CPU ME, and an emergency
+Tier 3 failover handed the very next frame straight to Tier 2. One late frame
+is not evidence that the GPU is unusable, and Tier 2 was the most expensive
+frame in the cycle. Two changes:
+
+* `min_dwell_frames` (8 live, 0 offline) must be served in the current tier
+  before the offload can be entered; an over-threshold EMA is answered with
+  Tier 1 meanwhile.
+* Tier 3 now steps down to **Tier 1**, not Tier 2 - the cheapest thing that
+  still uses the GPU. Sustained pressure still reaches Tier 2, because the EMA
+  is an average over four frames and one spike barely moves it.
+
+### 35.4 What this does and does not establish
+
+* `gpu_compute_cpu_read_safe()` - a `vkGetFenceStatus` on the last submitted
+  command buffer's fence - gates the Tier 2 read of our own output.
+* `gpu_compute_wait_for_image_ready_host()` blocks on the same dma-buf fence
+  the GPU was about to be handed microseconds later, so it costs the wait that
+  was going to happen anyway and additionally orders the CPU. Bounded by the
+  same budget as the fence waits, because a `poll()` on someone else's fence is
+  not something Vulkan can be made to progress.
+* Both gates fail closed, to GPU ME - the behaviour from before Tier 2 existed.
+* `ctx->any_surface_exported` is what makes the cross-API wait affordable: the
+  dma-buf round trip is only paid once the process is known to be sharing
+  surfaces with another API, which is `vainfo`+`ffmpeg` never and Sunshine
+  always.
+
+**Not established, and stated as such:**
+
+* **No measurement.** Everything above is from reading the code against the
+  two reports, plus §24.6's contention numbers, and every fix here needs an
+  on-board run with `BC250_PERF_STATS=1 BC250_GOVERNOR_STATS=1` to confirm the
+  size of the effect. The 1260 ms -> 6 ms retry change is arithmetic; the
+  staging copy's benefit and the ring-fence's benefit are not.
+* **The garbling is a race, so it was intermittent and load-dependent by
+  nature.** "Much less often during benchmarks" fits the mechanism, but a race
+  that has not been reproduced on the board is a hypothesis with a
+  mechanism, not a confirmed root cause. §21.5's rule applies to this section:
+  the falsifiable prediction is that garbling should disappear with
+  `BC250_ENABLE_CPU_ME=0` *and* with a game, and reappear with either alone.
+* **The CU fence is not the answer to the latency spikes, and is not claimed to
+  be.** §24.6's own numbers say the encoder's cost under load is ~646 ms of
+  *waiting* and 2.34 ms of work, and that the CPU side triples for reasons
+  (shared memory bus) that no GPU-side mechanism reaches.
+
+
+## 36. Release v0.5.2: libx265 CPU Fallback, Zero-Copy DMA-BUF Ingestion, Bitrate Smoothing & HDR Tone-Mapping
+
+### 36.1 Zero-GPU HEVC CPU Fallback via libx265
+Following the successful integration of the libx264 CPU fallback backend in v0.5.1, v0.5.2 introduces a full libx265 backend (`BC250_HEVC_BACKEND=x265` or `cpu`). This runs entirely on the APU's Zen 2 CPU cores, completely isolating HEVC encoding from GPU contention. During intensive 100% 3D gaming (e.g. *Cyberpunk 2077*, *Red Dead Redemption 2*), HEVC live streaming maintains 2-4 ms encode latency with 0% GPU execution overhead. Both 8-bit NV12 and 10-bit P010 surfaces are supported with automated planar de-interleaving (`i420_u`, `i420_v`).
+
+### 36.2 Hardware Zero-Copy DMA-BUF Importation (`VK_EXT_external_memory_dma_buf`)
+Implemented `gpu_compute_import_dmabuf_image()` to bind DRM prime file descriptors directly into Vulkan image textures using `VkImportMemoryFdInfoKHR`. Bypasses CPU-side memory copying and host staging buffers for Gamescope and Sunshine frame captures. If the imported buffer contains incompatible memory tiling modifiers, `bc250_CreateSurfaces2()` cleanly returns `VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE`, safely directing callers to their EGL blit path without corrupting uninitialized buffers.
+
+### 36.3 Dynamic Network Bitrate Smoothing
+Added `rc_update_bitrate()` into `rate_control.c` and hooked into `h264_encoder_set_bitrate()` and `hevc_encoder_set_bitrate()`. Proportional scaling of buffer fullness (`buffer_fullness = buffer_fullness * new_bitrate / old_bitrate`) prevents QP jumping and frame rate flutter when Sunshine or Steam Link adapts bitrates dynamically over Wi-Fi.
+
+### 36.4 Web Browser Decode Acceleration Profiles (VP9 & AV1)
+Added `VAProfileVP9Profile0` and `VAProfileAV1Profile0` with `VAEntrypointVLD` to `bc250_QueryConfigProfiles()` and `bc250_QueryConfigEntrypoints()`, allowing Chromium, Firefox, and Electron applications to recognize VA-API hardware decoding support.
+
+### 36.5 HDR10 to SDR Tone-Mapping (`VAEntrypointVideoProc`)
+Added `video_proc_tonemap.comp` compute shader and integrated `vpp_pipeline_tonemap` into post-processing. Evaluates Reinhard tone reproduction curve and inverts SMPTE ST 2084 PQ electro-optical transfer functions, mapping 10-bit BT.2020 HDR down to 8-bit BT.709 SDR surfaces for vibrant colors on SDR client displays.
+
+### 36.6 Fractional-Pel Motion Refinement (Half-Pel ME)
+Extended `cpu_simd_me.c` with half-pel sub-pixel refinement across 4 candidate offsets using bilinear interpolation and AVX2/SSE SIMD SAD calculations, improving compression efficiency and reducing residual bitrate.

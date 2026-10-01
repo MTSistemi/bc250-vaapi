@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <string.h>
 #include <assert.h>
@@ -23,12 +25,14 @@
 #include "encoder_h265.h"
 #include "hevc_intra.h"
 
-/* Create for writing with an explicit mode: fopen would ask for 0666
- * and let the umask decide, which is what CodeQL's
- * cpp/world-writable-file-creation is about. */
-static FILE *fdopen_w(const char *path)
+/* Create the test's stream file 0600 and refuse a symbolic link at its name.
+ * The fallback is /tmp, which anybody can write to: a link planted there with
+ * this name would otherwise make the test write through it, and fopen(...,
+ * "wb") would also leave the mode to the umask (CodeQL
+ * cpp/world-writable-file-creation). */
+static FILE *fopen_wb(const char *path)
 {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return NULL;
     FILE *f = fdopen(fd, "wb");
     if (!f) close(fd);
@@ -136,9 +140,9 @@ static void test_multi_frame_gop(void) {
     uint8_t *out_buf = malloc(out_cap);
     assert(out_buf != NULL);
 
-    FILE *f = fdopen_w("bc250_test_stream.hevc");
+    FILE *f = fopen_wb("bc250_test_stream.hevc");
     if (!f) {
-        f = fdopen_w("/tmp/bc250_test_stream.hevc");
+        f = fopen_wb("/tmp/bc250_test_stream.hevc");
     }
     if (!f) {
         fprintf(stderr, "[test_hevc_encode] Warning: could not open output stream file for writing, proceeding in memory\n");

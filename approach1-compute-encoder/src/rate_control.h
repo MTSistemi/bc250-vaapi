@@ -65,6 +65,7 @@ typedef struct {
 
 void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
              uint32_t width, uint32_t height);
+void rc_update_bitrate(rate_control_t *rc, uint32_t bitrate, uint32_t width, uint32_t height);
 int rc_get_frame_qp(rate_control_t *rc, uint64_t est_sad);
 void rc_update_stats(rate_control_t *rc, int bits_used);
 

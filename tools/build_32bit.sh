@@ -76,18 +76,36 @@ elif command -v pacman >/dev/null 2>&1; then
     run $SUDO pacman -S --needed --noconfirm \
         lib32-libva lib32-libdrm lib32-vulkan-icd-loader lib32-gcc-libs \
         || die "pacman failed to install the 32-bit libraries"
-    ok "Arch/CachyOS 32-bit libraries present"
+
+    # lib32-x264 is an AUR package on standard Arch Linux (or found in custom repos like CachyOS).
+    # Try installing it if available, but do not fail the build if absent since CMake will
+    # gracefully fall back to the compute encoder if lib32-x264 is omitted.
+    if pacman -Si lib32-x264 >/dev/null 2>&1; then
+        run $SUDO pacman -S --needed --noconfirm lib32-x264 2>/dev/null || true
+    elif command -v paru >/dev/null 2>&1; then
+        paru -S --needed --noconfirm lib32-x264 2>/dev/null || true
+    elif command -v yay >/dev/null 2>&1; then
+        yay -S --needed --noconfirm lib32-x264 2>/dev/null || true
+    fi
+
+    if pacman -Qi lib32-x264 >/dev/null 2>&1 || PKG_CONFIG_LIBDIR=/usr/lib32/pkgconfig pkg-config --exists x264 2>/dev/null; then
+        ok "Arch/CachyOS 32-bit libraries present (including lib32-x264)"
+    else
+        ok "Arch/CachyOS base 32-bit libraries present"
+        warn "lib32-x264 not installed. The 32-bit driver will build with the GPU compute encoder."
+        warn "For x264 software offload in 32-bit Steam Link, install: 'paru -S lib32-x264' or 'yay -S lib32-x264'"
+    fi
 elif command -v dnf >/dev/null 2>&1; then
     run $SUDO dnf install -y \
         glibc-devel.i686 libgcc.i686 libgomp.i686 \
-        libva-devel.i686 libdrm-devel.i686 vulkan-loader-devel.i686 \
+        libva-devel.i686 libdrm-devel.i686 vulkan-loader-devel.i686 x264-devel.i686 \
         || die "dnf failed to install the i686 libraries"
     ok "Fedora i686 libraries present"
 elif command -v apt-get >/dev/null 2>&1; then
     run $SUDO dpkg --add-architecture i386
     run $SUDO apt-get update
     run $SUDO apt-get install -y gcc-multilib \
-        libva-dev:i386 libdrm-dev:i386 libvulkan-dev:i386 libgomp1:i386 \
+        libva-dev:i386 libdrm-dev:i386 libvulkan-dev:i386 libgomp1:i386 libx264-dev:i386 \
         || die "apt failed to install the i386 libraries"
     ok "Debian/Ubuntu i386 libraries present"
 elif command -v zypper >/dev/null 2>&1; then

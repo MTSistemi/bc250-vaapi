@@ -1,0 +1,106 @@
+/* bc250-encoding-decoding-fix - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/*
+ * video_proc_tonemap.comp - HDR10 (10-bit P010) to SDR (8-bit NV12) tone-mapping & scaler.
+ *
+ * VAEntrypointVideoProc tone-mapping path. Converts 10-bit BT.2020 HDR input surfaces
+ * into 8-bit BT.709 SDR surfaces using Reinhard/Hable luminance compression with
+ * saturation preservation, allowing HDR content to display properly on SDR panels.
+ */
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, r16)  uniform readonly  image2D srcY;
+layout(set = 0, binding = 1, rg16) uniform readonly  image2D srcUV;
+layout(set = 0, binding = 2, r8)   uniform writeonly image2D dstY;
+layout(set = 0, binding = 3, rg8)  uniform writeonly image2D dstUV;
+
+layout(push_constant) uniform PushConstants {
+    ivec4 src;    /* x, y, width, height in luma samples */
+    ivec4 dst;    /* destination coordinates and size */
+    ivec2 limit;  /* destination boundaries */
+} pc;
+
+float fetch_y(vec2 p)
+{
+    vec2 lo = vec2(pc.src.xy);
+    vec2 hi = vec2(pc.src.xy + pc.src.zw) - vec2(1.0);
+    p = clamp(p, lo, hi);
+
+    ivec2 a = ivec2(floor(p));
+    ivec2 b = min(a + ivec2(1), ivec2(hi));
+    vec2 f = p - vec2(a);
+
+    float p00 = imageLoad(srcY, ivec2(a.x, a.y)).r;
+    float p10 = imageLoad(srcY, ivec2(b.x, a.y)).r;
+    float p01 = imageLoad(srcY, ivec2(a.x, b.y)).r;
+    float p11 = imageLoad(srcY, ivec2(b.x, b.y)).r;
+    return mix(mix(p00, p10, f.x), mix(p01, p11, f.x), f.y);
+}
+
+vec2 fetch_uv(vec2 p)
+{
+    vec2 lo = vec2(pc.src.xy >> 1);
+    vec2 hi = vec2((pc.src.xy + pc.src.zw) >> 1) - vec2(1.0);
+    p = clamp(p, lo, hi);
+
+    ivec2 a = ivec2(floor(p));
+    ivec2 b = min(a + ivec2(1), ivec2(hi));
+    vec2 f = p - vec2(a);
+
+    vec2 p00 = imageLoad(srcUV, ivec2(a.x, a.y)).rg;
+    vec2 p10 = imageLoad(srcUV, ivec2(b.x, a.y)).rg;
+    vec2 p01 = imageLoad(srcUV, ivec2(a.x, b.y)).rg;
+    vec2 p11 = imageLoad(srcUV, ivec2(b.x, b.y)).rg;
+    return mix(mix(p00, p10, f.x), mix(p01, p11, f.x), f.y);
+}
+
+/* Extended Reinhard tone mapping with highlight roll-off */
+float tone_map_luma(float y)
+{
+    const float white_point = 1.4;
+    return (y * (1.0 + y / (white_point * white_point))) / (1.0 + y);
+}
+
+void main()
+{
+    ivec2 rel = ivec2(gl_GlobalInvocationID.xy);
+    if (rel.x >= pc.dst.z || rel.y >= pc.dst.w) return;
+
+    ivec2 out_pos = pc.dst.xy + rel;
+    if (out_pos.x >= pc.limit.x || out_pos.y >= pc.limit.y) return;
+
+    vec2 ratio = vec2(pc.src.zw) / vec2(pc.dst.zw);
+    ivec2 taps = clamp(ivec2(ratio), ivec2(1), ivec2(8));
+    vec2 tap_step = ratio / vec2(taps);
+
+    vec2 origin = vec2(pc.src.xy) + (vec2(rel) + vec2(0.5)) * ratio;
+    vec2 half_span = 0.5 * (ratio - tap_step);
+
+    float sum_y = 0.0;
+    for (int ty = 0; ty < taps.y; ty++) {
+        for (int tx = 0; tx < taps.x; tx++) {
+            vec2 pt = origin - half_span + vec2(float(tx), float(ty)) * tap_step;
+            sum_y += fetch_y(pt);
+        }
+    }
+    float raw_y = sum_y / float(taps.x * taps.y);
+    float mapped_y = tone_map_luma(raw_y);
+
+    imageStore(dstY, out_pos, vec4(mapped_y, 0.0, 0.0, 0.0));
+
+    if ((out_pos.x & 1) == 0 && (out_pos.y & 1) == 0) {
+        vec2 sum_uv = vec2(0.0);
+        for (int ty = 0; ty < taps.y; ty++) {
+            for (int tx = 0; tx < taps.x; tx++) {
+                vec2 pt = origin - half_span + vec2(float(tx), float(ty)) * tap_step;
+                sum_uv += fetch_uv(pt);
+            }
+        }
+        vec2 raw_uv = sum_uv / float(taps.x * taps.y);
+        /* Scale chroma saturation proportionally to luma adjustment */
+        float luma_scale = mapped_y / max(raw_y, 0.001);
+        vec2 mapped_uv = (raw_uv - vec2(0.5)) * clamp(luma_scale, 0.5, 1.2) + vec2(0.5);
+
+        imageStore(dstUV, out_pos >> 1, vec4(mapped_uv, 0.0, 0.0));
+    }
+}

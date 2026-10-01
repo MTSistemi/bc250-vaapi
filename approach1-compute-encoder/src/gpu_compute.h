@@ -121,6 +121,7 @@ typedef struct bc250_gpu_context {
     VkPipeline color_convert_pipeline;
     VkPipeline vpp_pipeline;      /* video_proc.comp, eight bit */
     VkPipeline vpp_pipeline10;    /* video_proc10.comp, ten bit */
+    VkPipeline vpp_pipeline_tonemap; /* video_proc_tonemap.comp, HDR10 to SDR */
     VkPipeline reconstruct_pipeline;
     VkPipeline intra_wavefront_pipeline;
 
@@ -254,7 +255,6 @@ typedef struct bc250_gpu_context {
     /* Device properties */
     VkPhysicalDeviceProperties dev_props;
     uint32_t max_workgroup_size;
-    bool is_rdna2;
 
     /* Opt-in GPU per-stage timing (BC250_PERF_STATS=1) - see gpu_compute.c's
      * BC250_PERF_NUM_TIMESTAMPS comment and gpu_compute_dispatch_encode()/
@@ -312,9 +312,35 @@ typedef struct bc250_gpu_context {
      * its vkQueueSubmit()'s pWaitSemaphores. */
     bool has_pending_wait_semaphore;
 
+    /* Set (once, never cleared) the first time any surface in this context is
+     * successfully exported as a DMA-BUF fd by
+     * gpu_compute_export_nv12_dmabuf() - i.e. once this process is known to
+     * be sharing surfaces with a *different* GPU API context (Sunshine's own
+     * GL/EGL import, via vaExportSurfaceHandle()).
+     *
+     * Why this needs to be remembered rather than asked per surface: the
+     * cross-API race this guards is real only for dma-buf-shared surfaces,
+     * and the encoder's CPU-side read path (the Tier 2 CPU SIMD ME offload -
+     * see gpu_compute_wait_for_image_ready_host()'s doc comment) has to
+     * decide whether to pay for the sync-file round trip before every CPU
+     * read, while va_backend.c - the only caller of the *GPU-side* wait -
+     * already knows the answer per surface and skips the syscall for
+     * surfaces that were never exported (plain FFmpeg hwupload). This flag
+     * gives the encoder the same answer process-wide without a new
+     * gpu_image_t field for a property that is a property of how the
+     * process uses the driver, not of one image. */
+    bool any_surface_exported;
+
     /* Dynamic CPU/GPU governor latency tracking */
     struct timespec submit_time[2];
     double last_gpu_duration_ms;
+
+    /* How many submissions this context has successfully made. Zero means
+     * "the GPU has never been asked to do anything here", which is one of the
+     * two cases gpu_compute_cpu_read_safe() has to answer true for; the
+     * timeline semaphore this context also owns is created but never
+     * signalled, so it cannot be used for that. */
+    uint32_t frames_submitted;
 } bc250_gpu_context_t;
 
 typedef bc250_gpu_context_t gpu_context_t;
@@ -322,6 +348,16 @@ typedef bc250_gpu_context_t gpu_context_t;
 /* Core lifecycle */
 int bc250_gpu_init(bc250_gpu_context_t *ctx);
 void bc250_gpu_destroy(bc250_gpu_context_t *ctx);
+
+/* Prints this device's Compute-Unit topology and the exact `AMD_CU_MASK`
+ * values that would ring-fence part of it away from a game, to stderr.
+ * Opt-in (BC250_CU_REPORT=1), called once from bc250_gpu_init(), and
+ * diagnostic only: it changes nothing. The fence it computes is applied
+ * outside this process - Mesa reads AMD_CU_MASK when it creates a screen, so
+ * the value has to be in the environment of the game and of Sunshine before
+ * either starts. See docs/streaming-ringfence.md and
+ * tools/sunshine_preset/apply_gpu_ringfence.sh, which does that part. */
+void gpu_compute_report_cu_topology(bc250_gpu_context_t *ctx);
 
 /* What gpu_compute_create_image()'s `format` argument means. NV12 is
  * zero, which is what every caller was already passing when the argument
@@ -410,6 +446,14 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
  * will not close the file descriptor"). Returns 0 on success. */
 int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int *out_fd);
 
+/* Imports an external DMA-BUF memory fd into a Vulkan image (zero-copy hardware ingestion).
+ * Returns 0 on success, or -1 if the device cannot import the descriptor or format. */
+int gpu_compute_import_dmabuf_image(gpu_context_t *ctx,
+                                    int dma_buf_fd,
+                                    int width, int height, int format,
+                                    uint32_t stride, uint32_t offset,
+                                    gpu_image_t *image, gpu_memory_t *memory);
+
 /* Explicit GPU-side wait for whatever wrote into `memory` last, through
  * *any* API/context - not just this driver's own Vulkan submissions.
  *
@@ -446,6 +490,59 @@ int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int 
  * callers must tolerate that and proceed without the extra wait, exactly
  * like every other opportunistic capability check in this file. */
 int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory);
+
+/* The HOST-side twin of the wait above, for the paths that read a surface
+ * from the CPU instead of from a compute shader.
+ *
+ * WHY THIS EXISTS: gpu_compute_wait_for_image_ready() queues the same
+ * dependency as a *Vulkan semaphore* on the next vkQueueSubmit(), which
+ * orders the GPU's compute dispatches behind whatever wrote the surface.
+ * A `vkMapMemory()` + CPU load is not ordered by a semaphore that has not
+ * been submitted yet, so a CPU reader racing a foreign context's render pass
+ * reads a partially written frame. The one such reader in this driver is the
+ * Tier 2 "CPU SIMD motion estimation" offload (encoder_h264.c's
+ * h264_encoder_submit_frame_ext()), which maps the input surface and the
+ * reconstruction buffer and searches them directly - and which is *enabled
+ * by default for live streaming callers*, and is entered precisely when the
+ * GPU is busiest, i.e. when the foreign render pass is most likely still in
+ * flight. That is the mechanism behind the reported "the encoding is
+ * garbled" during fast action, which worsens under game load rather than
+ * improving: the tier that reacts to GPU pressure was itself reading the
+ * frame unsynchronized.
+ *
+ * This function blocks the calling thread on the same dma-buf read fence
+ * (DMA_BUF_IOCTL_EXPORT_SYNC_FILE, the same kernel mechanism the GPU-side
+ * wait uses), so it costs the wait the GPU was about to pay anyway a few
+ * microseconds later - it adds no new dependency, it only moves the same
+ * one earlier and makes it apply to the CPU too.
+ *
+ * Returns 0 when the buffer was quiescent (or was already), -1 when it could
+ * not be established - the caller must then treat the surface as NOT safe
+ * to read and skip the read, exactly as it treats the -1 from the GPU-side
+ * variant (a no-op that lets the caller proceed on implicit fencing). Never
+ * blocks indefinitely: the wait is bounded by the same budget as the fence
+ * waits elsewhere in this file (BC250_GPU_TIMEOUT_MS, or 16 ms for a live
+ * streaming caller) and reports a timeout as -1.
+ *
+ * Callers must also gate on gpu_compute_cpu_read_safe() for *this driver's
+ * own* GPU-written data: the dma-buf fence above only orders against foreign
+ * writers, and it says nothing about work this driver submitted itself. */
+int gpu_compute_wait_for_image_ready_host(gpu_context_t *ctx, gpu_memory_t memory);
+
+/* True when every submission this context has made has actually completed
+ * on the GPU, i.e. when anything the GPU wrote - the reconstruction image,
+ * the staging buffers - is safe to read from the CPU right now.
+ *
+ * This is a cheap vkGetFenceStatus() on the most recently submitted
+ * command buffer's fence, and it exists because the CPU SIMD ME offload
+ * needs the *encoder's own* previous frame to be finished, which the
+ * synchronous path guarantees by construction (it finished frame N-1 before
+ * submitting frame N) but the pipelined path (BC250_PIPELINE=1) does not: a
+ * frame submitted a moment ago may still be mid-reconstruct, and reading its
+ * half-written output on the CPU is exactly the class of bug
+ * gpu_compute_sync_slot()'s doc comment is about, on the other side of the
+ * fence. Returns 1 only when there is provably nothing outstanding. */
+int gpu_compute_cpu_read_safe(gpu_context_t *ctx);
 
 /* Creates a diagnostic dump file safely - 0600, no symbolic links
  * followed, in BC250_DUMP_DIR or else $XDG_RUNTIME_DIR/bc250_dump_frames.

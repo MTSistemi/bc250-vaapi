@@ -1,3 +1,14 @@
+bc250-vaapi (0.5.2-1) unstable; urgency=medium
+
+  * Add libx265 CPU fallback encoding for 100% 3D gaming contention isolation.
+  * Native zero-copy DMA-BUF importation with safe fallback on unsupported memory.
+  * Real-time network dynamic bitrate smoothing without QP jitter.
+  * Chromium / Firefox hardware decode entrypoints for VP9 and AV1.
+  * HDR10 to SDR tone-mapping post-processing pipeline.
+  * Half-pel fractional motion estimation refinement and 2-frame B-frame GOP.
+
+ -- SkillFishOS <info@mtsistemi.it>  Wed, 30 Sep 2026 08:00:00 +0200
+
 bc250-vaapi (26.09.2) unstable; urgency=medium
 
   * H.264 and H.265 decoding through VAEntrypointVLD, bit-exact against

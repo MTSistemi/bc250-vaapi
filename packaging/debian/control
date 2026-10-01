@@ -9,6 +9,7 @@ Build-Depends: debhelper-compat (= 13),
                libdrm-dev,
                libvulkan-dev,
                libx264-dev,
+               libx265-dev,
                glslang-tools
 Standards-Version: 4.7.0
 Homepage: https://github.com/MTSistemi/bc250-vaapi

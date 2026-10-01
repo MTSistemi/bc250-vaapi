@@ -9,15 +9,18 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #if defined(__linux__)
 #include <sched.h>
 #include <pthread.h>
+extern char *program_invocation_short_name;
 #endif
 
 #include "cpu_simd_me.h"
-#include <stdlib.h>
-#include <string.h>
 
 #if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
@@ -88,6 +91,9 @@ static uint32_t cpu_simd_sad_16x16_sse2(const uint8_t *src, int src_stride,
 }
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((unused))
+#endif
 static uint32_t cpu_simd_sad_16x16_scalar(const uint8_t *src, int src_stride,
                                           const uint8_t *ref, int ref_stride)
 {
@@ -134,6 +140,62 @@ uint32_t cpu_simd_sad_16x16(const uint8_t *src, int src_stride,
     return fn(src, src_stride, ref, ref_stride);
 }
 
+static int get_cmdline_threads(void)
+{
+#if defined(__linux__)
+    static int cached_threads = -1;
+    if (cached_threads != -1) return cached_threads;
+
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    if (!f) {
+        cached_threads = 0;
+        return 0;
+    }
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        cached_threads = 0;
+        return 0;
+    }
+    buf[n] = '\0';
+
+    size_t pos = 0;
+    while (pos < n) {
+        const char *arg = buf + pos;
+        size_t len = strlen(arg);
+
+        if ((strcmp(arg, "-threads") == 0 || strcmp(arg, "--threads") == 0 ||
+             strcmp(arg, "-slices") == 0 || strcmp(arg, "--slices") == 0) && (pos + len + 1 < n)) {
+            const char *val = buf + pos + len + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-threads=", 9) == 0 || strncmp(arg, "--threads=", 10) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-slices=", 8) == 0 || strncmp(arg, "--slices=", 9) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        }
+        pos += len + 1;
+    }
+    cached_threads = 0;
+#endif
+    return 0;
+}
+
 void cpu_simd_me_config_init(cpu_simd_me_config_t *cfg, uint32_t width, uint32_t height)
 {
     if (!cfg) return;
@@ -141,13 +203,26 @@ void cpu_simd_me_config_init(cpu_simd_me_config_t *cfg, uint32_t width, uint32_t
     cfg->height = height;
     cfg->width_in_mbs = (width + 15) / 16;
     cfg->height_in_mbs = (height + 15) / 16;
-    cfg->search_radius = 8;
-    cfg->num_threads = 1; /* Default to 1 worker thread to preserve CPU headroom */
+    cfg->num_threads = 4; /* Default to 4 worker threads for fast AVX2 SIMD ME */
     const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
+    if (!env_threads) env_threads = getenv("BC250_THREADS");
+    if (!env_threads) env_threads = getenv("BC250_CPU_THREADS");
     if (env_threads && *env_threads) {
         int t = atoi(env_threads);
-        if (t > 0 && t <= 8) cfg->num_threads = t;
+        if (t > 0 && t <= 16) cfg->num_threads = t;
     }
+    int cmd_t = get_cmdline_threads();
+    if (cmd_t > 0 && cmd_t <= 16) cfg->num_threads = cmd_t;
+#if defined(__linux__)
+    if (program_invocation_short_name) {
+        if (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+            strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0) {
+            /* In live streaming, cap to 2 threads to guarantee game CPU headroom */
+            if (!env_threads && cmd_t <= 0 && cfg->num_threads > 2) cfg->num_threads = 2;
+        }
+    }
+#endif
     cfg->core_ids[0] = -1;
     cfg->core_ids[1] = -1;
 
@@ -211,8 +286,18 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
     if (max_rad < 2) max_rad = 2;
     if (max_rad > 16) max_rad = 16;
 
-    int threads = (cfg && cfg->num_threads > 0) ? cfg->num_threads : 1;
-    if (threads > 2) threads = 2; /* Cap at 2 threads to guarantee game CPU headroom */
+    int threads = (cfg && cfg->num_threads > 0) ? cfg->num_threads : 4;
+    int cmd_t = get_cmdline_threads();
+    if (cmd_t > 0 && cmd_t <= 16) threads = cmd_t;
+#if defined(__linux__)
+    if (program_invocation_short_name &&
+        (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+         strcmp(program_invocation_short_name, "steam") == 0 ||
+         strcmp(program_invocation_short_name, "streaming_client") == 0)) {
+        if (cmd_t <= 0 && threads > 2) threads = 2; /* Cap at 2 threads to guarantee game CPU headroom */
+    }
+#endif
+    if (threads > 16) threads = 16;
 
     const ivec2_t search_pattern[8] = {
         { 0,  1}, { 0, -1}, { 1,  0}, {-1,  0},
@@ -322,9 +407,84 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
                 if (best_cost == 0) break;
             }
 
-            /* Convert integer motion vector to quarter-pel units (multiply by 4) */
-            out_mvs[mb_idx].mvx = best_mv.x * 4;
-            out_mvs[mb_idx].mvy = best_mv.y * 4;
+            int qx = best_mv.x * 4;
+            int qy = best_mv.y * 4;
+            if (best_cost > 128 && best_cost < 3000) {
+                /* Half-pel refinement (2 quarter-pels offset) around best integer MV */
+                int int_x = best_mv.x;
+                int int_y = best_mv.y;
+                int base_x = px + int_x;
+                int base_y = py + int_y;
+                if (base_x > 0 && base_x + 17 < max_x && base_y > 0 && base_y + 17 < max_y) {
+                    const int hpel_off[4][2] = { {2, 0}, {-2, 0}, {0, 2}, {0, -2} };
+                    int best_sub_x = 0;
+                    int best_sub_y = 0;
+                    uint32_t lowest_sad = best_cost;
+
+                    for (int h = 0; h < 4; h++) {
+                        int sx = hpel_off[h][0];
+                        int sy = hpel_off[h][1];
+                        uint32_t sad = 0;
+                        if (sx != 0) {
+                            int shift = (sx > 0) ? 1 : -1;
+                            const uint8_t *r0 = ref_y + base_y * ref_pitch + base_x;
+                            const uint8_t *r1 = r0 + shift;
+                            for (int r = 0; r < 16; r++) {
+                                const uint8_t *s = curr_mb + r * src_pitch;
+                                const uint8_t *p0 = r0 + r * ref_pitch;
+                                const uint8_t *p1 = r1 + r * ref_pitch;
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+                                __m128i v0 = _mm_loadu_si128((const __m128i *)p0);
+                                __m128i v1 = _mm_loadu_si128((const __m128i *)p1);
+                                __m128i vs = _mm_loadu_si128((const __m128i *)s);
+                                __m128i interp = _mm_avg_epu8(v0, v1);
+                                __m128i sad_v = _mm_sad_epu8(vs, interp);
+                                sad += (uint32_t)_mm_cvtsi128_si32(sad_v) + (uint32_t)_mm_extract_epi16(sad_v, 4);
+#else
+                                for (int c = 0; c < 16; c++) {
+                                    uint8_t interp = (uint8_t)(((uint32_t)p0[c] + (uint32_t)p1[c] + 1) >> 1);
+                                    sad += (uint32_t)abs((int)s[c] - (int)interp);
+                                }
+#endif
+                            }
+                        } else {
+                            int shift = (sy > 0) ? ref_pitch : -ref_pitch;
+                            const uint8_t *r0 = ref_y + base_y * ref_pitch + base_x;
+                            const uint8_t *r1 = r0 + shift;
+                            for (int r = 0; r < 16; r++) {
+                                const uint8_t *s = curr_mb + r * src_pitch;
+                                const uint8_t *p0 = r0 + r * ref_pitch;
+                                const uint8_t *p1 = r1 + r * ref_pitch;
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+                                __m128i v0 = _mm_loadu_si128((const __m128i *)p0);
+                                __m128i v1 = _mm_loadu_si128((const __m128i *)p1);
+                                __m128i vs = _mm_loadu_si128((const __m128i *)s);
+                                __m128i interp = _mm_avg_epu8(v0, v1);
+                                __m128i sad_v = _mm_sad_epu8(vs, interp);
+                                sad += (uint32_t)_mm_cvtsi128_si32(sad_v) + (uint32_t)_mm_extract_epi16(sad_v, 4);
+#else
+                                for (int c = 0; c < 16; c++) {
+                                    uint8_t interp = (uint8_t)(((uint32_t)p0[c] + (uint32_t)p1[c] + 1) >> 1);
+                                    sad += (uint32_t)abs((int)s[c] - (int)interp);
+                                }
+#endif
+                            }
+                        }
+                        if (sad < lowest_sad) {
+                            lowest_sad = sad;
+                            best_sub_x = sx;
+                            best_sub_y = sy;
+                        }
+                    }
+                    qx += best_sub_x;
+                    qy += best_sub_y;
+                    best_cost = lowest_sad;
+                }
+            }
+
+            /* Convert integer + half-pel motion vector to quarter-pel units */
+            out_mvs[mb_idx].mvx = qx;
+            out_mvs[mb_idx].mvy = qy;
             out_mvs[mb_idx].sad = best_cost;
             out_mvs[mb_idx]._pad = 0;
         }

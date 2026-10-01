@@ -1,6 +1,6 @@
-# bc250-encoding-decoding-fix v0.4.3 - https://github.com/simpmix/bc250-encoding-decoding-fix
+# bc250-encoding-decoding-fix v0.5.2 - https://github.com/simpmix/bc250-encoding-decoding-fix
 cmake_minimum_required(VERSION 3.16)
-project(bc250-compute-encoder VERSION 0.4.3 LANGUAGES C)
+project(bc250-compute-encoder VERSION 0.5.2 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O2 -fPIC")
@@ -274,6 +274,23 @@ if(BC250_WITH_X264)
     endif()
 endif()
 
+# HEVC through libx265 - see src/encoder_x265.h for why. Optional: without
+# it HEVC is encoded by the compute encoder, as before.
+option(BC250_WITH_X265 "Encode HEVC through libx265" ON)
+if(BC250_WITH_X265)
+    pkg_check_modules(X265 x265)
+    if(X265_FOUND)
+        target_sources(bc250_drv_video PRIVATE src/encoder_x265.c)
+        target_include_directories(bc250_drv_video PRIVATE ${X265_INCLUDE_DIRS})
+        target_link_libraries(bc250_drv_video ${X265_LINK_LIBRARIES})
+        target_compile_definitions(bc250_drv_video PRIVATE BC250_HAVE_X265)
+        message(STATUS "libx265 ${X265_VERSION} found: HEVC encodes through x265")
+    else()
+        target_sources(bc250_drv_video PRIVATE src/encoder_x265.c)
+        message(WARNING "libx265 not found: HEVC falls back to the compute encoder")
+    endif()
+endif()
+
 # Installation paths
 if(NOT LIBVA_DRIVERS_PATH)
     if(BUILD_32BIT)
@@ -358,6 +375,38 @@ if(BUILD_RC_BENCH)
         add_executable(rc_bench ${RC_BENCH_SRC})
         target_include_directories(rc_bench PRIVATE src ${Vulkan_INCLUDE_DIRS})
         target_link_libraries(rc_bench PRIVATE bc250_drv_video ${Vulkan_LIBRARIES} ${BC250_EXTRA_LIBS} m)
+    endif()
+endif()
+
+# ----------------------------------------------------------------------------
+# gpu_contention - tunable Vulkan compute load generator (tools/gpu_contention.c)
+# ----------------------------------------------------------------------------
+option(BUILD_GPU_CONTENTION "Build the tunable GPU contention-load generator (tools/gpu_contention.c)" OFF)
+if(BUILD_GPU_CONTENTION)
+    set(GPU_CONTENTION_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gpu_contention.c)
+    set(GPU_CONTENTION_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/../tools/shaders/gpu_contention.comp)
+    if(EXISTS ${GPU_CONTENTION_SRC} AND EXISTS ${GPU_CONTENTION_SHADER})
+        set(GPU_CONTENTION_SPV ${CMAKE_CURRENT_BINARY_DIR}/gpu_contention.comp.spv)
+        if(GLSLANG_VALIDATOR)
+            add_custom_command(
+                OUTPUT ${GPU_CONTENTION_SPV}
+                COMMAND ${GLSLANG_VALIDATOR} -V ${GPU_CONTENTION_SHADER} -o ${GPU_CONTENTION_SPV}
+                DEPENDS ${GPU_CONTENTION_SHADER}
+                COMMENT "Compiling gpu_contention.comp with glslangValidator")
+        elseif(GLSLC)
+            add_custom_command(
+                OUTPUT ${GPU_CONTENTION_SPV}
+                COMMAND ${GLSLC} -c ${GPU_CONTENTION_SHADER} -o ${GPU_CONTENTION_SPV}
+                DEPENDS ${GPU_CONTENTION_SHADER}
+                COMMENT "Compiling gpu_contention.comp with glslc")
+        endif()
+        add_custom_target(gpu_contention_shader DEPENDS ${GPU_CONTENTION_SPV})
+
+        add_executable(gpu_contention ${GPU_CONTENTION_SRC})
+        target_link_libraries(gpu_contention PRIVATE ${Vulkan_LIBRARIES})
+        add_dependencies(gpu_contention gpu_contention_shader)
+        add_custom_command(TARGET gpu_contention POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy ${GPU_CONTENTION_SPV} $<TARGET_FILE_DIR:gpu_contention>/gpu_contention.comp.spv)
     endif()
 endif()
 

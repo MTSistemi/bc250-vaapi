@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix
+# bc250-encoding-decoding-fix v0.5.2 - https://github.com/simpmix/bc250-encoding-decoding-fix
 #
 # bc250_diagnose.sh - Comprehensive hardware verification, VA-API test, and encode benchmark
 #
@@ -34,7 +34,7 @@ if [ -d "/sys/class/drm" ]; then
     for card in /sys/class/drm/card[0-9]/device; do
         if [ -f "$card/current_compute_units" ]; then
             cus=$(cat "$card/current_compute_units")
-            echo -e "  ${GREEN}✓ Active RDNA 2 Compute Units: ${cus} CUs${NC}"
+            echo -e "  ${GREEN}✓ Active Compute Units: ${cus} CUs (Cyan Skillfish/Oberon)${NC}"
         fi
     done
 fi
@@ -45,16 +45,23 @@ echo -e "  ${GREEN}✓ CPU Processing Threads: ${cores}${NC}"
 
 # 2. Audio Subsystem
 echo -e "\n${BOLD}[2/5] Checking Audio Subsystem...${NC}"
-if lsmod | grep bc250_audio_fix > /dev/null 2>&1; then
-    echo -e "  ${GREEN}✓ bc250_audio_fix kernel module is ACTIVE${NC}"
-else
-    echo -e "  ${YELLOW}! bc250_audio_fix module is not loaded.${NC}"
-    echo -e "    Run: cd audio-fix && sudo ./install_dkms.sh"
-fi
-
+hdmi_devs=0
 if command -v aplay &> /dev/null; then
     hdmi_devs=$(aplay -l 2>/dev/null | grep -i -E "hdmi|displayport" | wc -l)
-    echo -e "  ${GREEN}✓ Detected ${hdmi_devs} digital audio endpoints${NC}"
+fi
+
+if [ "$hdmi_devs" -gt 0 ]; then
+    echo -e "  ${GREEN}✓ Detected ${hdmi_devs} digital audio endpoints (native kernel audio functional; legacy DKMS module not needed)${NC}"
+    if lsmod | grep bc250_audio_fix > /dev/null 2>&1; then
+        echo -e "  ${YELLOW}! bc250_audio_fix module is also loaded alongside native audio.${NC}"
+        echo -e "    On modern kernels (e.g. CachyOS 7.2+), native kernel audio works directly. To avoid clashes:"
+        echo -e "    cd audio-fix && sudo ./uninstall_dkms.sh"
+    fi
+elif lsmod | grep bc250_audio_fix > /dev/null 2>&1; then
+    echo -e "  ${GREEN}✓ bc250_audio_fix kernel module is ACTIVE (legacy DKMS)${NC}"
+else
+    echo -e "  ${YELLOW}! No digital audio endpoints detected and bc250_audio_fix module is not loaded.${NC}"
+    echo -e "    If running on an older kernel without native audio support, run: cd audio-fix && sudo ./install_dkms.sh"
 fi
 
 # 3. VA-API Driver Installation
@@ -90,6 +97,19 @@ STANDARD_DRI_DIRS=("/usr/lib64/dri" "/usr/lib/x86_64-linux-gnu/dri" "/usr/lib/dr
 if [ $FOUND_DRIVER -eq 0 ]; then
     echo -e "  ${RED}✗ bc250_drv_video.so not found in standard or immutable system DRI paths.${NC}"
     echo -e "    Run ./build_and_install.sh, ./tools/setup_bazzite.sh, or ./tools/setup_steamos.sh first!"
+fi
+
+FOUND_32BIT_DRIVER=0
+for dri32 in "/usr/lib32/dri" "/usr/lib/i386-linux-gnu/dri"; do
+    if [ -f "$dri32/bc250_drv_video.so" ]; then
+        echo -e "  ${GREEN}✓ Found 32-bit companion driver (Steam Link): $dri32/bc250_drv_video.so${NC}"
+        FOUND_32BIT_DRIVER=1
+        break
+    fi
+done
+if [ $FOUND_32BIT_DRIVER -eq 0 ]; then
+    echo -e "  ${YELLOW}! 32-bit companion driver not found in /usr/lib32/dri (required for Steam Link).${NC}"
+    echo -e "    Run: ./tools/build_32bit.sh or install from release v0.5.2 bundle."
 fi
 
 FOUND_SHADERS=0
@@ -244,6 +264,22 @@ else
         echo -e "  ${GREEN}✓ No elevated file capabilities detected on Sunshine's process${NC}"
         echo -e "    (CapEff=${CAPEFF:-unreadable}) - libva's environment-variable lookup"
         echo -e "    should apply normally; the check below is meaningful here."
+    fi
+
+    if pgrep -f "gamescope" > /dev/null 2>&1 || [ -n "${GAMESCOPE_WAYLAND_DISPLAY:-}" ] || [ "${XDG_CURRENT_DESKTOP:-}" = "gamescope" ] || [ "${DESKTOP_SESSION:-}" = "gamescope" ]; then
+        echo -e "  ${BLUE}ℹ Active Gamescope / Gaming Mode session detected.${NC}"
+        if [ "$CAPEFF" = "0000000000000000" ] && [ "${SUNSHINE_UID:-0}" != "0" ]; then
+            echo -e "  ${RED}✗ In Gaming Mode, Sunshine lacks DRM KMS capture capabilities (CapEff=0000000000000000).${NC}"
+            echo -e "    KMS capture will fail with 'Couldn't get drm fb for plane [0]: Permission denied' (black screen)!"
+            echo -e "    To fix Sunshine in Gaming Mode:"
+            echo -e "      1. Set capabilities on the canonical binary:"
+            echo -e "         sudo setcap cap_sys_admin,cap_sys_nice+p \$(readlink -f \$(which sunshine))"
+            echo -e "      2. Install the persistent boot redirect so driver loads under secure-exec:"
+            echo -e "         sudo ./tools/install_vaapi_boot_redirect.sh"
+            echo -e "      3. If launching Sunshine via systemd --user service, add to [Service] in sunshine.service:"
+            echo -e "         AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE"
+            echo -e "      4. In Steam Game Mode Settings > System > Developer Mode, enable 'Force Composite'."
+        fi
     fi
     echo
 

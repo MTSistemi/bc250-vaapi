@@ -45,11 +45,21 @@ static void test_governor_transitions(void)
     governor_tier_t emergency = dynamic_governor_update(&gov, 16.5);
     assert(emergency == GOV_TIER_3_FAILOVER);
 
-    /* 5. Next frame drops from Tier 3 back to Tier 2 */
+    /* 5. Next frame drops from Tier 3 to the CHEAPEST tier, not to the CPU
+     * offload. One late frame is not evidence that the GPU is unusable, and
+     * the offload is the most expensive frame in the cycle on a live stream
+     * (a whole-frame CPU motion search) - see dynamic_governor_update(). */
     governor_tier_t post_emergency = dynamic_governor_update(&gov, 13.0);
-    assert(post_emergency == GOV_TIER_2_CPU_OFFLOAD);
+    assert(post_emergency == GOV_TIER_1_GPU_FAST);
 
-    /* 6. Hysteresis test: lower latency (4.0ms) requires 15 stable frames to drop back to Tier 0 */
+    /* 6. ...but sustained pressure still gets the offload: the EMA is an
+     * average over 4 frames, so it stays over the tier-2 threshold and the
+     * next update promotes it. (Dwell is 0 in this test - see
+     * test_governor_dwell_gate() for the live-stream value.) */
+    dynamic_governor_update(&gov, 13.5);
+    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_2_CPU_OFFLOAD);
+
+    /* 7. Hysteresis test: lower latency (4.0ms) requires 15 stable frames to drop back to Tier 0 */
     for (int i = 0; i < 14; i++) {
         dynamic_governor_update(&gov, 4.0);
         /* Should NOT have dropped back to Tier 0 yet due to hysteresis */
@@ -60,6 +70,67 @@ static void test_governor_transitions(void)
     assert(dynamic_governor_get_tier(&gov) == GOV_TIER_0_GPU_FULL);
 
     printf("  ✓ Governor transitions and hysteresis verified!\n");
+}
+
+/* The dwell gate is the fix for the reported ">200ms spikes": it stops a
+ * single frame's worth of pressure from changing the per-frame work mix.
+ * With min_dwell_frames = 8 (the live-stream default), the tier the governor
+ * just moved to must be held for 8 frames before the CPU offload can be
+ * entered - and while it is being held, an over-threshold EMA is answered
+ * with Tier 1 (less GPU work than Tier 0) rather than with a full CPU ME. */
+static void test_governor_dwell_gate(void)
+{
+    printf("[TEST] Testing the dwell gate before entering the CPU offload...\n");
+
+    dynamic_governor_t gov;
+    dynamic_governor_init(&gov);
+    gov.cpu_offload_enabled = true;
+    gov.min_dwell_frames = 8;
+
+    /* Establish a healthy Tier 0 baseline, so the pressure below is the only
+     * thing that can move the tier. */
+    for (int i = 0; i < 10; i++) {
+        dynamic_governor_update(&gov, 4.0);
+    }
+    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_0_GPU_FULL);
+
+    /* Now hold 14ms of GPU latency - over the tier-2 threshold, under the
+     * emergency one - and record when the governor reached each tier. The
+     * EMA is an average over 4 frames, so it takes a few updates to climb;
+     * the point of interest is the gap between the two transitions. */
+    int tier1_at = -1, offload_at = -1;
+    for (int i = 0; i < 60; i++) {
+        dynamic_governor_update(&gov, 14.0);
+        governor_tier_t t = dynamic_governor_get_tier(&gov);
+        if (t == GOV_TIER_1_GPU_FAST && tier1_at < 0) tier1_at = i;
+        if (t == GOV_TIER_2_CPU_OFFLOAD) { offload_at = i; break; }
+    }
+    assert(tier1_at >= 0);
+    assert(offload_at >= 0);
+    /* The offload must not be entered until the tier it is being entered from
+     * has been held for the full dwell, counting the crossing update (the
+     * frame that changed tier counts as the first frame of the new tier). */
+    assert(offload_at - tier1_at + 1 >= (int)gov.min_dwell_frames);
+
+    /* Control, and the reason the gate is off by default: with no dwell the
+     * very same input crosses into the offload as soon as the EMA gets there,
+     * several frames earlier. An offline transcode wants exactly that. */
+    dynamic_governor_t gov0;
+    dynamic_governor_init(&gov0);
+    gov0.cpu_offload_enabled = true;
+    gov0.min_dwell_frames = 0;
+    for (int i = 0; i < 10; i++) dynamic_governor_update(&gov0, 4.0);
+    int tier1_at0 = -1, offload_at0 = -1;
+    for (int i = 0; i < 60; i++) {
+        dynamic_governor_update(&gov0, 14.0);
+        governor_tier_t t = dynamic_governor_get_tier(&gov0);
+        if (t == GOV_TIER_1_GPU_FAST && tier1_at0 < 0) tier1_at0 = i;
+        if (t == GOV_TIER_2_CPU_OFFLOAD) { offload_at0 = i; break; }
+    }
+    assert(offload_at0 >= 0);
+    assert(offload_at0 - tier1_at0 + 1 < (int)gov.min_dwell_frames);
+
+    printf("  ✓ Dwell gate verified!\n");
 }
 
 static void test_governor_gpu_only_mode(void)
@@ -113,13 +184,16 @@ static void test_governor_failover_handled(void)
     assert(dynamic_governor_get_tier(&gov) == GOV_TIER_3_FAILOVER);
 
     /* In Tier 3, no GPU work is submitted, so dynamic_governor_update() is not called.
-     * notify_failover_handled must transition immediately down to Tier 2 CPU offload when enabled. */
+     * notify_failover_handled must transition immediately down to the cheapest tier -
+     * Tier 1, not the CPU offload. The frame that failed over proves the GPU was late
+     * once, and the offload is the most expensive thing this encoder can do with a
+     * frame; sustained pressure promotes to it through the EMA instead. */
     dynamic_governor_notify_failover_handled(&gov);
-    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_2_CPU_OFFLOAD);
+    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_1_GPU_FAST);
 
-    /* Calling it again while in Tier 2 should be a safe no-op */
+    /* Calling it again while already unlatched should be a safe no-op */
     dynamic_governor_notify_failover_handled(&gov);
-    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_2_CPU_OFFLOAD);
+    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_1_GPU_FAST);
 
     /* Calling with NULL should be safe */
     dynamic_governor_notify_failover_handled(NULL);
@@ -189,6 +263,7 @@ int main(void)
     printf("========================================\n");
 
     test_governor_transitions();
+    test_governor_dwell_gate();
     test_governor_gpu_only_mode();
     test_governor_failover_handled();
     test_governor_negative_latency();

@@ -7,10 +7,10 @@
 
 A high-performance, spec-compliant VA-API driver (`bc250_drv_video.so`) engineered specifically for the **AMD BC-250 (Cyan Skillfish)** APU on Linux. 
 
-The BC-250 is a repurposed PS5 APU (Zen 2 8-core/16-thread CPU, up to 40 unlocked RDNA 2 Compute Units) whose physical VCN (Video Core Next) hardware engine was permanently unprovisioned and eFused off at the factory. Without a working VCN block, Linux applications fail to initialize hardware video acceleration. 
+The BC-250 is a repurposed PS5 APU (Zen 2 8-core/16-thread CPU, up to 40 unlocked Compute Units; Oberon / Cyan Skillfish semi-custom RDNA 1.5 architecture) whose physical VCN (Video Core Next) hardware engine was permanently unprovisioned and eFused off at the factory. Without a working VCN block, Linux applications fail to initialize hardware video acceleration. 
 
 This project solves this by delivering:
-1. **GPU Compute Video Encoders**: Real-time H.264 and H.265/HEVC encoding executed across the APU's 40 RDNA 2 Compute Units using custom Vulkan compute shaders with asynchronous pipelining and AVX2 CPU SIMD offloading.
+1. **GPU Compute Video Encoders**: Real-time H.264 and H.265/HEVC encoding executed across the APU's 40 Compute Units using custom Vulkan compute shaders with asynchronous pipelining and AVX2 CPU SIMD offloading.
 2. **Bit-Exact VA-API Video Decoders (`VAEntrypointVLD`)**: Threaded H.264 and HEVC decoding running on the Zen 2 CPU, verified bit-exact against reference decoders across all 302 conformance tests.
 3. **Low-Latency Game & VR Streaming**: Pre-tuned presets and passive thread policies for Sunshine / Moonlight (1080p60/1440p) and WiVRn wireless VR streaming (~36ms motion-to-photon latency, ~190 Mbps throughput).
 4. **Hardware Audio Clock Fix**: DKMS kernel module repairing the missing DisplayPort/HDMI audio clock.
@@ -109,7 +109,13 @@ To configure Sunshine for zero-stutter 60/120 FPS game streaming with minimal GP
 ```bash
 ./tools/sunshine_preset/apply_sunshine_preset.sh
 ```
-*See [`docs/sunshine-guide.md`](docs/sunshine-guide.md) for full details.*
+*See [`docs/sunshine-guide.md`](docs/sunshine-guide.md) for full configuration, and [`docs/troubleshooting.md`](docs/troubleshooting.md) for Gamescope / Steam Link fixes.*
+
+To stop a game taking every Compute Unit from the encoder:
+```bash
+./tools/sunshine_preset/apply_gpu_ringfence.sh
+```
+*See [`docs/streaming-ringfence.md`](docs/streaming-ringfence.md) — what can and cannot be ring-fenced on Mesa, and why a saturated game still costs a live stream more than a CU shortage alone explains.*
 
 ### WiVRn (Wireless VR Streaming)
 To configure WiVRn for ~36ms motion-to-photon latency and ~190 Mbps throughput:
@@ -125,12 +131,21 @@ To configure WiVRn for ~36ms motion-to-photon latency and ~190 Mbps throughput:
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
 | `LIBVA_DRIVER_NAME` | *(unset)* | Set to `bc250` to activate this driver. Handled automatically on BC-250 by systemd generator. |
+| `BC250_H264_BACKEND` | `x264` | `x264` uses Zen 2 CPU offload (fastest, leaves GPU free for games). Set to `compute` for GPU compute ME + Dynamic Governor. |
+| `BC250_X264_CRF` | `23` | Target Constant Rate Factor for x264 ICQ/CRF encodes (~5.0 Mbps at 1080p). Lower = higher quality/bitrate. |
+| `BC250_X264_PRESET` | *(auto)* | Override x264 preset (`veryfast`, `superfast`, `ultrafast`). |
+| `BC250_X264_THREADS` | `4` (live) / auto | Max worker threads for x264. Defaults to 4 for live streams (Sunshine, Steam Link, WiVRn). |
 | `BC250_FAST_MODE` | `1` | Restricts GPU compute overhead to <3–5%, preventing GPU starvation in heavy 3D games. |
 | `BC250_SLICES_PER_FRAME` | `4` | Number of slices per H.264 frame. Use `2` for multi-stream VR to prevent CPU thread congestion. |
 | `BC250_HEVC_SLICES` | `4` | Number of concurrent slices for HEVC encode (1..16). Yields 111+ fps at default 4. |
 | `OMP_WAIT_POLICY` | `PASSIVE` | Critical: enforces passive wait in `libgomp`, cutting CPU usage from 1300% to ~350%. |
 | `GOMP_SPINCOUNT` | `0` | Disables CPU busy-wait spin loops in worker threads. |
 | `BC250_USE_CABAC` | `1` (Main/High) | Toggles CABAC (10–13% smaller bitrate) vs CAVLC for H.264 encode. |
+| `BC250_CU_REPORT` | *(unset)* | Print this device's CU topology and the exact `AMD_CU_MASK` values that would ring-fence part of it. Diagnostic only; see [`docs/streaming-ringfence.md`](docs/streaming-ringfence.md). |
+| `BC250_RINGFENCE_CUS_PER_SA` | `2` | CUs per shader array that `BC250_CU_REPORT`'s advice assumes. Changes the reported advice, nothing else. |
+| `BC250_QUEUE_PRIORITY` | *(unset)* | `low`/`medium`/`high`/`realtime` global queue priority. HIGH and REALTIME need `CAP_SYS_NICE` or Vulkan refuses the device outright - see `apply_gpu_ringfence.sh`. |
+| `BC250_GOVERNOR_DWELL_FRAMES` | `0` (`8` live) | Frames a tier must be held before the governor may enter the CPU ME offload. Bounds how often the per-frame work mix can change; `0` for offline transcode. |
+| `BC250_GPU_TIMEOUT_MS` | *(unset)* | Overrides the GPU fence-wait budget. Unset means 16 ms for a live streaming caller, infinite otherwise. |
 
 ---
 

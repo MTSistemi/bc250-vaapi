@@ -29,6 +29,8 @@
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <string.h>
 
 #include "decoder_h264.h"
@@ -36,10 +38,10 @@
 #include "h264_dec_tables.h"   /* the two zig-zag scans, for the scaling lists */
 #include <time.h>
 
-/* Create for writing with an explicit mode: fopen would ask for 0666
- * and let the umask decide, which is what CodeQL's
- * cpp/world-writable-file-creation is about. */
-static FILE *fdopen_w(const char *path)
+/* Create an output file with its mode spelled out. fopen(..., "wb") asks for
+ * 0666 and leaves the rest to the umask, which is what CodeQL's
+ * cpp/world-writable-file-creation reports. */
+static FILE *fopen_wb(const char *path)
 {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return NULL;
@@ -500,7 +502,7 @@ int main(int argc, char **argv)
     if (!buf || fread(buf, 1, (size_t)len, fi) != (size_t)len) return 1;
     fclose(fi);
 
-    FILE *fo = fdopen_w(argv[2]);
+    FILE *fo = fopen_wb(argv[2]);
     if (!fo) { perror(argv[2]); return 1; }
 
     h264_decoder_t *dec = NULL;

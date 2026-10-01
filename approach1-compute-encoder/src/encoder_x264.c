@@ -7,10 +7,33 @@
 #include "encoder_x264.h"
 #include "rate_control.h"
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <x264.h>
+
+#if defined(__linux__)
+extern char *program_invocation_short_name;
+#endif
+
+static bool is_steam_caller(void)
+{
+#if defined(__linux__)
+    if (!program_invocation_short_name) return false;
+    return (strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0 ||
+            strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
+            strcmp(program_invocation_short_name, "gamescope") == 0 ||
+            strstr(program_invocation_short_name, "steam") != NULL ||
+            strstr(program_invocation_short_name, "gamescope") != NULL);
+#else
+    return false;
+#endif
+}
 
 struct h264_x264 {
     x264_t *h;
@@ -24,15 +47,140 @@ struct h264_x264 {
 /* ultrafast .. faster, in the order x264 trades speed for bits. */
 static const char *const presets[] = { "ultrafast", "superfast", "veryfast", "faster" };
 
+static const char *get_cmdline_preset(void)
+{
+#if defined(__linux__)
+    static char cached_preset[32] = {0};
+    static bool checked = false;
+    if (checked) return cached_preset[0] ? cached_preset : NULL;
+    checked = true;
+
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    if (!f) return NULL;
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return NULL;
+    buf[n] = '\0';
+
+    static const char *const valid_presets[] = {
+        "ultrafast", "superfast", "veryfast", "faster", "fast",
+        "medium", "slow", "slower", "veryslow", "placebo", NULL
+    };
+
+    size_t pos = 0;
+    while (pos < n) {
+        const char *arg = buf + pos;
+        size_t len = strlen(arg);
+
+        if ((strcmp(arg, "-preset") == 0 || strcmp(arg, "--preset") == 0) && (pos + len + 1 < n)) {
+            const char *val = buf + pos + len + 1;
+            for (int i = 0; valid_presets[i]; i++) {
+                if (strcmp(val, valid_presets[i]) == 0) {
+                    strncpy(cached_preset, val, sizeof(cached_preset) - 1);
+                    return cached_preset;
+                }
+            }
+        } else if (strncmp(arg, "-preset=", 8) == 0 || strncmp(arg, "--preset=", 9) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            for (int i = 0; valid_presets[i]; i++) {
+                if (strcmp(val, valid_presets[i]) == 0) {
+                    strncpy(cached_preset, val, sizeof(cached_preset) - 1);
+                    return cached_preset;
+                }
+            }
+        }
+        pos += len + 1;
+    }
+#endif
+    return NULL;
+}
+
+static int get_cmdline_threads(void)
+{
+#if defined(__linux__)
+    static int cached_threads = -1;
+    if (cached_threads != -1) return cached_threads;
+
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    if (!f) {
+        cached_threads = 0;
+        return 0;
+    }
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        cached_threads = 0;
+        return 0;
+    }
+    buf[n] = '\0';
+
+    size_t pos = 0;
+    while (pos < n) {
+        const char *arg = buf + pos;
+        size_t len = strlen(arg);
+
+        if ((strcmp(arg, "-threads") == 0 || strcmp(arg, "--threads") == 0 ||
+             strcmp(arg, "-slices") == 0 || strcmp(arg, "--slices") == 0) && (pos + len + 1 < n)) {
+            const char *val = buf + pos + len + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 64) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-threads=", 9) == 0 || strncmp(arg, "--threads=", 10) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 64) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-slices=", 8) == 0 || strncmp(arg, "--slices=", 9) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 64) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        }
+        pos += len + 1;
+    }
+    cached_threads = 0;
+#endif
+    return 0;
+}
+
 const char *h264_x264_preset_for(const h264_x264_config_t *cfg)
 {
+    /* 1. Environment variable override takes highest priority:
+     * Support BC250_X264_PRESET, BC250_PRESET, and X264_PRESET. */
     const char *env = getenv("BC250_X264_PRESET");
+    if (!env || !*env) env = getenv("BC250_PRESET");
+    if (!env || !*env) env = getenv("X264_PRESET");
     if (env && *env) return env;
 
-    /* By pixel rate first. On the BC-250 with four threads, veryfast holds
-     * 1080p at 64 fps and superfast at 99, so up to 1080p30 there is room
-     * for veryfast, up to 1080p60 for superfast, and above that only
-     * ultrafast keeps up. */
+    /* 2. Process command-line argument (-preset <name> / --preset=<name>):
+     * Directly honors FFmpeg/application CLI flags even if the application's
+     * VA-API wrapper internally dropped or ignored the option. */
+    const char *cmd_preset = get_cmdline_preset();
+    if (cmd_preset && *cmd_preset) return cmd_preset;
+
+    /* 3. Live streaming server (Sunshine, Steam Link, WiVRn): latency is the
+     * primary constraint. Ultrafast executes in 2-4ms per frame on 4 Zen 2
+     * threads, keeping total encode latency well under the 16.6ms 60fps budget.
+     * Slower presets (superfast) can still be selected via quality_level <= 2
+     * or BC250_X264_PRESET. */
+    if (cfg->live) {
+        if (cfg->quality_level > 0 && cfg->quality_level <= 2) {
+            return "superfast";
+        }
+        return "ultrafast";
+    }
+
+    /* 4. By pixel rate first for offline transcodes without explicit preset. */
     const double rate = (double)cfg->width * cfg->height * (cfg->fps ? cfg->fps : 30);
     const double p1080 = 1920.0 * 1080.0;
     int i = rate <= p1080 * 31 ? 2 : (rate <= p1080 * 61 ? 1 : 0);
@@ -50,14 +198,26 @@ const char *h264_x264_preset_for(const h264_x264_config_t *cfg)
 static int threads_for(const h264_x264_config_t *cfg)
 {
     const char *env = getenv("BC250_X264_THREADS");
+    if (!env || !*env) env = getenv("BC250_THREADS");
+    if (!env || !*env) env = getenv("X264_THREADS");
     if (env && *env) {
         int t = atoi(env);
         if (t >= 0 && t <= 64) return t;
     }
+    const char *env_max = getenv("BC250_MAX_CPU_THREADS");
+    if (env_max && *env_max) {
+        int t = atoi(env_max);
+        if (t >= 0 && t <= 64) return t;
+    }
+    int cmd_t = get_cmdline_threads();
+    if (cmd_t > 0 && cmd_t <= 64) return cmd_t;
     /* A streaming server shares the machine with the game it streams:
      * four threads, which is where x264 stops scaling usefully with sliced
-     * threads anyway. Everyone else gets x264's own choice. */
-    return cfg->live ? 4 : 0;
+     * threads anyway. For offline transcode, default to 4 threads as well to
+     * prevent pinning all 16 Zen 2 cores at 100% CPU. Unconstrained auto-threads
+     * can still be requested explicitly via BC250_X264_THREADS=0. */
+    (void)cfg;
+    return 4;
 }
 
 static const char *profile_name(int profile_idc)
@@ -83,7 +243,13 @@ static void set_rate(x264_param_t *p, const h264_x264_config_t *cfg)
     if (cfg->crf > 0) {
         /* ICQ is constant quality, which is what CRF is. */
         p->rc.i_rc_method = X264_RC_CRF;
-        p->rc.f_rf_constant = (float)(cfg->crf > 51 ? 51 : cfg->crf);
+        float crf_val = (float)(cfg->crf > 51 ? 51 : cfg->crf);
+        const char *env_crf = getenv("BC250_X264_CRF");
+        if (env_crf && *env_crf) {
+            float env_val = (float)atof(env_crf);
+            if (env_val >= 0.0f && env_val <= 51.0f) crf_val = env_val;
+        }
+        p->rc.f_rf_constant = crf_val;
         return;
     }
 
@@ -91,21 +257,27 @@ static void set_rate(x264_param_t *p, const h264_x264_config_t *cfg)
     const int fps = cfg->fps ? (int)cfg->fps : 30;
     p->rc.i_rc_method = X264_RC_ABR;
     p->rc.i_bitrate = kbps;
-    switch (cfg->rc_mode) {
-    case RC_LOW_LATENCY:
-        /* One frame of buffer: every frame fits the link on its own, which
-         * is what a stream to a client over a network needs. */
+    if (cfg->live) {
+        /* Live streaming (Sunshine, Steam Link, WiVRn): 1 frame VBV buffer
+         * guarantees every frame fits the network link on its own, preventing
+         * buffer bloat, frame queueing, and stream latency spikes. */
         p->rc.i_vbv_max_bitrate = kbps;
         p->rc.i_vbv_buffer_size = kbps / fps > 0 ? kbps / fps : 1;
-        break;
-    case RC_CBR:
-        p->rc.i_vbv_max_bitrate = kbps;
-        p->rc.i_vbv_buffer_size = kbps;
-        break;
-    default: /* RC_VBR */
-        p->rc.i_vbv_max_bitrate = kbps + kbps / 2;
-        p->rc.i_vbv_buffer_size = kbps * 2;
-        break;
+    } else {
+        switch (cfg->rc_mode) {
+        case RC_LOW_LATENCY:
+            p->rc.i_vbv_max_bitrate = kbps;
+            p->rc.i_vbv_buffer_size = kbps / fps > 0 ? kbps / fps : 1;
+            break;
+        case RC_CBR:
+            p->rc.i_vbv_max_bitrate = kbps;
+            p->rc.i_vbv_buffer_size = kbps;
+            break;
+        default: /* RC_VBR */
+            p->rc.i_vbv_max_bitrate = kbps + kbps / 2;
+            p->rc.i_vbv_buffer_size = kbps * 2;
+            break;
+        }
     }
     if (cfg->cbr_intent && cfg->rc_mode != RC_VBR) {
         p->i_nal_hrd = X264_NAL_HRD_CBR;
@@ -150,6 +322,16 @@ static int open_encoder(h264_x264_t *x, const h264_x264_config_t *cfg)
     p->i_height = (int)cfg->height;
     p->i_csp = X264_CSP_NV12;
     p->i_threads = x->threads;
+    if (cfg->live) {
+        /* Sliced threads process each frame in parallel across threads without
+         * adding frame delay, keeping latency strictly under 4ms.
+         * For Steam Link (steam, streaming_client), hardware and client decoders
+         * drop or fail on multiple slices per frame, causing solid grey or black screens.
+         * Enforce single slice (b_sliced_threads = 0) for Steam Link. */
+        p->b_sliced_threads = is_steam_caller() ? 0 : 1;
+        p->rc.i_lookahead = 0;
+        p->i_sync_lookahead = 0;
+    }
     p->i_fps_num = cfg->fps ? cfg->fps : 30;
     p->i_fps_den = 1;
     p->b_vfr_input = 0;

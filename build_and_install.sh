@@ -1,10 +1,30 @@
 #!/usr/bin/env bash
-# bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix
+# bc250-encoding-decoding-fix v0.5.2 - https://github.com/simpmix/bc250-encoding-decoding-fix
 #
 # build_and_install.sh - Automated build, test, and installer for AMD BC-250 custom drivers
 #
 
 set -e
+
+WITH_AUDIO_FIX=0
+for arg in "$@"; do
+    case "$arg" in
+        --with-audio-fix)
+            WITH_AUDIO_FIX=1
+            ;;
+        --without-audio-fix)
+            WITH_AUDIO_FIX=0
+            ;;
+        -h|--help)
+            echo "Usage: ./build_and_install.sh [options]"
+            echo "Options:"
+            echo "  --with-audio-fix     Install legacy DKMS audio fix (only for older kernels; deprecated on modern/CachyOS kernels)"
+            echo "  --without-audio-fix  Skip DKMS audio fix (default)"
+            echo "  -h, --help           Show this help message"
+            exit 0
+            ;;
+    esac
+done
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -75,11 +95,11 @@ else
         echo -e "\n${BOLD}Attempting to install missing build dependencies...${NC}"
         if command -v apt-get &> /dev/null; then
             $SUDO apt-get update
-            $SUDO apt-get install -y build-essential cmake pkg-config libva-dev libdrm-dev libvulkan-dev libx264-dev glslang-tools vainfo
+            $SUDO apt-get install -y build-essential cmake pkg-config libva-dev libdrm-dev libvulkan-dev libx264-dev libx265-dev glslang-tools vainfo
         elif command -v dnf &> /dev/null; then
             $SUDO dnf install -y gcc gcc-c++ cmake pkgconf libva-devel libdrm-devel vulkan-loader-devel glslang libva-utils
         elif command -v pacman &> /dev/null; then
-            $SUDO pacman -S --needed --noconfirm base-devel cmake pkgconf libva libdrm vulkan-devel x264 glslang libva-utils
+            $SUDO pacman -S --needed --noconfirm base-devel cmake pkgconf libva libdrm vulkan-devel x264 x265 glslang libva-utils
         elif command -v zypper &> /dev/null; then
             $SUDO zypper install -y gcc gcc-c++ cmake pkg-config libva-devel libdrm-devel vulkan-devel glslang libva-utils
         else
@@ -183,10 +203,17 @@ elif [ -f "/etc/environment" ]; then
     fi
 fi
 
-# Optional: Install Audio Fix via DKMS if available
-if [ -d "$SCRIPT_DIR/audio-fix" ] && command -v dkms &> /dev/null; then
-    echo -e "\n${BLUE}Configuring Audio Fix with DKMS...${NC}"
-    (cd "$SCRIPT_DIR/audio-fix" && $SUDO bash ./install_dkms.sh) || echo -e "${YELLOW}DKMS setup skipped.${NC}"
+# Optional: Install Audio Fix via DKMS if explicitly requested
+if [ "$WITH_AUDIO_FIX" -eq 1 ]; then
+    if [ -d "$SCRIPT_DIR/audio-fix" ] && command -v dkms &> /dev/null; then
+        echo -e "\n${BLUE}Configuring Audio Fix with DKMS (--with-audio-fix specified)...${NC}"
+        (cd "$SCRIPT_DIR/audio-fix" && $SUDO bash ./install_dkms.sh) || echo -e "${YELLOW}DKMS setup skipped.${NC}"
+    else
+        echo -e "\n${YELLOW}Audio fix requested but audio-fix directory or dkms not available. Skipping.${NC}"
+    fi
+else
+    echo -e "\n${BLUE}[*] Audio Fix DKMS skipped by default (native kernel audio supported on modern kernels and CachyOS).${NC}"
+    echo -e "    Pass ${BOLD}--with-audio-fix${NC} if you are on an older kernel that requires the legacy DKMS module."
 fi
 
 # Configuration summary

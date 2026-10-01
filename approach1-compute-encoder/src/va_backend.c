@@ -20,6 +20,10 @@
 #include <errno.h>
 #include <math.h>
 
+#if defined(__linux__)
+extern char *program_invocation_short_name;
+#endif
+
 #ifndef VA_RC_ICQ
 #define VA_RC_ICQ 0x00000040
 #endif
@@ -44,6 +48,77 @@ static int big_decode(VAProfile profile, VAEntrypoint entrypoint)
 {
     return entrypoint == VAEntrypointVLD
         && (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10);
+}
+
+static bool is_steam_caller(void)
+{
+#if defined(__linux__)
+    if (!program_invocation_short_name) return false;
+    return (strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0 ||
+            strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
+            strcmp(program_invocation_short_name, "gamescope") == 0 ||
+            strstr(program_invocation_short_name, "steam") != NULL ||
+            strstr(program_invocation_short_name, "gamescope") != NULL);
+#else
+    return false;
+#endif
+}
+
+static int get_cmdline_threads(void)
+{
+#if defined(__linux__)
+    static int cached_threads = -1;
+    if (cached_threads != -1) return cached_threads;
+
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    if (!f) {
+        cached_threads = 0;
+        return 0;
+    }
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        cached_threads = 0;
+        return 0;
+    }
+    buf[n] = '\0';
+
+    size_t pos = 0;
+    while (pos < n) {
+        const char *arg = buf + pos;
+        size_t len = strlen(arg);
+
+        if ((strcmp(arg, "-threads") == 0 || strcmp(arg, "--threads") == 0 ||
+             strcmp(arg, "-slices") == 0 || strcmp(arg, "--slices") == 0) && (pos + len + 1 < n)) {
+            const char *val = buf + pos + len + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-threads=", 9) == 0 || strncmp(arg, "--threads=", 10) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-slices=", 8) == 0 || strncmp(arg, "--slices=", 9) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        }
+        pos += len + 1;
+    }
+    cached_threads = 0;
+#endif
+    return 0;
 }
 
 static bc250_driver_data* get_driver_data(VADriverContextP ctx) {
@@ -73,6 +148,9 @@ VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list
     profile_list[i++] = VAProfileHEVCMain;
     /* Decoded, and encoded from P010 surfaces. */
     profile_list[i++] = VAProfileHEVCMain10;
+    /* Web browser decoding acceleration profiles (Chromium / Firefox / MPV) */
+    profile_list[i++] = VAProfileVP9Profile0;
+    profile_list[i++] = VAProfileAV1Profile0;
     /* Post-processing hangs off no codec at all. */
     profile_list[i++] = VAProfileNone;
 
@@ -93,6 +171,8 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
                                 profile == VAProfileH264High ||
                                 profile == VAProfileHEVCMain ||
                                 profile == VAProfileHEVCMain10 ||
+                                profile == VAProfileVP9Profile0 ||
+                                profile == VAProfileAV1Profile0 ||
                                 profile == VAProfileNone);
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
@@ -120,8 +200,10 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
                             profile == VAProfileH264Main ||
                             profile == VAProfileH264High ||
                             profile == VAProfileHEVCMain ||
-                            profile == VAProfileHEVCMain10);
-    const int can_encode = 1;
+                            profile == VAProfileHEVCMain10 ||
+                            profile == VAProfileVP9Profile0 ||
+                            profile == VAProfileAV1Profile0);
+    const int can_encode = (profile != VAProfileVP9Profile0 && profile != VAProfileAV1Profile0);
     const int count = (can_decode ? 1 : 0) + (can_encode ? 1 : 0);
 
     if (!entrypoint_list) {
@@ -196,6 +278,9 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
                  * HEVC uses 1 slice per picture. */
                 attrib_list[i].value = (profile == VAProfileHEVCMain) ? 1 : 16;
                 break;
+#ifdef VAConfigAttribEncQualityLevels
+            case VAConfigAttribEncQualityLevels:
+#endif
             case VAConfigAttribEncQualityRange:
                 /* Quality levels 1..7 (1 = High Quality, 4 = Balanced, 7 = High Speed) */
                 attrib_list[i].value = 7;
@@ -319,7 +404,7 @@ VAStatus bc250_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config, V
     }
 
     if (!attrib_list) {
-        *num_attribs = both ? 4 : 3;
+        *num_attribs = both ? 5 : 4;
         return VA_STATUS_SUCCESS;
     }
 
@@ -337,6 +422,12 @@ VAStatus bc250_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config, V
         attrib_list[i].value.value.i = VA_FOURCC_P010;
         i++;
     }
+
+    attrib_list[i].type = VASurfaceAttribMemoryType;
+    attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+    attrib_list[i].value.type = VAGenericValueTypeInteger;
+    attrib_list[i].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
+    i++;
 
     attrib_list[i].type = VASurfaceAttribMaxWidth;
     attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
@@ -435,7 +526,81 @@ VAStatus bc250_CreateSurfaces(VADriverContextP ctx, int width, int height, int f
 VAStatus bc250_CreateSurfaces2(VADriverContextP ctx, unsigned int format, unsigned int width, unsigned int height,
                               VASurfaceID *surfaces, unsigned int num_surfaces,
                               VASurfaceAttrib *attrib_list, unsigned int num_attribs) {
-    (void)attrib_list; (void)num_attribs;
+    VASurfaceAttribExternalBuffers *ext_bufs = NULL;
+    int mem_type = 0;
+
+    if (attrib_list && num_attribs > 0) {
+        for (unsigned int i = 0; i < num_attribs; i++) {
+            if (attrib_list[i].type == VASurfaceAttribMemoryType) {
+                mem_type = attrib_list[i].value.value.i;
+            } else if (attrib_list[i].type == VASurfaceAttribExternalBufferDescriptor) {
+                ext_bufs = (VASurfaceAttribExternalBuffers *)attrib_list[i].value.value.p;
+            } else if (attrib_list[i].type == VASurfaceAttribPixelFormat) {
+                uint32_t fourcc = (uint32_t)attrib_list[i].value.value.i;
+                if (fourcc == VA_FOURCC_P010) {
+                    format = VA_RT_FORMAT_YUV420_10;
+                } else if (fourcc == VA_FOURCC_NV12 || fourcc == VA_FOURCC_YV12 || fourcc == VA_FOURCC_I420) {
+                    format = VA_RT_FORMAT_YUV420;
+                }
+            }
+        }
+    }
+
+    /* Attempt hardware zero-copy DMA-BUF memory import if an external buffer descriptor is supplied. */
+    if (ext_bufs && ext_bufs->buffers && ext_bufs->num_buffers >= num_surfaces) {
+        bc250_driver_data *data = get_driver_data(ctx);
+        if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+        DRIVER_LOCK(data);
+
+        const int gpu_format = (format == VA_RT_FORMAT_YUV420_10) ? GPU_IMAGE_P010 : GPU_IMAGE_NV12;
+        unsigned int allocated = 0;
+        for (VASurfaceID i = 1; i < MAX_SURFACES && allocated < num_surfaces; i++) {
+            if (!data->surfaces[i].allocated) {
+                bc250_surface *surf = &data->surfaces[i];
+                memset(surf, 0, sizeof(*surf));
+                int fd = (int)ext_bufs->buffers[allocated];
+                uint32_t stride = ext_bufs->pitches ? ext_bufs->pitches[0] : 0;
+                uint32_t offset = (ext_bufs->offsets && ext_bufs->num_planes > 1) ? ext_bufs->offsets[1] : 0;
+
+                if (gpu_compute_import_dmabuf_image(&data->gpu, fd, width, height, gpu_format,
+                                                    stride, offset, &surf->image, &surf->memory) != 0) {
+                    memset(surf, 0, sizeof(*surf));
+                    break;
+                }
+
+                void *mapped = NULL;
+                if (surf->memory.memory && vkMapMemory(data->gpu.device, surf->memory.memory, 0, surf->memory.size, 0, &mapped) == VK_SUCCESS) {
+                    surf->mapped_ptr = mapped;
+                    surf->memory.mapped_ptr = mapped;
+                }
+
+                surf->allocated = 1;
+                surf->width = width;
+                surf->height = height;
+                surf->format = format;
+                surf->ref_count = 1;
+                surf->is_exported = 1;
+                surfaces[allocated++] = i;
+            }
+        }
+
+        if (allocated < num_surfaces) {
+            bc250_DestroySurfaces(ctx, surfaces, allocated);
+            DRIVER_UNLOCK(data);
+            return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+        }
+
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_SUCCESS;
+    }
+
+    if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_VA && mem_type != 0) {
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+    if (ext_bufs) {
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+
     return bc250_CreateSurfaces(ctx, width, height, format, num_surfaces, surfaces);
 }
 
@@ -573,7 +738,9 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                                     if (program_invocation_short_name &&
                                         (strcmp(program_invocation_short_name, "sunshine") == 0 ||
                                          strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
-                                         strcmp(program_invocation_short_name, "wivrn") == 0)) {
+                                         strcmp(program_invocation_short_name, "wivrn") == 0 ||
+                                         strcmp(program_invocation_short_name, "steam") == 0 ||
+                                         strcmp(program_invocation_short_name, "streaming_client") == 0)) {
                                         hevc_encoder_set_rc_mode(c->hevc_enc, RC_LOW_LATENCY);
                                     } else {
                                         hevc_encoder_set_rc_mode(c->hevc_enc, RC_CBR);
@@ -586,7 +753,9 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                                     if (program_invocation_short_name &&
                                         (strcmp(program_invocation_short_name, "sunshine") == 0 ||
                                          strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
-                                         strcmp(program_invocation_short_name, "wivrn") == 0)) {
+                                         strcmp(program_invocation_short_name, "wivrn") == 0 ||
+                                         strcmp(program_invocation_short_name, "steam") == 0 ||
+                                         strcmp(program_invocation_short_name, "streaming_client") == 0)) {
                                         hevc_encoder_set_rc_mode(c->hevc_enc, RC_LOW_LATENCY);
                                     } else {
                                         hevc_encoder_set_rc_mode(c->hevc_enc, RC_VBR);
@@ -602,6 +771,26 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                 } else {
                     c->h264_enc = h264_encoder_create(&data->gpu, picture_width, picture_height, 30, 4000000, prof);
                     if (c->h264_enc) {
+                        int def_slices = is_steam_caller() ? 1 : 4;
+                        const char *s_env = getenv("BC250_SLICES_PER_FRAME");
+                        if (s_env) {
+                            int s = atoi(s_env);
+                            if (s >= 1 && s <= 16) def_slices = s;
+                        } else {
+                            int cmd_t = get_cmdline_threads();
+                            if (cmd_t >= 1 && cmd_t <= 16) def_slices = cmd_t;
+                            else if (picture_width < 1280 && picture_height < 720) def_slices = 1;
+                        }
+                        /* Steam Link hardware and client decoders fail on multi-slice H.264 streams,
+                         * rendering a grey or black screen. Steam Link callers MUST stay on 1 slice
+                         * unless explicitly forced with BC250_FORCE_SLICES=1. */
+                        if (is_steam_caller()) {
+                            const char *force_slices = getenv("BC250_FORCE_SLICES");
+                            if (!force_slices || (strcmp(force_slices, "1") != 0 && strcmp(force_slices, "true") != 0)) {
+                                def_slices = 1;
+                            }
+                        }
+                        h264_encoder_set_num_slices(c->h264_enc, def_slices);
                         for (int a = 0; a < data->configs[config_id].num_attribs; a++) {
                             if (data->configs[config_id].attribs[a].type == VAConfigAttribRateControl) {
                                 unsigned int rc_attrib = data->configs[config_id].attribs[a].value;
@@ -614,7 +803,9 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                                     if (program_invocation_short_name &&
                                         (strcmp(program_invocation_short_name, "sunshine") == 0 ||
                                          strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
-                                         strcmp(program_invocation_short_name, "wivrn") == 0)) {
+                                         strcmp(program_invocation_short_name, "wivrn") == 0 ||
+                                         strcmp(program_invocation_short_name, "steam") == 0 ||
+                                         strcmp(program_invocation_short_name, "streaming_client") == 0)) {
                                         h264_encoder_set_rc_mode(c->h264_enc, RC_LOW_LATENCY);
                                     } else {
                                         h264_encoder_set_rc_mode(c->h264_enc, RC_CBR);
@@ -641,12 +832,20 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                 c->vpp = 1;
                 c->vpp_state.source = VA_INVALID_SURFACE;
             } else if (entry == VAEntrypointVLD) {
-                if (prof == VAProfileHEVCMain || prof == VAProfileHEVCMain10)
+                if (prof == VAProfileHEVCMain || prof == VAProfileHEVCMain10) {
                     c->h265_dec = hevc_decoder_create(&data->gpu, picture_width,
                                                       picture_height);
-                else
+                } else if (prof == VAProfileVP9Profile0 || prof == VAProfileAV1Profile0) {
+                    /* Not implemented in CPU software decoder; reject context creation
+                     * so Chromium/Firefox/mpv fall back to built-in libvpx/dav1d
+                     * instead of producing blank/frozen frames. */
+                    memset(c, 0, sizeof(*c));
+                    DRIVER_UNLOCK(data);
+                    return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+                } else {
                     c->h264_dec = h264_decoder_create(&data->gpu, picture_width,
                                                       picture_height);
+                }
             }
 
             *context = i;
@@ -1200,13 +1399,13 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                             double pixel_rate = (double)w * (double)h * 30.0;
                             if (c->h264_enc) {
                                 double base_bps = pixel_rate * 0.0643004;
-                                uint32_t q = 20;
+                                uint32_t q = 23; /* standard x264 default CRF is 23 (~5.0 Mbps at 1080p) */
 #if defined(VA_CHECK_VERSION) && VA_CHECK_VERSION(1, 1, 0)
                                 if (rc->ICQ_quality_factor >= 1 && rc->ICQ_quality_factor <= 51) {
                                     q = rc->ICQ_quality_factor;
                                 }
 #endif
-                                target_bps = (uint32_t)(base_bps * pow(2.0, (20.0 - (double)q) / 6.0));
+                                target_bps = (uint32_t)(base_bps * pow(2.0, (23.0 - (double)q) / 6.0));
                                 /* x264 does real constant quality; the bitrate above
                                  * is only what the compute encoder falls back on. */
                                 h264_encoder_set_icq_quality(c->h264_enc, (int)q);
@@ -1828,6 +2027,11 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
             surf->ref_count++;
             buf->derived_surface = surface;
             img->surface_id = surface;
+        } else {
+            bc250_DestroyBuffer(ctx, img->buffer_id);
+            img->allocated = 0;
+            DRIVER_UNLOCK(data);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
         }
     }
     DRIVER_UNLOCK(data);
@@ -2243,7 +2447,7 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
     data->max_width = BC250_MAX_DECODE_SIDE;
     data->max_height = BC250_MAX_DECODE_SIDE;
     ctx->pDriverData = data;
-    ctx->str_vendor = "AMD BC-250 RDNA2 Compute VA-API Driver";
+    ctx->str_vendor = "AMD BC-250 Compute VA-API Driver";
 
 #ifdef _OPENMP
     /* OpenMP Thread Pool & Wait Policy Management:
@@ -2254,23 +2458,31 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
      * Multi-threading can be explicitly enabled by the user via BC250_MAX_CPU_THREADS. */
     setenv("OMP_WAIT_POLICY", "PASSIVE", 1);
     setenv("GOMP_SPINCOUNT", "0", 1);
-    omp_set_dynamic(0);
     const char *max_t = getenv("BC250_MAX_CPU_THREADS");
-    int def_threads = 1;
+    if (!max_t) max_t = getenv("BC250_THREADS");
+    if (!max_t) max_t = getenv("BC250_CPU_THREADS");
+    int def_threads = 4;
     if (max_t && *max_t) {
         int v = atoi(max_t);
-        if (v > 0 && v <= 8) def_threads = v;
+        if (v > 0 && v <= 16) def_threads = v;
     }
 #if defined(__linux__)
     else if (program_invocation_short_name) {
-        if (strcmp(program_invocation_short_name, "sunshine") == 0) {
+        if (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+            strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0) {
             def_threads = 2;
         } else if (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
                    strcmp(program_invocation_short_name, "wivrn") == 0) {
             def_threads = 4;
+        } else if (strcmp(program_invocation_short_name, "ffmpeg") == 0 ||
+                   strcmp(program_invocation_short_name, "ffmpeg_g") == 0) {
+            def_threads = 4;
         }
     }
 #endif
+    int cmd_t = get_cmdline_threads();
+    if (cmd_t > 0 && cmd_t <= 16) def_threads = cmd_t;
     omp_set_num_threads(def_threads);
 #endif
 

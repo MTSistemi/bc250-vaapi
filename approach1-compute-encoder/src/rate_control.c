@@ -129,6 +129,45 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
     }
 }
 
+void rc_update_bitrate(rate_control_t *rc, uint32_t bitrate, uint32_t width, uint32_t height) {
+    if (!rc || bitrate == 0 || bitrate == rc->target_bitrate) return;
+    double old_rate = (double)(rc->target_bitrate > 0 ? rc->target_bitrate : bitrate);
+    double ratio = (double)bitrate / old_rate;
+
+    rc->target_bitrate = bitrate;
+    double fps = (rc->framerate > 0.0) ? rc->framerate : 30.0;
+    rc->target_bits_per_frame = (uint32_t)(rc->target_bitrate / fps);
+    if (rc->target_bits_per_frame < 100) rc->target_bits_per_frame = 100;
+
+    int64_t old_size = rc->buffer_size;
+    if (rc->mode == RC_LOW_LATENCY) {
+        rc->buffer_size = rc->target_bits_per_frame * 2;
+    } else {
+        rc->buffer_size = rc->target_bitrate;
+    }
+    if (rc->buffer_size < 1000) rc->buffer_size = 1000;
+
+    if (old_size > 0) {
+        rc->buffer_fullness = (int64_t)((double)rc->buffer_fullness * ratio);
+        if (rc->buffer_fullness > rc->buffer_size) rc->buffer_fullness = rc->buffer_size;
+        if (rc->buffer_fullness < 0) rc->buffer_fullness = 0;
+    } else {
+        rc->buffer_fullness = rc->buffer_size / 2;
+    }
+
+    int new_base = rc_estimate_base_qp(rc->target_bitrate, rc->framerate, width, height);
+    int qp_diff = new_base - rc->base_qp;
+    rc->base_qp = new_base;
+    rc->current_qp += qp_diff;
+    if (rc->current_qp < rc->qp_min) rc->current_qp = rc->qp_min;
+    if (rc->current_qp > rc->qp_max) rc->current_qp = rc->qp_max;
+
+    if (getenv("BC250_DEBUG_RC")) {
+        fprintf(stderr, "[bc250-rc] rc_update_bitrate: target=%u bps -> base_qp=%d current_qp=%d fullness=%lld\n",
+                rc->target_bitrate, rc->base_qp, rc->current_qp, (long long)rc->buffer_fullness);
+    }
+}
+
 /*
  * Integral-term time constant and gain. This file's header comment has
  * always described a "Proportional-Integral" controller, and the struct
@@ -286,7 +325,9 @@ void rc_update_stats(rate_control_t *rc, int bits_used) {
                 if (program_invocation_short_name &&
                     (strcmp(program_invocation_short_name, "sunshine") == 0 ||
                      strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
-                     strcmp(program_invocation_short_name, "wivrn") == 0)) {
+                     strcmp(program_invocation_short_name, "wivrn") == 0 ||
+                     strcmp(program_invocation_short_name, "steam") == 0 ||
+                     strcmp(program_invocation_short_name, "streaming_client") == 0)) {
                     wallclock_drain_mode = 1;
                 } else {
                     wallclock_drain_mode = 0;

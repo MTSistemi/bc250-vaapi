@@ -1,0 +1,146 @@
+/*
+ * Copyright (c) 2026 BC-250 Project Contributors
+ * SPDX-License-Identifier: GPL-3.0-only
+ *
+ * test_x265.c - Unit test for libx265 fallback HEVC encoding backend:
+ * verifies single-frame zero-latency output, VPS/SPS/PPS parameter sets,
+ * IDR generation, and rate control modes.
+ */
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "encoder_x265.h"
+#include "rate_control.h"
+
+#define W 320
+#define H 240
+
+static uint8_t y_plane[W * H];
+static uint8_t uv_plane[W * H / 2];
+static uint8_t out[W * H * 4];
+
+static void fill_frame(int frame)
+{
+    for (int r = 0; r < H; r++) {
+        for (int c = 0; c < W; c++) {
+            y_plane[r * W + c] = (uint8_t)((c + frame * 3) ^ (r * 2));
+        }
+    }
+    for (int i = 0; i < W * H / 2; i++) {
+        uv_plane[i] = (uint8_t)(128 + ((i + frame) & 15));
+    }
+}
+
+/* Parse HEVC NAL unit types in an Annex B bitstream */
+static int hevc_nal_types(const uint8_t *b, int n, int *types, int max)
+{
+    int count = 0;
+    for (int i = 0; i + 4 < n && count < max; i++) {
+        if (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1) {
+            /* HEVC NAL header is 2 bytes: (byte 0 >> 1) & 0x3F */
+            types[count++] = (b[i + 3] >> 1) & 0x3F;
+            i += 3;
+        } else if (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 0 && b[i + 3] == 1) {
+            types[count++] = (b[i + 4] >> 1) & 0x3F;
+            i += 4;
+        }
+    }
+    return count;
+}
+
+static int has_nal(const int *t, int n, int type)
+{
+    for (int i = 0; i < n; i++) {
+        if (t[i] == type) return 1;
+    }
+    return 0;
+}
+
+static void run_hevc_test(const char *what, hevc_x265_config_t cfg, int frames, int idr_at)
+{
+    hevc_x265_t *x = hevc_x265_create();
+    assert(x && "hevc_x265_create failed");
+
+    for (int f = 0; f < frames; f++) {
+        fill_frame(f);
+        int n = hevc_x265_encode(x, &cfg, y_plane, W, uv_plane, W,
+                                 f == idr_at, cfg.rc_mode == RC_CQP ? cfg.qp : 0,
+                                 out, sizeof(out));
+        assert(n > 0 && "every frame in must output encoded bitstream");
+
+        int t[64];
+        int k = hevc_nal_types(out, n, t, 64);
+        assert(k > 0 && "bitstream must contain at least one valid HEVC NAL unit");
+
+        if (f == 0 || f == idr_at) {
+            /* VPS (32), SPS (33), PPS (34), IDR (19 or 20) or CRA (21) */
+            int has_headers = has_nal(t, k, 32) && has_nal(t, k, 33) && has_nal(t, k, 34);
+            int has_key = has_nal(t, k, 19) || has_nal(t, k, 20) || has_nal(t, k, 21);
+            assert((has_headers || has_key) && "First frame or IDR frame must have parameter sets or keyframe NAL");
+        }
+    }
+
+    hevc_x265_destroy(x);
+    printf("[test_x265] %-32s ok\n", what);
+}
+
+int main(void)
+{
+    const hevc_x265_config_t base = {
+        .width = W,
+        .height = H,
+        .fps = 30,
+        .gop = 1000,
+        .rc_mode = RC_CQP,
+        .qp = 26,
+        .quality_level = 4,
+        .ten_bit = false,
+        .live = true,
+    };
+    hevc_x265_config_t c;
+
+    run_hevc_test("HEVC CQP Main Profile", base, 6, 3);
+
+    c = base;
+    c.rc_mode = RC_VBR;
+    c.bitrate = 600000;
+    run_hevc_test("HEVC VBR Mode", c, 6, -1);
+
+    c = base;
+    c.rc_mode = RC_CBR;
+    c.bitrate = 600000;
+    c.cbr_intent = true;
+    run_hevc_test("HEVC CBR Mode", c, 6, -1);
+
+    c = base;
+    c.rc_mode = RC_LOW_LATENCY;
+    c.bitrate = 500000;
+    c.live = true;
+    run_hevc_test("HEVC Low Latency Live", c, 6, -1);
+
+    /* Dynamic bitrate reconfiguration test */
+    {
+        hevc_x265_t *x = hevc_x265_create();
+        assert(x);
+        hevc_x265_config_t dyn = base;
+        dyn.rc_mode = RC_VBR;
+        dyn.bitrate = 500000;
+        fill_frame(0);
+        int n1 = hevc_x265_encode(x, &dyn, y_plane, W, uv_plane, W, false, 0, out, sizeof(out));
+        assert(n1 > 0);
+
+        /* Change bitrate on the fly */
+        dyn.bitrate = 1200000;
+        fill_frame(1);
+        int n2 = hevc_x265_encode(x, &dyn, y_plane, W, uv_plane, W, false, 0, out, sizeof(out));
+        assert(n2 > 0);
+
+        hevc_x265_destroy(x);
+        printf("[test_x265] %-32s ok\n", "Dynamic bitrate reconfig");
+    }
+
+    printf("[test_x265] all tests passed!\n");
+    return 0;
+}

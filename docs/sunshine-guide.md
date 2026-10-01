@@ -2,7 +2,7 @@
 
 ## Overview
 
-The AMD BC-250 mining card features an 8-core AMD Zen 2 CPU, 40 RDNA 2 Compute Units (CUs), and 16 GB of high-speed unified GDDR6 memory. However, the fixed-function Video Core Next (VCN) ASIC is disabled/fused off on these salvage dies.
+The AMD BC-250 mining card features an 8-core AMD Zen 2 CPU, 40 Compute Units (CUs, Oberon / Cyan Skillfish semi-custom architecture), and 16 GB of high-speed unified GDDR6 memory. However, the fixed-function Video Core Next (VCN) ASIC is disabled/fused off on these salvage dies.
 
 The **bc250-encoding-decoding-fix** driver restores ultra-low-latency game streaming by combining Vulkan compute shaders with a **Dynamic 4-Tier Hybrid Load Governor** and **AVX2 SIMD CPU offloading**.
 
@@ -145,3 +145,32 @@ sudo install -Dm755 bc250_drv_video.so /usr/lib32/dri/bc250_drv_video.so
 sudo install -Dm755 bc250_drv_video.so /usr/lib/i386-linux-gnu/dri/bc250_drv_video.so
 ```
 In `streaming_log.txt` (or Steam console output), verify that Steam loads `/usr/lib32/dri/bc250_drv_video.so`. The driver automatically enforces passive OpenMP thread waiting (`OMP_WAIT_POLICY=PASSIVE`, `GOMP_SPINCOUNT=0`) and caps slice worker threads to 2 (`BC250_MAX_CPU_THREADS=2`) to guarantee low host CPU usage.
+
+### 4. Gaming Mode (Gamescope Session) Setup & Blank/Green Screen Troubleshooting
+When running Bazzite, SteamOS, or CachyOS in **Gaming Mode**, the compositor is **Gamescope**, which runs directly on DRM/KMS rather than a standard desktop Wayland/X11 session.
+
+#### 1. Grant KMS Capabilities to Sunshine
+Inside Gamescope, Sunshine cannot capture via Wayland or `xdg-desktop-portal`. It must capture the display via direct DRM/KMS screencasting (`capture = kms`).
+* On Arch / CachyOS / Bazzite, `/usr/bin/sunshine` is often a wrapper script or symlink. Use `readlink -f` to apply capabilities directly to the canonical binary:
+```bash
+sudo setcap cap_sys_admin,cap_sys_nice+p $(readlink -f $(which sunshine))
+```
+* If Sunshine is launched via a systemd user unit (`systemctl --user start sunshine`), systemd strips file capabilities by default unless ambient capabilities are specified. Add the following under the `[Service]` block in `~/.config/systemd/user/sunshine.service`:
+```ini
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE
+```
+* **Gamescope Direct Scanout (Black Screen Fix)**: When Gamescope bypasses its compositor for direct display scanout, KMS plane 0 cannot be read by secondary processes. To prevent this, open Steam Game Mode: **Settings -> System -> Developer Mode**, and enable **"Force Composite"**.
+
+#### 2. Install the VA-API Boot Redirect
+Granting `cap_sys_admin` puts Linux into secure-execution mode (`AT_SECURE`), causing `libva` to discard user environment variables like `LIBVA_DRIVER_NAME=bc250`. To ensure `libva` loads `bc250_drv_video.so` instead of the non-functional `radeonsi` driver:
+```bash
+sudo ./tools/install_vaapi_boot_redirect.sh
+```
+
+#### 3. Configure the Correct DRM Adapter Node
+In the Sunshine Web UI (**Configuration -> Audio/Video -> adapter_name**):
+* On the BC-250 APU, the active monitor output (e.g. `DP-1`) is frequently connected to `/dev/dri/card1` rather than `/dev/dri/card0`.
+* Run `./tools/bc250_diagnose.sh` to check which card node owns the active connector. Setting `adapter_name = /dev/dri/card1` ensures Sunshine captures the actual display plane rather than an inactive dummy connector.
+
+#### 4. Green Screen Resolution in v0.5.1+
+* If you previously experienced a solid green screen or blank screen when connecting in Gaming Mode, update to driver release **v0.5.1** or newer. Release v0.5.1 fixes `bc250_CreateSurfaces2` to reject un-imported DMA-BUF external memory types (`DRM_PRIME_2`), forcing Sunshine to execute its working OpenGL/EGL blit path (`vaExportSurfaceHandle`) rather than encoding an uninitialized buffer.

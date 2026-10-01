@@ -16,6 +16,9 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
+#if defined(__linux__)
+extern char *program_invocation_short_name;
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -211,6 +214,32 @@ struct h264_encoder {
     cpu_simd_me_config_t me_cfg;
     gpu_mv_t *cpu_mvs;
     size_t cpu_mvs_cap;
+
+    /* Host-heap (ordinary cached RAM) copies of the two luma planes the CPU
+     * ME offload searches: the current frame and the reconstruction.
+     *
+     * WHY THIS EXISTS, and it is not a micro-optimisation: the surfaces they
+     * are copied from are allocated HOST_VISIBLE|HOST_COHERENT (see
+     * gpu_compute_create_image()), which on this APU is the GART aperture
+     * rather than a cached host mapping - a CPU load from it cannot be served
+     * by the CPU's caches at all. cpu_simd_me_search_frame() is built to be
+     * read-friendly (SIMD SAD, spatial-predicator and static-block early
+     * exits) and that only pays off out of cache: its worst case, the
+     * diamond search, is up to ~34 sixteen-byte loads per 16x16 block, and at
+     * 1080p that is millions of scattered uncached reads - tens of
+     * milliseconds, every frame, for the "cheap CPU fallback" that exists
+     * precisely because the GPU was slow. The early exits are also exactly
+     * what stops it on static content and what fails on fast action, so the
+     * worst case is reached in precisely the situation where the offload was
+     * engaged. One sequential row-by-row copy of each luma plane per frame is
+     * two streaming passes over ~3 MB, and after it the search runs out of
+     * ordinary cached memory.
+     *
+     * Allocated once per resolution and reused; freed in
+     * h264_encoder_destroy(). */
+    uint8_t *me_src_stage;
+    uint8_t *me_ref_stage;
+    size_t me_stage_cap;
 
 #ifdef BC250_HAVE_X264
     /* Non-NULL when H.264 goes through libx264 - see encoder_x264.h. The
@@ -887,6 +916,32 @@ static int gpu_chroma_pred_mode(const uint32_t *pred_modes, uint32_t mb_idx) {
     return pred_modes ? (int)((pred_modes[mb_idx] >> 2) & 0x3u) : H264_CHROMA_DC;
 }
 
+int h264_sanitize_i16_mode(int mode, bool top_avail, bool left_avail) {
+    if (!top_avail && !left_avail) {
+        return H264_I16x16_DC;
+    }
+    if (!top_avail && (mode == H264_I16x16_VERT || mode == H264_I16x16_PLANE)) {
+        return left_avail ? H264_I16x16_HORIZ : H264_I16x16_DC;
+    }
+    if (!left_avail && (mode == H264_I16x16_HORIZ || mode == H264_I16x16_PLANE)) {
+        return top_avail ? H264_I16x16_VERT : H264_I16x16_DC;
+    }
+    return mode;
+}
+
+int h264_sanitize_chroma_mode(int mode, bool top_avail, bool left_avail) {
+    if (!top_avail && !left_avail) {
+        return H264_CHROMA_DC;
+    }
+    if (!top_avail && (mode == H264_CHROMA_VERT || mode == H264_CHROMA_PLANE)) {
+        return left_avail ? H264_CHROMA_HORIZ : H264_CHROMA_DC;
+    }
+    if (!left_avail && (mode == H264_CHROMA_HORIZ || mode == H264_CHROMA_PLANE)) {
+        return top_avail ? H264_CHROMA_VERT : H264_CHROMA_DC;
+    }
+    return mode;
+}
+
 /* Neighbor MV lookup for the P16x16 MVD predictor below: (dx,dy) is a
  * neighbor offset in MB units (e.g. left=(-1,0), top=(0,-1)). Unavailable
  * (off-picture, or belongs to an earlier slice) is reported via *avail. */
@@ -1065,8 +1120,12 @@ static int mb_has_any_chroma_nonzero(const int16_t *quant_levels, const int *dc_
 static void encode_mb_i16x16(bitstream_t *bs, const int16_t *quant_levels, const int *dc_coeff,
                               const uint32_t *pred_modes,
                               uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp) {
-    int pred_mode = gpu_pred_mode_i16(pred_modes, mb);
-    int chroma_pred_mode = gpu_chroma_pred_mode(pred_modes, mb);
+    bool left_avail = (mbx > 0 && (mb - 1) >= nc->start_mb);
+    bool top_avail  = (mby > 0 && (mb - nc->width_in_mbs) >= nc->start_mb);
+    int raw_luma_mode = gpu_pred_mode_i16(pred_modes, mb);
+    int raw_chroma_mode = gpu_chroma_pred_mode(pred_modes, mb);
+    int pred_mode = h264_sanitize_i16_mode(raw_luma_mode, top_avail, left_avail);
+    int chroma_pred_mode = h264_sanitize_chroma_mode(raw_chroma_mode, top_avail, left_avail);
     {
         const char *dbg = getenv("BC250_DEBUG_I16_MB");
         if (dbg && (uint32_t)atoi(dbg) == mb) {
@@ -1426,7 +1485,12 @@ static void encode_mb_i16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
                                     const uint32_t *pred_modes,
                                     uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp,
                                     bool *last_dqp_nonzero) {
-    int pred_mode = gpu_pred_mode_i16(pred_modes, mb);
+    bool left_avail = (mbx > 0 && (mb - 1) >= nc->start_mb);
+    bool top_avail  = (mby > 0 && (mb - nc->width_in_mbs) >= nc->start_mb);
+    int raw_luma_mode = gpu_pred_mode_i16(pred_modes, mb);
+    int raw_chroma_mode = gpu_chroma_pred_mode(pred_modes, mb);
+    int pred_mode = h264_sanitize_i16_mode(raw_luma_mode, top_avail, left_avail);
+    int chroma_pred_mode = h264_sanitize_chroma_mode(raw_chroma_mode, top_avail, left_avail);
 
     int dc_in[4][4];
     for (int r = 0; r < 4; r++)
@@ -1464,13 +1528,7 @@ static void encode_mb_i16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
                     (mby > 0 && (mb - nc->width_in_mbs) >= nc->start_mb ? 1 : 0);
     cabac_write_mb_type_i16x16(cb, ctx_intra, cbp_luma_flag != 0, cbp_chroma, pred_mode);
 
-    /* intra_chroma_pred_mode: this project always transmits mode 0 (DC) -
-     * see cavlc_write_mb_i16x16_header()'s hardcoded 0 - so every possible
-     * neighbor also always has mode 0, making the ctxIdxInc formula's
-     * "neighbor's mode != 0" test always false regardless of availability;
-     * ctx is therefore always 0 without needing a dedicated neighbor-mode
-     * tracking array. */
-    cabac_write_intra_chroma_pred_mode(cb, 0, 0);
+    cabac_write_intra_chroma_pred_mode(cb, 0, chroma_pred_mode);
 
     *last_dqp_nonzero = cabac_write_qp_delta(cb, 0, *last_dqp_nonzero);
 
@@ -1643,6 +1701,114 @@ static void encode_mb_p16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
     }
 }
 
+static int get_cmdline_threads(void)
+{
+#if defined(__linux__)
+    static int cached_threads = -1;
+    if (cached_threads != -1) return cached_threads;
+
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    if (!f) {
+        cached_threads = 0;
+        return 0;
+    }
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        cached_threads = 0;
+        return 0;
+    }
+    buf[n] = '\0';
+
+    size_t pos = 0;
+    while (pos < n) {
+        const char *arg = buf + pos;
+        size_t len = strlen(arg);
+
+        if ((strcmp(arg, "-threads") == 0 || strcmp(arg, "--threads") == 0 ||
+             strcmp(arg, "-slices") == 0 || strcmp(arg, "--slices") == 0) && (pos + len + 1 < n)) {
+            const char *val = buf + pos + len + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-threads=", 9) == 0 || strncmp(arg, "--threads=", 10) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-slices=", 8) == 0 || strncmp(arg, "--slices=", 9) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        }
+        pos += len + 1;
+    }
+    cached_threads = 0;
+#endif
+    return 0;
+}
+
+static int get_default_slice_threads(int num_slices) {
+    const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
+    if (!env_threads) env_threads = getenv("BC250_THREADS");
+    if (!env_threads) env_threads = getenv("BC250_CPU_THREADS");
+    if (env_threads) {
+        int t = atoi(env_threads);
+        if (t >= 1 && t <= 16) return (num_slices < t) ? num_slices : t;
+    }
+    const char *env_no_omp = getenv("BC250_DISABLE_OPENMP");
+    if (env_no_omp && (strcmp(env_no_omp, "0") != 0 && strcmp(env_no_omp, "false") != 0)) {
+        return 1;
+    }
+    int cmd_t = get_cmdline_threads();
+    if (cmd_t >= 1 && cmd_t <= 16) {
+        return (num_slices < cmd_t) ? num_slices : cmd_t;
+    }
+#if defined(__linux__)
+    if (program_invocation_short_name) {
+        if (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+            strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0) {
+            return (num_slices < 2) ? 1 : 2;
+        } else if (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+                   strcmp(program_invocation_short_name, "wivrn") == 0) {
+            int def_cap = (num_slices > 4) ? (num_slices > 16 ? 16 : num_slices) : 4;
+            return (num_slices < def_cap) ? num_slices : def_cap;
+        } else if (strcmp(program_invocation_short_name, "ffmpeg") == 0 ||
+                   strcmp(program_invocation_short_name, "ffmpeg_g") == 0) {
+            int def_cap = (num_slices > 4) ? (num_slices > 16 ? 16 : num_slices) : 4;
+            return (num_slices < def_cap) ? num_slices : def_cap;
+        }
+    }
+#endif
+    int def_cap = (num_slices > 4) ? (num_slices > 16 ? 16 : num_slices) : 4;
+    return (num_slices < def_cap) ? num_slices : def_cap;
+}
+
+static bool is_steam_caller(void)
+{
+#if defined(__linux__)
+    if (!program_invocation_short_name) return false;
+    return (strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0 ||
+            strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
+            strcmp(program_invocation_short_name, "gamescope") == 0 ||
+            strstr(program_invocation_short_name, "steam") != NULL ||
+            strstr(program_invocation_short_name, "gamescope") != NULL);
+#else
+    return false;
+#endif
+}
+
 h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
                                     uint32_t width, uint32_t height,
                                     uint32_t fps, uint32_t bitrate,
@@ -1668,14 +1834,43 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
     if (slice_env) {
         int s = atoi(slice_env);
         if (s >= 1 && s <= 16) encoder->num_slices = s;
+    } else {
+        int cmd_t = get_cmdline_threads();
+        if (cmd_t >= 1 && cmd_t <= 16) {
+            encoder->num_slices = cmd_t;
+        } else {
+            const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
+            if (!env_threads) env_threads = getenv("BC250_THREADS");
+            if (!env_threads) env_threads = getenv("BC250_CPU_THREADS");
+            if (env_threads) {
+                int t = atoi(env_threads);
+                if (t >= 1 && t <= 16) encoder->num_slices = t;
+            }
+#if defined(__linux__)
+            else if (program_invocation_short_name &&
+                     (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+                      strcmp(program_invocation_short_name, "wivrn") == 0 ||
+                      strcmp(program_invocation_short_name, "ffmpeg") == 0 ||
+                      strcmp(program_invocation_short_name, "ffmpeg_g") == 0)) {
+                encoder->num_slices = 4;
+            }
+#endif
+            else if (gpu_ctx != NULL && encoder->total_mbs >= 1000) {
+                /* When backed by real GPU context at HD/FHD resolutions (>= 720p),
+                 * default to 4 slices for multi-threaded parallel OpenMP entropy coding. */
+                encoder->num_slices = 4;
+            }
+        }
     }
 #if defined(__linux__)
-    else if (program_invocation_short_name &&
-             (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
-              strcmp(program_invocation_short_name, "wivrn") == 0)) {
-        /* WiVRn encodes high-res VR streams (typically >= 1800x1800 per eye).
-         * Multi-slice H.264 enables parallel entropy coding and drastically reduces VR latency. */
-        encoder->num_slices = 4;
+    /* Steam Link hardware/app client decoders fail on multi-slice H.264 streams,
+     * rendering a grey or black screen. Steam Link callers MUST stay on 1 slice
+     * unless explicitly forced with BC250_FORCE_SLICES=1. */
+    if (is_steam_caller()) {
+        const char *force_slices = getenv("BC250_FORCE_SLICES");
+        if (!force_slices || (strcmp(force_slices, "1") != 0 && strcmp(force_slices, "true") != 0)) {
+            encoder->num_slices = 1;
+        }
     }
 #endif
     encoder->quality_level = 4;
@@ -1817,17 +2012,32 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
 #ifdef BC250_HAVE_X264
     {
         const char *be = getenv("BC250_H264_BACKEND");
-        if (!be || strcmp(be, "compute") != 0)
+        if (!be || (strcmp(be, "compute") != 0 && strcmp(be, "hybrid") != 0 && strcmp(be, "gpu") != 0))
             encoder->x264 = h264_x264_create();
     }
     if (encoder->x264) {
-        fprintf(stderr, "[bc250-h264] Encoder initialized: %ux%u, profile %d, backend=x264\n",
+        fprintf(stderr, "[bc250-h264] Encoder initialized: %ux%u, profile %d, backend=x264 (CPU libx264; set BC250_H264_BACKEND=compute for GPU/hybrid)\n",
                 width, height, prof_idc);
         return encoder;
     }
 #endif
-    fprintf(stderr, "[bc250-h264] Encoder initialized: %ux%u @ %u fps, %u bps, profile %d, entropy=%s, hybrid_governor=enabled\n",
-            width, height, encoder->fps, bitrate, prof_idc, use_cabac ? "CABAC" : "CAVLC");
+    /* Compute/Hybrid GPU+CPU backend */
+    const char *be = getenv("BC250_H264_BACKEND");
+    bool gpu_only = be && strcmp(be, "gpu") == 0;
+    if (gpu_only) {
+        encoder->governor.enabled = false;
+        encoder->governor.cpu_offload_enabled = false;
+    } else {
+        encoder->governor.enabled = true;
+        encoder->governor.cpu_offload_enabled = true;
+    }
+    fprintf(stderr, "[bc250-h264] Encoder initialized: %ux%u @ %u fps, %u bps, profile %d, backend=%s, entropy=%s, slices=%d, threads=%d, hybrid_governor=%s\n",
+            width, height, encoder->fps, bitrate, prof_idc,
+            gpu_only ? "gpu" : (be && strcmp(be, "hybrid") == 0 ? "hybrid" : "compute"),
+            use_cabac ? "CABAC" : "CAVLC",
+            encoder->num_slices,
+            get_default_slice_threads(encoder->num_slices),
+            encoder->governor.enabled ? "enabled" : "disabled");
 
     return encoder;
 }
@@ -1855,8 +2065,7 @@ void h264_encoder_set_bitrate(h264_encoder_t *encoder, uint32_t bitrate_bps) {
      * again here) is likewise just "don't reset state that didn't need to
      * change." */
     if (encoder && bitrate_bps > 0 && bitrate_bps != encoder->rc.target_bitrate) {
-        rc_init(&encoder->rc, encoder->rc.mode, bitrate_bps, (double)encoder->fps,
-                encoder->width, encoder->height);
+        rc_update_bitrate(&encoder->rc, bitrate_bps, encoder->width, encoder->height);
     }
 }
 
@@ -2088,35 +2297,85 @@ int h264_encoder_submit_frame_ext(h264_encoder_t *encoder,
         int me_mode = (tier >= GOV_TIER_1_GPU_FAST) ? 1 : 0;
 
         /* Dynamic Governor Tier 2: CPU SIMD Motion Estimation Offload.
-         * Only run if explicitly opted in via BC250_ENABLE_CPU_ME=1 / cpu_offload_enabled. */
+         * Only run if explicitly opted in via BC250_ENABLE_CPU_ME=1 / cpu_offload_enabled.
+         *
+         * This is the one path in the encoder that reads the *input frame*
+         * and the *reconstruction* from the CPU rather than handing them to a
+         * compute shader, and both of those reads are hazards that the GPU
+         * path does not have, which is why the two gates below exist. Neither
+         * hazard is theoretical; see gpu_compute_wait_for_image_ready_host()
+         * and gpu_compute_cpu_read_safe() for the full argument. In short:
+         * this tier is entered when the GPU is slow, which is also when the
+         * foreign renderer (Sunshine's own GL pass) is slow, which is also
+         * when reading its half-written output is most likely - so the tier
+         * that was supposed to make a busy stream smoother was instead a
+         * source of the garbled frames that come with a busy one. */
         if (!is_idr && tier == GOV_TIER_2_CPU_OFFLOAD && encoder->governor.cpu_offload_enabled &&
             input_memory.memory != VK_NULL_HANDLE &&
-            gpu_ctx->has_recon_frame && gpu_ctx->recon_memory.memory != VK_NULL_HANDLE) {
+            gpu_ctx->has_recon_frame && gpu_ctx->recon_image.y_plane != VK_NULL_HANDLE &&
+            gpu_ctx->recon_memory.memory != VK_NULL_HANDLE &&
+            /* GATE 1: the reconstruction is written by *this* driver's own
+             * GPU. Provably finished in the synchronous path (it finished the
+             * previous frame before returning), NOT provably finished in the
+             * pipelined path, where the previous frame may still be
+             * mid-reconstruct - and reading that from the CPU is a torn read
+             * of our own output, which no amount of dma-buf fencing helps
+             * with. Falling back to GPU ME here is always safe: it is the
+             * behaviour this driver had before Tier 2 existed. */
+            gpu_compute_cpu_read_safe(gpu_ctx) &&
+            /* GATE 2: the input surface is written by a *foreign* GPU
+             * context when it has been exported as a dma-buf, and nothing in
+             * this thread can know whether that render pass has finished.
+             * gpu_compute_wait_for_image_ready_host() blocks on the same
+             * dma-buf read fence va_backend.c already hands to the GPU as a
+             * submit semaphore, so this costs the wait the GPU path was about
+             * to pay anyway microseconds later and orders the CPU against
+             * exactly the same dependency. */
+            (!gpu_ctx->any_surface_exported ||
+             gpu_compute_wait_for_image_ready_host(gpu_ctx, input_memory) == 0)) {
 
             gpu_nv12_layout_t in_layout, ref_layout;
-            if (gpu_compute_get_nv12_layout(gpu_ctx, &input_surface, input_memory, &in_layout) == 0 &&
-                gpu_compute_get_nv12_layout(gpu_ctx, &gpu_ctx->recon_image, gpu_ctx->recon_memory, &ref_layout) == 0) {
+            bool unmap_in = false, unmap_ref = false;
+            uint8_t *in_base = gpu_compute_map_surface(gpu_ctx, &input_surface, input_memory, &in_layout, &unmap_in);
+            uint8_t *ref_base = gpu_compute_map_surface(gpu_ctx, &gpu_ctx->recon_image, gpu_ctx->recon_memory, &ref_layout, &unmap_ref);
 
-                void *in_mapped = NULL, *ref_mapped = NULL;
-                if (vkMapMemory(gpu_ctx->device, input_memory.memory, 0, input_memory.size, 0, &in_mapped) == VK_SUCCESS) {
-                    if (vkMapMemory(gpu_ctx->device, gpu_ctx->recon_memory.memory, 0, gpu_ctx->recon_memory.size, 0, &ref_mapped) == VK_SUCCESS) {
-                        const uint8_t *src_y = (const uint8_t *)in_mapped + in_layout.y_offset;
-                        const uint8_t *ref_y = (const uint8_t *)ref_mapped + ref_layout.y_offset;
-
-                        if (cpu_simd_me_search_frame(src_y, (int)in_layout.y_pitch,
-                                                     ref_y, (int)ref_layout.y_pitch,
-                                                     encoder->width, encoder->height,
-                                                     encoder->cpu_mvs,
-                                                     &encoder->me_cfg) == 0) {
-                            cpu_mvs = encoder->cpu_mvs;
-                            me_mode = 2;
-                        }
-
-                        vkUnmapMemory(gpu_ctx->device, gpu_ctx->recon_memory.memory);
-                    }
-                    vkUnmapMemory(gpu_ctx->device, input_memory.memory);
+            /* One streaming copy of each luma plane into cached host RAM, so
+             * the search itself runs out of cache instead of out of the GART.
+             * See me_src_stage's comment in struct h264_encoder. */
+            const size_t luma_bytes = (size_t)encoder->width * encoder->height;
+            if (in_base && ref_base && encoder->me_stage_cap < luma_bytes) {
+                uint8_t *ns = realloc(encoder->me_src_stage, luma_bytes);
+                uint8_t *nr = ns ? realloc(encoder->me_ref_stage, luma_bytes) : NULL;
+                if (nr) {
+                    encoder->me_src_stage = ns;
+                    encoder->me_ref_stage = nr;
+                    encoder->me_stage_cap = luma_bytes;
                 }
             }
+
+            if (in_base && ref_base && encoder->me_stage_cap >= luma_bytes) {
+                const uint8_t *src_y = in_base + in_layout.y_offset;
+                const uint8_t *ref_y = ref_base + ref_layout.y_offset;
+                uint8_t *src_stage = encoder->me_src_stage;
+                uint8_t *ref_stage = encoder->me_ref_stage;
+
+                for (uint32_t r = 0; r < encoder->height; r++) {
+                    memcpy(src_stage + (size_t)r * encoder->width, src_y + (size_t)r * in_layout.y_pitch, encoder->width);
+                    memcpy(ref_stage + (size_t)r * encoder->width, ref_y + (size_t)r * ref_layout.y_pitch, encoder->width);
+                }
+
+                if (cpu_simd_me_search_frame(src_stage, (int)encoder->width,
+                                             ref_stage, (int)encoder->width,
+                                             encoder->width, encoder->height,
+                                             encoder->cpu_mvs,
+                                             &encoder->me_cfg) == 0) {
+                    cpu_mvs = encoder->cpu_mvs;
+                    me_mode = 2;
+                }
+            }
+
+            gpu_compute_unmap_surface(gpu_ctx, gpu_ctx->recon_memory, unmap_ref);
+            gpu_compute_unmap_surface(gpu_ctx, input_memory, unmap_in);
         }
 
         gpu_compute_dispatch_encode_ext(gpu_ctx, input_surface, encoder->width, encoder->height,
@@ -2148,7 +2407,9 @@ static bool is_live_caller(void)
     return program_invocation_short_name &&
            (strcmp(program_invocation_short_name, "sunshine") == 0 ||
             strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
-            strcmp(program_invocation_short_name, "wivrn") == 0);
+            strcmp(program_invocation_short_name, "wivrn") == 0 ||
+            strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0);
 #else
     return false;
 #endif
@@ -2247,30 +2508,6 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     gpu_memory_t dummy_mem = {0};
     return h264_encoder_encode_frame_ext(encoder, gpu_ctx, input_surface, dummy_mem,
                                          output_buf, output_size);
-}
-
-static int get_default_slice_threads(int num_slices) {
-    int threads = 1;
-    const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
-    if (env_threads) {
-        int t = atoi(env_threads);
-        if (t >= 1 && t <= 8) return (num_slices < t) ? num_slices : t;
-    }
-    const char *env_no_omp = getenv("BC250_DISABLE_OPENMP");
-    if (env_no_omp && (strcmp(env_no_omp, "0") != 0 && strcmp(env_no_omp, "false") != 0)) {
-        return 1;
-    }
-#if defined(__linux__)
-    if (program_invocation_short_name) {
-        if (strcmp(program_invocation_short_name, "sunshine") == 0) {
-            return (num_slices < 2) ? 1 : 2;
-        } else if (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
-                   strcmp(program_invocation_short_name, "wivrn") == 0) {
-            return (num_slices < 4) ? num_slices : 4;
-        }
-    }
-#endif
-    return threads;
 }
 
 int h264_encoder_finish_frame(h264_encoder_t *encoder,
@@ -2412,7 +2649,9 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
          * the same safe fallback. */
         if (gpu_compute_sync_slot(gpu_ctx, pending->gpu_slot) == 0) {
             double last_gpu_lat = gpu_compute_get_last_latency_ms(gpu_ctx);
-            dynamic_governor_update(&encoder->governor, last_gpu_lat);
+            if (!is_idr) {
+                dynamic_governor_update(&encoder->governor, last_gpu_lat);
+            }
         if (ph) {
             clock_gettime(CLOCK_MONOTONIC, &ph_d);
             ph_begin_ms    = (double)(ph_b.tv_sec - ph_a.tv_sec) * 1000.0 +
@@ -2741,7 +2980,16 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
                 }
             }
         }
-        } /* gpu_compute_sync() == 0 */
+        } else {
+            /* GPU fence wait timed out or failed under heavy graphics contention (e.g. RDR 2 benchmark).
+             * Notify the dynamic governor with high latency so it immediately engages failover
+             * and CPU offload rather than oscillating. */
+            double timeout_ms = gpu_compute_get_last_latency_ms(gpu_ctx);
+            if (timeout_ms < 16.0) timeout_ms = 20.0;
+            if (!is_idr) {
+                dynamic_governor_update(&encoder->governor, timeout_ms);
+            }
+        }
     } else {
         /* Emergency Failover or submit failure: no GPU work was submitted for this frame.
          * Notify the governor so any Tier 3 Failover steps down to Tier 2 CPU offload. */
@@ -3430,6 +3678,9 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
                 int mode = H264_I16x16_DC;
                 if (v_diff * 3 < h_diff * 2) mode = H264_I16x16_VERT;
                 else if (h_diff * 3 < v_diff * 2) mode = H264_I16x16_HORIZ;
+                bool left_avail = (mbx > 0 && (mb - 1) >= start_mb);
+                bool top_avail  = (mby > 0 && (mb - encoder->width_in_mbs) >= start_mb);
+                mode = h264_sanitize_i16_mode(mode, top_avail, left_avail);
                 cavlc_write_mb_i16x16_header(&bs, mode, H264_CHROMA_DC, 0, 0, 0);
             }
         } else {
@@ -3605,22 +3856,24 @@ void h264_encoder_destroy(h264_encoder_t *encoder)
     }
 #endif
     if (!encoder) return;
-    free(encoder->output_buf);
-    free(encoder->prev_y_frame);
-    free(encoder->nz_luma);
-    free(encoder->nz_cb);
-    free(encoder->nz_cr);
-    free(encoder->dc_cbf_luma);
-    free(encoder->dc_cbf_chroma);
-    free(encoder->cbp_nb);
-    free(encoder->mvd_x_abs);
-    free(encoder->mvd_y_abs);
-    free(encoder->skip_flag);
-    free(encoder->quant_levels_shadow);
-    free(encoder->dc_coeff_shadow);
-    free(encoder->pred_modes_shadow);
-    free(encoder->mvs_shadow);
-    free(encoder->nz_masks_shadow);
-    free(encoder->cpu_mvs);
+    if (encoder->output_buf) free(encoder->output_buf);
+    if (encoder->prev_y_frame) free(encoder->prev_y_frame);
+    if (encoder->nz_luma) free(encoder->nz_luma);
+    if (encoder->nz_cb) free(encoder->nz_cb);
+    if (encoder->nz_cr) free(encoder->nz_cr);
+    if (encoder->dc_cbf_luma) free(encoder->dc_cbf_luma);
+    if (encoder->dc_cbf_chroma) free(encoder->dc_cbf_chroma);
+    if (encoder->cbp_nb) free(encoder->cbp_nb);
+    if (encoder->mvd_x_abs) free(encoder->mvd_x_abs);
+    if (encoder->mvd_y_abs) free(encoder->mvd_y_abs);
+    if (encoder->skip_flag) free(encoder->skip_flag);
+    if (encoder->quant_levels_shadow) free(encoder->quant_levels_shadow);
+    if (encoder->dc_coeff_shadow) free(encoder->dc_coeff_shadow);
+    if (encoder->pred_modes_shadow) free(encoder->pred_modes_shadow);
+    if (encoder->mvs_shadow) free(encoder->mvs_shadow);
+    if (encoder->nz_masks_shadow) free(encoder->nz_masks_shadow);
+    if (encoder->cpu_mvs) free(encoder->cpu_mvs);
+    if (encoder->me_src_stage) free(encoder->me_src_stage);
+    if (encoder->me_ref_stage) free(encoder->me_ref_stage);
     free(encoder);
 }

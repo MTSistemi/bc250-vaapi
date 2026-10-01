@@ -49,9 +49,28 @@ typedef struct {
     double tier2_threshold_ms;     /* Default: 12.0 ms */
     double tier3_threshold_ms;     /* Default: 15.5 ms */
     uint32_t step_down_hysteresis; /* Default: 4 frames */
+    /* Minimum frames a tier must have been held before the governor may move
+     * *up* into the CPU offload tier. Default 0 (no dwell) generally, 8 for a
+     * live streaming caller.
+     *
+     * WHY, given that there is already a step_down_hysteresis: that one
+     * governs how long the governor must see a healthy EMA before it *leaves*
+     * the offload, and it says nothing about entering it. Entering happened on
+     * the first frame whose EMA crossed the tier-2 threshold, and on the frame
+     * after any emergency failover. On a live stream that produced a
+     * repeating one-frame pattern that is very expensive and, as reported,
+     * visible: a game spiking past the emergency threshold drops one frame,
+     * the next frame is handed to the CPU ME offload - a full-frame search
+     * over memory the CPU cannot cache (see me_src_stage in encoder_h264.c) -
+     * and the frame after that goes back to the GPU. The work the encoder
+     * does per frame changed by a large factor several times a second, and
+     * the frame time changed with it. See docs/DEVLOG.md. */
+    uint32_t min_dwell_frames;
+    uint32_t frames_in_tier;     /* Frames spent in current_tier; the dwell clock. */
     bool enabled;
     int forced_tier;               /* -1: auto, 0..3: forced via BC250_FORCE_TIER */
     bool cpu_offload_enabled;      /* Default: false; enabled via BC250_ENABLE_CPU_ME=1 */
+    bool allow_failover;           /* False for offline transcode to avoid dropping frames */
 } dynamic_governor_t;
 
 /**
